@@ -71,18 +71,26 @@ if not defined IDX (
 call :log "edition '%WIN_EDITION%' = index %IDX%"
 
 rem ------------------------------------------------------------------ partition
-(
-  echo select disk 0
-  echo clean
-  echo convert gpt
-  echo create partition efi size=100
-  echo format quick fs=fat32 label=System
-  echo assign letter=S
-  echo create partition msr size=16
-  echo create partition primary
-  echo format quick fs=ntfs label=Windows
-  echo assign letter=W
-) > X:\winslim-dp.txt
+rem capture mode (./winvm iso) adds an O: volume that receives the serviced image
+> X:\winslim-dp.txt echo select disk 0
+>>X:\winslim-dp.txt echo clean
+>>X:\winslim-dp.txt echo convert gpt
+>>X:\winslim-dp.txt echo create partition efi size=100
+>>X:\winslim-dp.txt echo format quick fs=fat32 label=System
+>>X:\winslim-dp.txt echo assign letter=S
+>>X:\winslim-dp.txt echo create partition msr size=16
+if "%WINSLIM_MODE%"=="capture" (
+  >>X:\winslim-dp.txt echo create partition primary size=40960
+) else (
+  >>X:\winslim-dp.txt echo create partition primary
+)
+>>X:\winslim-dp.txt echo format quick fs=ntfs label=Windows
+>>X:\winslim-dp.txt echo assign letter=W
+if "%WINSLIM_MODE%"=="capture" (
+  >>X:\winslim-dp.txt echo create partition primary
+  >>X:\winslim-dp.txt echo format quick fs=ntfs label=Output
+  >>X:\winslim-dp.txt echo assign letter=O
+)
 call :log "partitioning disk 0"
 diskpart /s X:\winslim-dp.txt >>"%LOG%" 2>&1
 if not exist W:\ (
@@ -107,6 +115,12 @@ rem image and lacks the AppX provider, and setup's WinPE has no findstr.exe.
 set "DI=W:\Windows\System32\Dism.exe /English /Image:W:\ /ScratchDir:W:\scratch"
 set "FINDSTR=W:\Windows\System32\findstr.exe"
 if not exist W:\Windows\System32\Dism.exe set "DI=dism /English /Image:W:\ /ScratchDir:W:\scratch"
+
+rem An image captured by ./winvm iso is already serviced: just stage and boot it.
+if "%WIN_PRESERVICED%"=="1" (
+  call :log "pre-serviced image - skipping offline servicing"
+  goto :staging
+)
 
 rem ------------------------------------------------------------------ drivers
 call :log "injecting virtio drivers"
@@ -161,7 +175,10 @@ rem ------------------------------------------------------------------ files
 call :log "deleting leftovers (Edge, OneDrive setup, WinRE)"
 for /f "usebackq delims=" %%P in ("%WS%\offline-delete.txt") do call :del "W:\%%P"
 
+if "%WINSLIM_MODE%"=="capture" goto :capture
+
 rem ------------------------------------------------------------------ first-boot payload
+:staging
 call :log "staging unattend.xml and first-boot scripts"
 mkdir W:\Windows\Panther >nul 2>&1
 copy /y "%WS%\unattend.xml" W:\Windows\Panther\unattend.xml >nul
@@ -182,6 +199,25 @@ copy /y "%LOG%" W:\Windows\Setup\winslim-pe.log >nul
 copy /y X:\winslim-appx.txt W:\Windows\Setup\ >nul
 copy /y X:\winslim-caps.txt W:\Windows\Setup\ >nul
 wpeutil reboot
+exit /b 0
+
+
+rem ------------------------------------------------------------------ capture (./winvm iso)
+:capture
+rd /s /q W:\scratch >nul 2>&1
+mkdir O:\scratch >nul 2>&1
+call :log "capturing the serviced image"
+dism /English /Capture-Image /ImageFile:O:\install.wim /CaptureDir:W:\ /Name:"%WIN_EDITION%" /Description:"winslim %WINSLIM_BUILD%" /Compress:fast /ScratchDir:O:\scratch >>"%LOG%" 2>&1
+if errorlevel 1 (
+  call :fail "dism /Capture-Image failed"
+  goto :eof
+)
+rem (the host re-exports it as solid LZMS with wimlib; WinPE lacks the RAM for that)
+rd /s /q O:\scratch >nul 2>&1
+call :log "WINSLIM-CAPTURE-DONE"
+copy /y "%LOG%" O:\winslim-pe.log >nul
+>O:\WINSLIM-CAPTURE-DONE echo ok
+wpeutil shutdown
 exit /b 0
 
 

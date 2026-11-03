@@ -7,9 +7,11 @@ and is not activated (you activate it yourself).
 * No Windows Update, Defender, SmartScreen, Copilot/Recall/AI, Edge, OneDrive,
   Store or inbox apps, telemetry, search indexer, hibernation or pagefile. WinRE
   is removed too.
-* The OS is applied with **CompactOS**, the component store is reset, and payloads
-  of disabled optional features are stripped. The golden image is a zstd-compressed
-  qcow2, and you run on a thin overlay, so a reset is instant.
+* The component store is reset (ResetBase), payloads of disabled optional
+  features are stripped, and Smart App Control is off (in evaluation mode it makes
+  every signed installer wait 2 minutes once Defender is gone). The golden image
+  is a zstd-compressed qcow2, and you run on a thin overlay, so a reset is
+  instant. Numbers are in [Results](#results).
 * Guest tools are installed: virtio drivers (storage, net, balloon, serial, rng,
   input, gpu), **qemu-guest-agent** and spice-vdagent (clipboard in the GTK window).
 * **Pure CLI mode.** Headless VM, OpenSSH server with key auth, PowerShell as the
@@ -26,16 +28,20 @@ scripts and config.
 
 ```sh
 # 1. one-time: host packages (Fedora names)
-sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils samba socat aria2
+sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils samba aria2
+# optional: libvirt-daemon-kvm virt-manager (libvirt mode), guestfs-tools (offline cleanup), freerdp
 
 # 2. Windows ISO: download in a browser from
 #    https://www.microsoft.com/software-download/windows11  ("Download Windows 11 Disk Image (ISO)")
 #    and save it as ~/Others/vm/iso/Win11_*.iso  (any official Win10/11 ISO works)
 
-# 3. build everything (about 30-60 min, unattended)
+# 3. build (unattended)
 ./winvm fetch          # pinned virtio-win + OpenSSH, sha256-verified
 ./winvm editions       # optional: list editions, pick WIN_EDITION
-./winvm install        # builds the boot ISO, installs, writes the golden base image
+./winvm install        # ~22 min: boot ISO + Microsoft ISO -> golden base image (6.2 GB)
+#   or, recommended if you rebuild often / want the smallest image:
+./winvm iso                     # ~1 h once: capture the debloated image -> 4.3 GB slim ISO
+./winvm install --standalone    # ~6 min each time -> golden base image (5.4 GB)
 
 # 4. use it
 ./winvm ssh            # starts the VM headless if needed, opens PowerShell
@@ -51,7 +57,8 @@ sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils sam
 | `fetch` | download pinned virtio-win ISO and Win32-OpenSSH MSI, verify sha256 |
 | `editions` | list editions inside the Windows ISO |
 | `build` | build `winslim-boot.iso` (~650 MB): patched WinPE, scripts, drivers |
-| `iso` | **iso→iso**: standalone single-edition installer `winslim-standalone.iso` |
+| `iso` | **iso→iso**: standalone installer `winslim-standalone.iso` holding the *already debloated* image |
+| `iso-resume` | finish an interrupted `iso` from its kept capture disk |
 | `install [--gui] [--standalone]` | unattended install, then golden `winslim-base.qcow2` and an overlay |
 | `start [--gui]` | start headless (daemonized), or with a GTK window plus clipboard |
 | `ssh`, `run`, `cp`, `wait` | CLI access over SSH (key auth, PowerShell) |
@@ -60,6 +67,7 @@ sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils sam
 | `gui` | GTK window, or a VNC viewer if already running headless |
 | `stop` / `kill` / `status` | ACPI shutdown, hard off, overview |
 | `reset` | discard all changes (new empty overlay on the base image) |
+| `balloon [size]` | show or change guest RAM live, returning memory to the host |
 | `screenshot` | PNG of the guest screen, handy when headless |
 | `cmdline` | print the exact QEMU command line used by `start` |
 | `virt-define` / `virt-undefine` / `virsh …` | libvirt session domain |
@@ -78,7 +86,8 @@ Win11.iso ─┬─ boot.wim (WinPE, index 2) ─ wimlib: winpeshl.ini → winsl
 
 1. **WinPE stage** (`guest/pe.cmd`, replaces setup.exe). It refuses to run unless
    the SMBIOS vendor is QEMU. Then it loads vioscsi, partitions disk 0 (ESP 100 MB
-   + MSR + C:, no recovery partition) and runs `dism /Apply-Image /Compact`. From
+   + MSR + C:, no recovery partition) and runs `dism /Apply-Image` (with
+   `/Compact` if `WIN_COMPACT=1`). From
    there it uses the applied image's own DISM, because WinPE's is older and lacks
    the AppX provider. It removes provisioned AppX packages not listed in
    `appx-keep.txt`, the capabilities in `capabilities-remove.txt` and the features
@@ -93,14 +102,29 @@ Win11.iso ─┬─ boot.wim (WinPE, index 2) ─ wimlib: winpeshl.ini → winsl
 3. **SetupComplete** (`setupcomplete.ps1`, SYSTEM): installs the virtio guest tools
    and the OpenSSH server (with your keys), turns the firewall off, creates the
    `C:\host` link and sets power settings. It repeats the debloat sweep online,
-   disables scheduled tasks, runs CompactOS and ResetBase, and re-trims.
+   disables scheduled tasks, runs ResetBase (plus CompactOS if `WIN_COMPACT=1`),
+   and re-trims.
 4. **First logon** (`firstlogon.ps1`): a single autologon creates the user profile
-   inside the base image, clears the autologon secrets and powers off.
-5. Host: `qemu-img convert -c` (zstd) gives the read-only **base**, plus a thin
-   **overlay** that you actually run.
+   inside the base image, removes the Edge WebView2 runtime (after the user
+   OOBE, which may still need it), clears the autologon secrets and powers off.
+5. Host: libguestfs, if installed, deletes the few WebView2 files the logged-in
+   shell kept locked, then fstrims. `qemu-img convert -c` (zstd) gives the
+   read-only **base**, plus a thin **overlay** that you actually run.
 
 Progress streams over the serial port (`~/Others/vm/run/winslim/install-serial.log`).
 Logs inside the guest are in `C:\Windows\Setup\winslim*.log`.
+
+### iso → iso (`./winvm iso`)
+
+`./winvm install` needs two CDs: the small boot ISO plus Microsoft's ISO. `./winvm iso`
+instead produces one self-contained installer that holds the already-slimmed
+image. It boots the boot ISO in capture mode, where WinPE applies and services
+the image exactly as above. Then, before the first boot, it runs
+`dism /Capture-Image`, writing the serviced `C:` to a spare partition, and
+`/Export-Image /Compress:recovery` turns that into an LZMS ESD. The host pulls
+`install.esd` out with libguestfs and wraps it with the WinPE tree. The installer
+on that ISO skips servicing (it's already done) and only applies, stages the
+first-boot scripts and boots. `./winvm install --standalone` uses it.
 
 ## Customizing
 
@@ -112,7 +136,16 @@ WIN_PASSWORD='s3cret'
 WIN_KEYBOARD=041f:0000041f        # Turkish Q
 RAM=8G CPUS=8 SSH_PORT=2022
 SHARE_DIR=$HOME/Projects
+WIN_REMOVE_WEBVIEW=0              # keep Edge WebView2 (some apps need it)
+WIN_COMPACT=1                     # CompactOS inside the guest instead (see Results)
+WIMLIB_THREADS=2                  # `iso` export threads; solid LZMS needs ~1 GiB RAM each
+MEM_RESERVE=1024                  # MiB of host RAM that must stay free
 ```
+
+**Host RAM guard.** Before every VM start (`install`, `iso`, `start`) and every
+wimlib export, `winvm` checks `MemAvailable`. It refuses to start when the job
+plus `MEM_RESERVE` won't fit, instead of pushing the host into swap or the OOM
+killer. Lower `RAM` or `WIMLIB_THREADS` if you hit it.
 
 Debloat is data-driven. Edit `guest/lists/*.txt`, then `./winvm clean --base && ./winvm install`.
 `WINSLIM_DEBUG=1 ./winvm build` makes a WinPE failure drop to a shell (watch it
@@ -140,6 +173,44 @@ virt-manager -c qemu:///session     # GUI, if you like
 
 Don't run the libvirt domain and `./winvm start` at the same time. They share the
 overlay, and QEMU's image locking will refuse.
+
+**SMB share under libvirt:** libvirt starts QEMU with a seccomp sandbox that
+forbids spawning processes, so QEMU can't launch its private `smbd`, and the
+sandbox can't be relaxed per domain. SSH, RDP, the guest agent and internet all
+work regardless. To get `C:\host` under libvirt too, turn the sandbox off for
+your session daemon (`virt-define` warns until you do):
+
+```sh
+echo 'seccomp_sandbox = 0' >> ~/.config/libvirt/qemu.conf
+systemctl --user restart virtqemud 2>/dev/null || pkill -u "$USER" virtqemud
+```
+
+The domain runs with `<seclabel type='none'/>` (unconfined, like the plain
+launcher), so QEMU can read the share in your home directory despite SELinux.
+
+## Results
+
+Measured on this repo's defaults (Windows 11 Pro, build 26300, 4 vCPU/4 GB, KVM):
+
+| | |
+|---|---|
+| `install` (Microsoft ISO → golden image) | ~22 min |
+| `iso` (Microsoft ISO → slim standalone ISO, 2 wimlib threads) | ~25 min VM + ~35 min export |
+| slim standalone ISO (Microsoft's is 9.0 GB) | **4.3 GB** |
+| `install --standalone` (slim ISO → golden image) | **~6 min** |
+| boot to SSH prompt | ~12 s |
+| graceful shutdown | ~7 s |
+| golden base image, from the slim ISO | **5.4 GB** |
+| golden base image, from Microsoft's ISO (`WIN_COMPACT=0`, zstd qcow2) | 6.2 GB |
+| same with CompactOS in the guest (`WIN_COMPACT=1`) | 7.5 GB |
+| fresh overlay | < 1 MB |
+| idle RAM in the guest (headless, nobody logged in) | ~950 MB, 86 processes |
+| host RSS of a 4 GB VM after `./winvm balloon 2G` | 4.2 GB → 2.1 GB |
+
+XPRESS4K (CompactOS) only reaches about 1.8:1, and its output is incompressible
+for qcow2. Leaving the guest data raw and letting qcow2's zstd compress it gives
+the smaller host footprint, so that's the default. Blocks you write later land
+uncompressed in the overlay; `./winvm reset` gets you back to the base.
 
 ## Activation and re-enabling things
 

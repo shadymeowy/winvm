@@ -17,10 +17,15 @@ Set-ItemProperty -Path $wl -Name AutoLogonCount -Value 0 -ErrorAction SilentlyCo
 # Edge WebView2 runtime: only needed by stuff we removed (widgets, Copilot, Teams...).
 # Done here, after the user OOBE, which may use it.
 if ($RemoveWebView) {
-    Get-Process msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath 'C:\Program Files (x86)\Microsoft\EdgeWebView' -Recurse -Force -ErrorAction SilentlyContinue
+    $wv = 'C:\Program Files (x86)\Microsoft\EdgeWebView'
+    for ($i = 0; $i -lt 3 -and (Test-Path -LiteralPath $wv); $i++) {   # shell processes may hold it briefly
+        Get-Process msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $wv -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $wv) { Start-Sleep -Seconds 3 }
+    }
     Remove-Item -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft EdgeWebView' -Recurse -Force -ErrorAction SilentlyContinue
-    Log ("  EdgeWebView removed: {0}" -f -not (Test-Path 'C:\Program Files (x86)\Microsoft\EdgeWebView')) 'FL'
+    $left = (Get-ChildItem -LiteralPath $wv -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    Log ("  EdgeWebView removed ({0:N1} MB still locked, the host cleans that up offline)" -f ($left/1MB)) 'FL'
 }
 
 # Per-user leftovers

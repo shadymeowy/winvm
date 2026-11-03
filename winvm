@@ -42,6 +42,12 @@ mib() { # 4G / 4096M / 4096 -> MiB
   case $v in *G) echo $(( ${v%G} * 1024 ));; *M) echo "${v%M}";; *) echo "$v";; esac
 }
 
+mem_available() { awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo; }
+need_mem() { # need_mem <MiB> <what> : refuse to start something the host can't hold
+  local want=$(( $1 + MEM_RESERVE )) have; have=$(mem_available)
+  (( have >= want )) || die "$2 needs ~$1 MiB RAM (+$MEM_RESERVE reserve) but only $have MiB is available - free memory or lower RAM/WIMLIB_THREADS"
+}
+
 win_iso() {
   if [[ -n $WIN_ISO ]]; then [[ -f $WIN_ISO ]] || die "WIN_ISO not found: $WIN_ISO"; echo "$WIN_ISO"; return; fi
   local f
@@ -82,7 +88,7 @@ Host $VM_NAME
   IdentityFile $SSH_KEY
   IdentitiesOnly yes
   StrictHostKeyChecking no
-  UserKnownHostsFile $RUN/known_hosts
+  UserKnownHostsFile /dev/null
   LogLevel ERROR
   ConnectTimeout 5
   ServerAliveInterval 30
@@ -191,7 +197,7 @@ stage_tree() { # stage_tree <dir> : WinPE + winslim payload, everything except i
   [[ -f $tree/efi/microsoft/boot/efisys_noprompt.bin ]] || die "unexpected ISO layout (no efisys_noprompt.bin)"
 
   log "patching boot.wim (WinPE shell -> winslim installer)"
-  wimlib-imagex export "$tree/sources/boot.wim" 2 "$tree/sources/boot.new.wim" --boot >/dev/null
+  wimlib-imagex export "$tree/sources/boot.wim" 2 "$tree/sources/boot.new.wim" --boot --threads="$WIMLIB_THREADS" >/dev/null
   crlf "$REPO/guest/winpeshl.ini" > "$tree/winpeshl.ini"
   crlf "$REPO/guest/winslim-start.cmd" > "$tree/winslim-start.cmd"
   wimlib-imagex update "$tree/sources/boot.new.wim" 1 >/dev/null <<EOF
@@ -225,6 +231,8 @@ set "WIN_EDITION=$WIN_EDITION"
 set "WIN_INDEX=${WIN_INDEX:-}"
 set "WIN_STRIP_PAYLOADS=$WIN_STRIP_PAYLOADS"
 set "WIN_COMPACT=$WIN_COMPACT"
+set "WINSLIM_MODE=${WINSLIM_MODE:-install}"
+set "WIN_PRESERVICED=${WIN_PRESERVICED:-0}"
 set "WINSLIM_DEBUG=${WINSLIM_DEBUG:-0}"
 set "WINSLIM_BUILD=$rev-$(date +%Y%m%d)"
 EOF
@@ -263,24 +271,56 @@ cmd_build() { ## build the small winslim boot ISO (WinPE + scripts + drivers)
   log "boot ISO: $BOOT_ISO ($(du -h "$BOOT_ISO" | cut -f1))"
 }
 
-cmd_iso() { ## build a standalone slim installer ISO (single edition, ESD) - "iso to iso"
-  local iso tree=$BUILD/tree src; iso=$(win_iso)
-  stage_tree "$tree"
-  log "exporting '$WIN_EDITION' to install.esd (LZMS solid, takes a while)"
-  mkdir -p "$BUILD/src"
-  src=$(7z l "$iso" sources/install.wim | grep -q install.wim && echo sources/install.wim || echo sources/install.esd)
-  7z x -y -o"$BUILD/src" "$iso" "$src" >/dev/null
-  mkdir -p "$tree/sources"
-  wimlib-imagex export "$BUILD/src/$src" "$WIN_EDITION" "$tree/sources/install.esd" --compress=LZMS --solid
-  rm -rf "$BUILD/src"
-  if (( $(stat -c %s "$tree/sources/install.esd") >= 4294967295 )); then
-    log "install.esd > 4 GiB: splitting into .swm parts"
-    wimlib-imagex split "$tree/sources/install.esd" "$tree/sources/install.swm" 3800
-    rm -f "$tree/sources/install.esd"
+iso_from_capture() { # iso_from_capture <capture.qcow2> <tree> : capture disk -> standalone ISO
+  local cap=$1 tree=$2
+  if [[ -f $cap ]]; then
+    log "pulling the captured image off the capture disk"
+    rm -f "$BUILD/install.wim"
+    guestfish --ro -a "$cap" run : mount /dev/sda4 / : download /WINSLIM-CAPTURE-DONE "$BUILD/capture.ok" : \
+      download /install.wim "$BUILD/install.wim" 2>/dev/null || die "capture failed - see VNC/screenshot; disk kept at $cap"
+    rm -f "$cap" "$BUILD/capture.iso" "$BUILD/capture.ok"
   fi
+  [[ -f $BUILD/install.wim ]] || die "no captured image ($cap or $BUILD/install.wim) - run ./winvm iso"
+  vm_alive && die "a VM is running - stop it before the export (both need lots of RAM)"
+  need_mem $(( WIMLIB_THREADS * 1024 )) "solid LZMS export with $WIMLIB_THREADS threads"
+  log "re-exporting as solid LZMS install.esd (wimlib, $WIMLIB_THREADS threads; slow but light)"
+  mkdir -p "$tree/sources"; rm -f "$tree/sources/install."*
+  wimlib-imagex export "$BUILD/install.wim" 1 "$tree/sources/install.esd" --solid --threads="$WIMLIB_THREADS"
+  rm -f "$BUILD/install.wim"
+  (( $(stat -c %s "$tree/sources/install.esd") < 4294967295 )) || die "install.esd is over 4 GiB (ISO9660 limit)"
+  # same payload, different mode: plain install of an already-serviced image
+  sed -i 's/^set "WINSLIM_MODE=.*/set "WINSLIM_MODE=install"\r/; s/^set "WIN_PRESERVICED=.*/set "WIN_PRESERVICED=1"\r/; s/^set "WIN_INDEX=.*/set "WIN_INDEX=1"\r/' \
+    "$tree/winslim/config.cmd"
   make_iso "$tree" "$SLIM_ISO" WINSLIM_FULL
   rm -rf "$tree"
+}
+
+cmd_iso_resume() { ## finish an interrupted `iso` from its kept capture disk
+  [[ ( -f $BUILD/capture.qcow2 || -f $BUILD/install.wim ) && -d $BUILD/tree ]] || die "nothing to resume in $BUILD - run ./winvm iso"
+  iso_from_capture "$BUILD/capture.qcow2" "$BUILD/tree"
   log "standalone ISO: $SLIM_ISO ($(du -h "$SLIM_ISO" | cut -f1))"
+}
+
+cmd_iso() { ## build a standalone slim installer ISO from the debloated image - "iso to iso"
+  # 1. boot a capture variant of the boot ISO: apply + service offline as usual, then
+  #    capture the serviced C: into install.esd on a spare partition and power off
+  # 2. pull install.esd out with libguestfs, 3. write an ISO whose installer skips servicing
+  need "$QEMU" "$QEMU_IMG" guestfish
+  vm_alive && die "VM is running - ./winvm stop first"
+  local tree=$BUILD/tree cap=$BUILD/capture.qcow2 iso; iso=$(win_iso)
+  WINSLIM_MODE=capture stage_tree "$tree"
+  make_iso "$tree" "$BUILD/capture.iso" WINSLIM
+  mkdir -p "$RUN"; ovmf
+  rm -f "$cap"; "$QEMU_IMG" create -q -f qcow2 "$cap" 80G
+  cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"
+  need_mem "$(mib "$RAM")" "the capture VM"
+  qemu_args install "$cap"
+  Q+=(-drive "if=none,id=cd0,media=cdrom,readonly=on,file=$BUILD/capture.iso" -device ide-cd,drive=cd0,bus=ide.0,bootindex=1
+      -drive "if=none,id=cd1,media=cdrom,readonly=on,file=$iso" -device ide-cd,drive=cd1,bus=ide.1)
+  log "capture run: apply + offline debloat + capture (~25 min, watch: VNC 127.0.0.1:$((5900+VNC_DISPLAY)))"
+  "${Q[@]}"
+  iso_from_capture "$cap" "$tree"
+  log "standalone ISO: $SLIM_ISO ($(du -h "$SLIM_ISO" | cut -f1)); install with ./winvm install --standalone"
   warn "this ISO wipes disk 0 without asking - it refuses to run on non-QEMU machines"
 }
 
@@ -288,7 +328,7 @@ cmd_install() { ## unattended install into a fresh disk, then produce the golden
   local gui='' standalone=''
   for a; do case $a in --gui) gui=1;; --standalone) standalone=1;; *) die "unknown option $a";; esac; done
   need "$QEMU" "$QEMU_IMG"
-  pid_alive && die "VM is running - ./winvm stop first"
+  vm_alive && die "VM is running - ./winvm stop first"
   local cds=()
   if [[ -n $standalone ]]; then
     [[ -f $SLIM_ISO ]] || cmd_iso
@@ -303,6 +343,7 @@ cmd_install() { ## unattended install into a fresh disk, then produce the golden
   "$QEMU_IMG" create -q -f qcow2 "$INSTALL_DISK" "$DISK_SIZE"
   cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"
 
+  need_mem "$(mib "$RAM")" "the install VM"
   qemu_args install "$INSTALL_DISK" "$gui"
   local i bi
   for i in "${!cds[@]}"; do   # first CD is the boot CD (after the still-empty disk)
@@ -327,6 +368,12 @@ cmd_install() { ## unattended install into a fresh disk, then produce the golden
 }
 
 finalize() {
+  if [[ $WIN_REMOVE_WEBVIEW == 1 ]] && command -v guestfish >/dev/null; then
+    # firstlogon deletes WebView2, but shell processes keep a few files locked; finish offline
+    log "removing WebView2 leftovers offline (libguestfs)"
+    printf '%s\n' '-rm-rf "/Program Files (x86)/Microsoft/EdgeWebView"' '-fstrim /' |
+      guestfish --rw -a "$INSTALL_DISK" -i >/dev/null 2>&1 || warn "guestfish failed - leftovers kept"
+  fi
   log "creating golden base image"
   local opts=(-O qcow2); [[ $COMPRESS_BASE == 1 ]] && opts+=(-c -o compression_type=zstd)
   "$QEMU_IMG" convert -p "${opts[@]}" "$INSTALL_DISK" "$BASE.tmp"
@@ -338,7 +385,7 @@ finalize() {
 }
 
 cmd_reset() { ## throw away all changes: new empty overlay on top of the base image
-  pid_alive && die "VM is running - ./winvm stop first"
+  vm_alive && die "VM is running - ./winvm stop first"
   [[ -f $BASE ]] || die "no base image - run ./winvm install"
   mkdir -p "$RUN"; ovmf
   rm -f "$DISK"
@@ -351,8 +398,10 @@ cmd_start() { ## start the VM headless (daemonized) [--gui for a GTK window with
   local gui=''; [[ ${1:-} == --gui ]] && gui=1
   need "$QEMU"
   pid_alive && { log "already running (pid $(cat "$RUN/qemu.pid"))"; return 0; }
+  virt_alive && { log "already running under libvirt ($LIBVIRT_URI)"; return 0; }
   [[ -f $DISK ]] || cmd_reset
   [[ -f $RUN/OVMF_VARS.fd ]] || { ovmf; cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"; }
+  need_mem "$(mib "$RAM")" "the VM"
   qemu_args run "$DISK" "$gui"
   if [[ -n $gui ]]; then
     "${Q[@]}" -pidfile "$RUN/qemu.pid" >"$RUN/qemu.log" 2>&1 &
@@ -367,7 +416,9 @@ cmd_start() { ## start the VM headless (daemonized) [--gui for a GTK window with
 cmd_gui() { ## start with a GTK window (or attach a viewer if already running headless)
   if pid_alive; then
     [[ -n $VNC_DISPLAY ]] || die "running headless without VNC"
-    local v; for v in vncviewer remote-viewer gvncviewer; do command -v $v >/dev/null && exec $v "127.0.0.1:$((5900+VNC_DISPLAY))"; done
+    local port=$((5900+VNC_DISPLAY))
+    command -v remote-viewer >/dev/null && exec remote-viewer "vnc://127.0.0.1:$port"
+    command -v vncviewer >/dev/null && exec vncviewer "127.0.0.1:$port"
     die "running headless - connect a VNC viewer to 127.0.0.1:$((5900+VNC_DISPLAY)) or RDP to 127.0.0.1:$RDP_PORT"
   fi
   cmd_start --gui
@@ -421,6 +472,11 @@ cmd_ga() { ## talk to qemu-guest-agent (works without network), e.g. ./winvm ga 
 }
 
 cmd_stop() { ## graceful shutdown (ACPI power button), force-kill after 120s
+  if virt_alive; then
+    virt shutdown "$VM_NAME" >/dev/null
+    local j; for j in $(seq 120); do virt_alive || { log "stopped (libvirt)"; return 0; }; sleep 1; done
+    warn "guest did not power off in time - destroying"; virt destroy "$VM_NAME"; return 0
+  fi
   pid_alive || { log "not running"; return 0; }
   qmp '{"execute":"system_powerdown"}' >/dev/null
   local i; for i in $(seq 120); do pid_alive || { log "stopped"; return 0; }; sleep 1; done
@@ -433,7 +489,8 @@ cmd_kill() { ## hard power-off
 }
 
 cmd_status() { ## show VM state, ports, disk usage
-  if pid_alive; then echo "running  pid=$(cat "$RUN/qemu.pid")"; else echo "stopped"; fi
+  if pid_alive; then echo "running  pid=$(cat "$RUN/qemu.pid") (qemu launcher)"
+  elif virt_alive; then echo "running  (libvirt $LIBVIRT_URI)"; else echo "stopped"; fi
   echo "ssh      ssh -F $RUN/ssh_config $VM_NAME   (127.0.0.1:$SSH_PORT)"
   [[ -n $RDP_PORT ]] && echo "rdp      127.0.0.1:$RDP_PORT  user=$WIN_USER"
   [[ -n $VNC_DISPLAY ]] && echo "vnc      127.0.0.1:$((5900+VNC_DISPLAY))"
@@ -442,6 +499,15 @@ cmd_status() { ## show VM state, ports, disk usage
     [[ -f $f ]] && printf '%-8s %6s on disk  %s\n' "$(basename "${f%.*}" | sed "s/^$VM_NAME-\?//;s/^$/overlay/")" "$(du -h "$f" | cut -f1)" "$f"
   done
   return 0
+}
+
+cmd_balloon() { ## show or set guest RAM via virtio-balloon, frees host RAM live, e.g. ./winvm balloon 2G
+  [[ -S $RUN/qmp.sock ]] || die "VM not running (launcher)"
+  if [[ -n ${1:-} ]]; then
+    qmp "{\"execute\":\"balloon\",\"arguments\":{\"value\":$(( $(mib "$1") * 1024 * 1024 ))}}" >/dev/null
+    sleep 2
+  fi
+  qmp '{"execute":"query-balloon"}' | python3 -c 'import json,sys; print("guest RAM: %d MiB" % (json.load(sys.stdin)["actual"] >> 20))'
 }
 
 cmd_screenshot() { ## save a PNG of the guest screen [file]
@@ -483,7 +549,7 @@ cmd_virsh() { ## virsh passthrough with the right URI, e.g. ./winvm virsh start 
 
 # ---------------------------------------------------------------- housekeeping
 cmd_clean() { ## remove build leftovers [--base also deletes base image+overlay] [--all also ISOs+cache]
-  pid_alive && die "VM is running"
+  vm_alive && die "VM is running - ./winvm stop first"
   rm -rf "$BUILD" "$INSTALL_DISK" "$IMG_DIR"/*.tmp
   case ${1:-} in
     --base) rm -f "$BASE" "$DISK" "$RUN/OVMF_VARS.fd";;
