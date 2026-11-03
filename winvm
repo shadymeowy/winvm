@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+# winvm - build and drive a slim, unattended Windows VM (QEMU/KVM + libvirt).
+# Small files live in this repo; big ones in $DATA_DIR (default ~/Others/vm).
+set -euo pipefail
+
+REPO=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=config.env
+source "$REPO/config.env"
+[[ -f $REPO/config.local.env ]] && source "$REPO/config.local.env"
+
+CACHE=$DATA_DIR/cache
+ISO_DIR=$DATA_DIR/iso
+IMG_DIR=$DATA_DIR/images
+KEY_DIR=$DATA_DIR/keys
+RUN=$DATA_DIR/run/$VM_NAME
+BUILD=$DATA_DIR/build
+
+BOOT_ISO=$ISO_DIR/$VM_NAME-boot.iso
+SLIM_ISO=$ISO_DIR/$VM_NAME-standalone.iso
+BASE=$IMG_DIR/$VM_NAME-base.qcow2
+DISK=$IMG_DIR/$VM_NAME.qcow2
+INSTALL_DISK=$IMG_DIR/$VM_NAME-install.qcow2
+SSH_KEY=$KEY_DIR/id_ed25519
+VIRTIO_ISO=$CACHE/$(basename "$VIRTIO_URL")
+OPENSSH_MSI=$CACHE/$(basename "$OPENSSH_URL")
+
+# virtio driver directories injected into Windows (w11/amd64 flavour)
+VIRTIO_DRIVERS=(vioscsi viostor NetKVM Balloon vioserial viorng vioinput pvpanic fwcfg viogpudo)
+
+# ---------------------------------------------------------------- helpers
+c_b=$'\e[1m' c_g=$'\e[32m' c_r=$'\e[31m' c_y=$'\e[33m' c_0=$'\e[0m'
+[[ -t 2 ]] || { c_b='' c_g='' c_r='' c_y='' c_0=''; }
+log()  { printf '%s==>%s %s\n' "$c_g$c_b" "$c_0" "$*" >&2; }
+warn() { printf '%swarn:%s %s\n' "$c_y$c_b" "$c_0" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$c_r$c_b" "$c_0" "$*" >&2; exit 1; }
+need() { for t; do command -v "$t" >/dev/null || die "missing tool: $t"; done; }
+crlf() { sed 's/\r*$/\r/' "$@"; }                       # unix -> dos line endings
+strip_list() { grep -vE '^[[:space:]]*(#|$)' "$1" | sed 's/[[:space:]]*$//'; }
+xml_escape() { local s=$1; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; s=${s//\"/&quot;}; s=${s//\'/&apos;}; printf '%s' "$s"; }
+mib() { # 4G / 4096M / 4096 -> MiB
+  local v=${1^^}
+  case $v in *G) echo $(( ${v%G} * 1024 ));; *M) echo "${v%M}";; *) echo "$v";; esac
+}
+
+win_iso() {
+  if [[ -n $WIN_ISO ]]; then [[ -f $WIN_ISO ]] || die "WIN_ISO not found: $WIN_ISO"; echo "$WIN_ISO"; return; fi
+  local f
+  f=$(ls -t "$ISO_DIR"/Win*.iso 2>/dev/null | grep -v "/$VM_NAME-" | head -1 || true)
+  [[ -n $f ]] || die "no Windows ISO in $ISO_DIR (download one from microsoft.com/software-download, or set WIN_ISO)"
+  echo "$f"
+}
+
+ovmf() { # sets OVMF_CODE / OVMF_VARS (non-secure-boot, raw)
+  [[ -n $OVMF_CODE && -n $OVMF_VARS ]] && return
+  local pair
+  for pair in /usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd \
+              /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd \
+              /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd \
+              /usr/share/edk2/x64/OVMF_CODE.4m.fd:/usr/share/edk2/x64/OVMF_VARS.4m.fd \
+              /usr/share/edk2-ovmf/x64/OVMF_CODE.fd:/usr/share/edk2-ovmf/x64/OVMF_VARS.fd; do
+    if [[ -f ${pair%%:*} && -f ${pair##*:} ]]; then OVMF_CODE=${pair%%:*} OVMF_VARS=${pair##*:}; return; fi
+  done
+  die "OVMF firmware not found (install edk2-ovmf, or set OVMF_CODE/OVMF_VARS)"
+}
+
+pid_alive() { [[ -f $RUN/qemu.pid ]] && kill -0 "$(cat "$RUN/qemu.pid")" 2>/dev/null; }
+virt_alive() { command -v virsh >/dev/null && [[ $(virsh -c "$LIBVIRT_URI" domstate "$VM_NAME" 2>/dev/null) == running ]]; }
+vm_alive() { pid_alive || virt_alive; }   # either launcher or libvirt
+
+qmp() { # qmp '{"execute":"..."}'  -> prints reply
+  [[ -S $RUN/qmp.sock ]] || die "QMP socket missing - is the VM running via ./winvm start?"
+  python3 -I "$REPO/lib/qjson.py" qmp "$RUN/qmp.sock" "$1"
+}
+
+ssh_config() {
+  mkdir -p "$RUN"
+  cat > "$RUN/ssh_config" <<EOF
+Host $VM_NAME
+  HostName 127.0.0.1
+  Port $SSH_PORT
+  User $WIN_USER
+  IdentityFile $SSH_KEY
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+  UserKnownHostsFile $RUN/known_hosts
+  LogLevel ERROR
+  ConnectTimeout 5
+  ServerAliveInterval 30
+EOF
+  echo "$RUN/ssh_config"
+}
+
+ensure_key() {
+  mkdir -p "$KEY_DIR"; chmod 700 "$KEY_DIR"
+  [[ -f $SSH_KEY ]] || ssh-keygen -q -t ed25519 -N '' -C "$VM_NAME" -f "$SSH_KEY"
+}
+
+# ---------------------------------------------------------------- QEMU command line
+# qemu_args <install|run> <disk> [gui]   -> fills global array Q
+qemu_args() {
+  local mode=$1 disk=$2 gui=${3:-}
+  ovmf
+  local cache=writeback; [[ $mode == install ]] && cache=unsafe
+  Q=("$QEMU" -name "$VM_NAME,process=$VM_NAME" -enable-kvm
+     -machine q35,hpet=off,vmport=off
+     -cpu "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-frequencies,hv-tlbflush,hv-ipi,hv-reset"
+     -smp "$CPUS" -m "$RAM"
+     -rtc base=utc,driftfix=slew -global kvm-pit.lost_tick_policy=delay
+     -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1
+     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
+     -drive "if=pflash,format=raw,file=$RUN/OVMF_VARS.fd"
+     -device virtio-scsi-pci,id=scsi0
+     -drive "if=none,id=disk0,file=$disk,format=qcow2,discard=unmap,detect-zeroes=unmap,cache=$cache"
+     -device scsi-hd,drive=disk0,bus=scsi0.0,rotation_rate=1,bootindex=0
+     -device virtio-balloon-pci -device virtio-rng-pci
+     -device virtio-tablet-pci -device virtio-keyboard-pci
+     -device virtio-serial-pci
+     -chardev "socket,id=qga0,path=$RUN/qga.sock,server=on,wait=off"
+     -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
+     -qmp "unix:$RUN/qmp.sock,server=on,wait=off"
+     -monitor "unix:$RUN/monitor.sock,server=on,wait=off"
+     -vga std)
+  if [[ $mode == install ]]; then
+    # No NIC while installing: nothing can phone home, and Windows knows it is offline
+    # (with a dead NIC every signature check waits out CRL/OCSP timeouts).
+    Q+=(-nic none -serial "file:$RUN/install-serial.log")
+  else
+    Q+=(-netdev "$(netdev_user net0)" -device virtio-net-pci,netdev=net0,mac=52:54:00:57:53:4c
+        -serial "file:$RUN/serial.log")
+  fi
+  if [[ -n $gui ]]; then
+    Q+=(-display gtk,zoom-to-fit=on
+        -chardev qemu-vdagent,id=vdagent0,clipboard=on,mouse=off
+        -device virtserialport,chardev=vdagent0,name=com.redhat.spice.0)
+  else
+    Q+=(-display none)
+    [[ -n $VNC_DISPLAY ]] && Q+=(-vnc "127.0.0.1:$VNC_DISPLAY")
+  fi
+  return 0
+}
+
+netdev_user() { # user-mode networking with localhost-only forwards + SMB share
+  local id=$1 s="user,id=$1,hostname=$VM_NAME,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22"
+  [[ -n $RDP_PORT ]] && s+=",hostfwd=tcp:127.0.0.1:$RDP_PORT-:3389"
+  if command -v smbd >/dev/null || [[ -x /usr/sbin/smbd ]]; then
+    mkdir -p "$SHARE_DIR"; s+=",smb=$SHARE_DIR"
+  fi
+  echo "$s"
+}
+
+# ---------------------------------------------------------------- commands
+cmd_fetch() { ## download pinned virtio-win ISO + OpenSSH MSI (Windows ISO: see README)
+  need curl sha256sum
+  mkdir -p "$CACHE" "$ISO_DIR"
+  local url file sum
+  for spec in "$VIRTIO_URL|$VIRTIO_ISO|$VIRTIO_SHA256" "$OPENSSH_URL|$OPENSSH_MSI|$OPENSSH_SHA256"; do
+    IFS='|' read -r url file sum <<<"$spec"
+    if [[ -f $file ]] && echo "$sum  $file" | sha256sum -c --status; then log "ok: $(basename "$file")"; continue; fi
+    log "downloading $(basename "$file")"
+    if command -v aria2c >/dev/null; then
+      aria2c -q -x8 -s8 --allow-overwrite=true --auto-file-renaming=false -d "$(dirname "$file")" -o "$(basename "$file")" "$url"
+    else
+      curl -fL --progress-bar -o "$file" "$url"
+    fi
+    echo "$sum  $file" | sha256sum -c --status || die "checksum mismatch: $file"
+  done
+  log "Windows ISO: $(win_iso 2>/dev/null || echo 'MISSING - put an official ISO into '"$ISO_DIR")"
+}
+
+cmd_editions() { ## list editions in the Windows ISO
+  need 7z wimlib-imagex
+  local iso tmp; iso=$(win_iso); tmp=$(mktemp -d -p "$DATA_DIR")
+  trap 'rm -rf "$tmp"' RETURN
+  if 7z l "$iso" sources/install.wim | grep -q install.wim; then
+    7z x -y -o"$tmp" "$iso" sources/install.wim >/dev/null
+  else
+    7z x -y -o"$tmp" "$iso" sources/install.esd >/dev/null
+  fi
+  wimlib-imagex info "$tmp"/sources/install.* | awk -F': *' '/^Index/{i=$2} /^Name/{print "  " i ": " $2}'
+}
+
+stage_tree() { # stage_tree <dir> : WinPE + winslim payload, everything except install.wim
+  local tree=$1 iso; iso=$(win_iso)
+  need 7z wimlib-imagex xorriso
+  [[ -f $VIRTIO_ISO && -f $OPENSSH_MSI ]] || cmd_fetch
+  ensure_key
+  rm -rf "$tree"; mkdir -p "$tree"
+
+  log "extracting boot files from $(basename "$iso")"
+  7z x -y -o"$tree" "$iso" bootmgr bootmgr.efi boot efi sources/boot.wim >/dev/null
+  [[ -f $tree/efi/microsoft/boot/efisys_noprompt.bin ]] || die "unexpected ISO layout (no efisys_noprompt.bin)"
+
+  log "patching boot.wim (WinPE shell -> winslim installer)"
+  wimlib-imagex export "$tree/sources/boot.wim" 2 "$tree/sources/boot.new.wim" --boot >/dev/null
+  crlf "$REPO/guest/winpeshl.ini" > "$tree/winpeshl.ini"
+  crlf "$REPO/guest/winslim-start.cmd" > "$tree/winslim-start.cmd"
+  wimlib-imagex update "$tree/sources/boot.new.wim" 1 >/dev/null <<EOF
+add '$tree/winpeshl.ini' /Windows/System32/winpeshl.ini
+add '$tree/winslim-start.cmd' /Windows/System32/winslim-start.cmd
+EOF
+  mv -f "$tree/sources/boot.new.wim" "$tree/sources/boot.wim"
+  rm -f "$tree/winpeshl.ini" "$tree/winslim-start.cmd"
+
+  log "extracting virtio drivers"
+  local d inc=()
+  for d in "${VIRTIO_DRIVERS[@]}"; do inc+=("$d/w11/amd64"); done
+  7z x -y -o"$BUILD/virtio" "$VIRTIO_ISO" "${inc[@]}" virtio-win-guest-tools.exe cert/Virtio_Win_Red_Hat_CA.cer >/dev/null
+  mkdir -p "$tree/drivers"
+  for d in "${VIRTIO_DRIVERS[@]}"; do
+    mkdir -p "$tree/drivers/${d,,}"
+    find "$BUILD/virtio/$d/w11/amd64" -maxdepth 1 -type f ! -name '*.pdb' -exec cp {} "$tree/drivers/${d,,}/" \;
+  done
+
+  log "staging winslim scripts and payload"
+  local ws=$tree/winslim pl=$tree/winslim/payload
+  mkdir -p "$pl"
+  crlf "$REPO/guest/pe.cmd" > "$ws/pe.cmd"
+  for f in appx-keep capabilities-remove features-remove features-keep-payload services-disable offline-delete; do
+    strip_list "$REPO/guest/lists/$f.txt" | crlf > "$ws/$f.txt"
+  done
+  crlf "$REPO/guest/lists/offline-reg.txt" > "$ws/offline-reg.txt"
+  local rev; rev=$(git -C "$REPO" describe --always --dirty 2>/dev/null || echo nogit)
+  crlf > "$ws/config.cmd" <<EOF
+set "WIN_EDITION=$WIN_EDITION"
+set "WIN_INDEX=${WIN_INDEX:-}"
+set "WIN_STRIP_PAYLOADS=$WIN_STRIP_PAYLOADS"
+set "WIN_COMPACT=$WIN_COMPACT"
+set "WINSLIM_DEBUG=${WINSLIM_DEBUG:-0}"
+set "WINSLIM_BUILD=$rev-$(date +%Y%m%d)"
+EOF
+  local e_user e_pw e_host e_tz
+  e_user=$(xml_escape "$WIN_USER"); e_pw=$(xml_escape "$WIN_PASSWORD")
+  e_host=$(xml_escape "$WIN_HOSTNAME"); e_tz=$(xml_escape "$WIN_TIMEZONE")
+  sed -e "s|@WIN_USER@|${e_user//|/\\|}|g" -e "s|@WIN_PASSWORD@|${e_pw//|/\\|}|g" \
+      -e "s|@WIN_HOSTNAME@|$e_host|g" -e "s|@WIN_TIMEZONE@|$e_tz|g" \
+      -e "s|@WIN_LOCALE@|$WIN_LOCALE|g" -e "s|@WIN_KEYBOARD@|$WIN_KEYBOARD|g" \
+      "$REPO/guest/unattend.xml.in" | crlf > "$ws/unattend.xml"
+  for f in SetupComplete.cmd setupcomplete.ps1 firstlogon.ps1 common.ps1; do crlf "$REPO/guest/payload/$f" > "$pl/$f"; done
+  strip_list "$REPO/guest/lists/appx-keep.txt" | crlf > "$pl/appx-keep.txt"
+  strip_list "$REPO/guest/lists/services-disable.txt" | crlf > "$pl/services-disable.txt"
+  { printf "\$WinUser = '%s'\r\n" "${WIN_USER//\'/\'\'}"
+    printf '$WinCompact = %s\r\n$RemoveWebView = %s\r\n' "$([[ $WIN_COMPACT == 1 ]] && echo '$true' || echo '$false')" \
+      "$([[ $WIN_REMOVE_WEBVIEW == 1 ]] && echo '$true' || echo '$false')"; } > "$pl/settings.ps1"
+  cp "$BUILD/virtio/virtio-win-guest-tools.exe" "$pl/"
+  cp "$BUILD/virtio/cert/Virtio_Win_Red_Hat_CA.cer" "$pl/virtio-ca.cer"
+  cp "$OPENSSH_MSI" "$pl/OpenSSH.msi"
+  { cat "$SSH_KEY.pub"; for k in ${SSH_EXTRA_PUBKEYS:-$HOME/.ssh/id_ed25519.pub}; do [[ -f $k ]] && cat "$k"; done; } | crlf > "$pl/authorized_keys"
+  rm -rf "$BUILD/virtio"
+}
+
+make_iso() { # make_iso <tree> <out.iso> <label>
+  log "writing $(basename "$2")"
+  xorriso -as mkisofs -quiet -iso-level 3 -J -joliet-long -relaxed-filenames -V "$3" \
+    -b boot/etfsboot.com -no-emul-boot -boot-load-size 8 -hide boot.catalog \
+    -eltorito-alt-boot -e efi/microsoft/boot/efisys_noprompt.bin -no-emul-boot \
+    -o "$2" "$1"
+}
+
+cmd_build() { ## build the small winslim boot ISO (WinPE + scripts + drivers)
+  stage_tree "$BUILD/tree"
+  make_iso "$BUILD/tree" "$BOOT_ISO" WINSLIM
+  rm -rf "$BUILD/tree"
+  log "boot ISO: $BOOT_ISO ($(du -h "$BOOT_ISO" | cut -f1))"
+}
+
+cmd_iso() { ## build a standalone slim installer ISO (single edition, ESD) - "iso to iso"
+  local iso tree=$BUILD/tree src; iso=$(win_iso)
+  stage_tree "$tree"
+  log "exporting '$WIN_EDITION' to install.esd (LZMS solid, takes a while)"
+  mkdir -p "$BUILD/src"
+  src=$(7z l "$iso" sources/install.wim | grep -q install.wim && echo sources/install.wim || echo sources/install.esd)
+  7z x -y -o"$BUILD/src" "$iso" "$src" >/dev/null
+  mkdir -p "$tree/sources"
+  wimlib-imagex export "$BUILD/src/$src" "$WIN_EDITION" "$tree/sources/install.esd" --compress=LZMS --solid
+  rm -rf "$BUILD/src"
+  if (( $(stat -c %s "$tree/sources/install.esd") >= 4294967295 )); then
+    log "install.esd > 4 GiB: splitting into .swm parts"
+    wimlib-imagex split "$tree/sources/install.esd" "$tree/sources/install.swm" 3800
+    rm -f "$tree/sources/install.esd"
+  fi
+  make_iso "$tree" "$SLIM_ISO" WINSLIM_FULL
+  rm -rf "$tree"
+  log "standalone ISO: $SLIM_ISO ($(du -h "$SLIM_ISO" | cut -f1))"
+  warn "this ISO wipes disk 0 without asking - it refuses to run on non-QEMU machines"
+}
+
+cmd_install() { ## unattended install into a fresh disk, then produce the golden base image [--gui] [--standalone]
+  local gui='' standalone=''
+  for a; do case $a in --gui) gui=1;; --standalone) standalone=1;; *) die "unknown option $a";; esac; done
+  need "$QEMU" "$QEMU_IMG"
+  pid_alive && die "VM is running - ./winvm stop first"
+  local cds=()
+  if [[ -n $standalone ]]; then
+    [[ -f $SLIM_ISO ]] || cmd_iso
+    cds=("$SLIM_ISO")
+  else
+    [[ -f $BOOT_ISO ]] || cmd_build
+    cds=("$BOOT_ISO" "$(win_iso)")
+  fi
+  [[ -f $BASE ]] && die "$BASE exists - ./winvm clean --base first to rebuild"
+  mkdir -p "$IMG_DIR" "$RUN"; ovmf
+  rm -f "$INSTALL_DISK" "$RUN/install-serial.log"
+  "$QEMU_IMG" create -q -f qcow2 "$INSTALL_DISK" "$DISK_SIZE"
+  cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"
+
+  qemu_args install "$INSTALL_DISK" "$gui"
+  local i bi
+  for i in "${!cds[@]}"; do   # first CD is the boot CD (after the still-empty disk)
+    bi=''; [[ $i == 0 ]] && bi=,bootindex=1
+    Q+=(-drive "if=none,id=cd$i,media=cdrom,readonly=on,file=${cds[$i]}"
+        -device "ide-cd,drive=cd$i,bus=ide.$i$bi")
+  done
+  log "starting unattended install (serial log: $RUN/install-serial.log)"
+  [[ -z $gui && -n $VNC_DISPLAY ]] && log "watch it: vncviewer 127.0.0.1:$((5900+VNC_DISPLAY))"
+  : > "$RUN/install-serial.log"
+  local t0=$SECONDS
+  "${Q[@]}" & local qpid=$!
+  echo "$qpid" > "$RUN/qemu.pid"
+  tail -n +1 -F --pid=$qpid "$RUN/install-serial.log" 2>/dev/null | tr -d '\r' | grep -a --line-buffered -E '^\[(PE|SC|FL|WIN)' &
+  local tpid=$!
+  local rc=0; wait "$qpid" || rc=$?
+  sleep 1; kill "$tpid" 2>/dev/null || true; rm -f "$RUN/qemu.pid"
+  log "QEMU exited (rc=$rc) after $(( (SECONDS-t0)/60 )) min"
+  grep -q 'WINSLIM-FAIL' "$RUN/install-serial.log" && die "install failed - see $RUN/install-serial.log (log also in C:\\Windows\\Setup on the disk)"
+  grep -q 'WINSLIM-DONE' "$RUN/install-serial.log" || die "install did not report WINSLIM-DONE - see $RUN/install-serial.log; disk kept at $INSTALL_DISK"
+  finalize
+}
+
+finalize() {
+  log "creating golden base image"
+  local opts=(-O qcow2); [[ $COMPRESS_BASE == 1 ]] && opts+=(-c -o compression_type=zstd)
+  "$QEMU_IMG" convert -p "${opts[@]}" "$INSTALL_DISK" "$BASE.tmp"
+  mv -f "$BASE.tmp" "$BASE"; chmod a-w "$BASE"
+  rm -f "$INSTALL_DISK"
+  cmd_reset
+  log "base image: $BASE ($(du -h "$BASE" | cut -f1) on disk)"
+  log "done - ./winvm start && ./winvm ssh"
+}
+
+cmd_reset() { ## throw away all changes: new empty overlay on top of the base image
+  pid_alive && die "VM is running - ./winvm stop first"
+  [[ -f $BASE ]] || die "no base image - run ./winvm install"
+  mkdir -p "$RUN"; ovmf
+  rm -f "$DISK"
+  "$QEMU_IMG" create -q -f qcow2 -F qcow2 -b "$BASE" "$DISK"
+  cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"
+  log "fresh overlay: $DISK"
+}
+
+cmd_start() { ## start the VM headless (daemonized) [--gui for a GTK window with clipboard]
+  local gui=''; [[ ${1:-} == --gui ]] && gui=1
+  need "$QEMU"
+  pid_alive && { log "already running (pid $(cat "$RUN/qemu.pid"))"; return 0; }
+  [[ -f $DISK ]] || cmd_reset
+  [[ -f $RUN/OVMF_VARS.fd ]] || { ovmf; cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"; }
+  qemu_args run "$DISK" "$gui"
+  if [[ -n $gui ]]; then
+    "${Q[@]}" -pidfile "$RUN/qemu.pid" >"$RUN/qemu.log" 2>&1 &
+    disown
+  else
+    "${Q[@]}" -pidfile "$RUN/qemu.pid" -daemonize
+  fi
+  sleep 1; pid_alive || die "QEMU failed to start (see $RUN/qemu.log)"
+  log "started $VM_NAME (pid $(cat "$RUN/qemu.pid")) ssh=127.0.0.1:$SSH_PORT${RDP_PORT:+ rdp=127.0.0.1:$RDP_PORT}${VNC_DISPLAY:+ vnc=127.0.0.1:$((5900+VNC_DISPLAY))}"
+}
+
+cmd_gui() { ## start with a GTK window (or attach a viewer if already running headless)
+  if pid_alive; then
+    [[ -n $VNC_DISPLAY ]] || die "running headless without VNC"
+    local v; for v in vncviewer remote-viewer gvncviewer; do command -v $v >/dev/null && exec $v "127.0.0.1:$((5900+VNC_DISPLAY))"; done
+    die "running headless - connect a VNC viewer to 127.0.0.1:$((5900+VNC_DISPLAY)) or RDP to 127.0.0.1:$RDP_PORT"
+  fi
+  cmd_start --gui
+}
+
+cmd_rdp() { ## open an RDP session (xfreerdp), nicer GUI than VNC: clipboard, resize
+  [[ -n $RDP_PORT ]] || die "RDP_PORT is empty"
+  local x; for x in xfreerdp3 xfreerdp sdl-freerdp3; do
+    command -v $x >/dev/null && exec $x "/v:127.0.0.1:$RDP_PORT" "/u:$WIN_USER" "/p:$WIN_PASSWORD" /cert:ignore /dynamic-resolution +clipboard "/drive:host,$SHARE_DIR" "$@"
+  done
+  die "no FreeRDP client found (dnf install freerdp)"
+}
+
+cmd_wait() { ## wait until SSH in the guest answers [timeout-seconds, default 300]
+  local t=${1:-300} cfg; cfg=$(ssh_config)
+  local end=$((SECONDS + t))
+  until ssh -F "$cfg" -o ConnectTimeout=3 -o BatchMode=yes "$VM_NAME" 'exit 0' 2>/dev/null; do
+    vm_alive || die "VM is not running"
+    (( SECONDS < end )) || die "timeout waiting for SSH"
+    sleep 2
+  done
+}
+
+cmd_ssh() { ## interactive PowerShell in the guest (starts the VM if needed); extra args go to ssh
+  vm_alive || cmd_start
+  cmd_wait
+  exec ssh -F "$(ssh_config)" "$VM_NAME" "$@"
+}
+
+cmd_run() { ## run a command in the guest (PowerShell), e.g. ./winvm run 'Get-Process | select -first 5'
+  [[ $# -gt 0 ]] || die "usage: winvm run <powershell command>"
+  vm_alive || cmd_start
+  cmd_wait
+  exec ssh -F "$(ssh_config)" -o BatchMode=yes "$VM_NAME" "$*"
+}
+
+cmd_cp() { ## scp files; prefix guest paths with ':'  e.g. ./winvm cp a.txt :C:/Users/user/  |  ./winvm cp :C:/x.log .
+  local args=() a
+  for a; do [[ $a == :* ]] && a="$VM_NAME$a"; args+=("$a"); done
+  exec scp -F "$(ssh_config)" -r "${args[@]}"
+}
+
+cmd_ga() { ## talk to qemu-guest-agent (works without network), e.g. ./winvm ga guest-info | ./winvm ga exec ipconfig /all
+  [[ -S $RUN/qga.sock ]] || die "VM not running"
+  local sub=${1:-guest-ping}; shift || true
+  if [[ $sub == exec ]]; then
+    [[ $# -gt 0 ]] || die "usage: winvm ga exec <program> [args...]"
+    exec python3 -I "$REPO/lib/qjson.py" exec "$RUN/qga.sock" "$@"
+  fi
+  python3 -I "$REPO/lib/qjson.py" qga "$RUN/qga.sock" "{\"execute\":\"$sub\"}"
+}
+
+cmd_stop() { ## graceful shutdown (ACPI power button), force-kill after 120s
+  pid_alive || { log "not running"; return 0; }
+  qmp '{"execute":"system_powerdown"}' >/dev/null
+  local i; for i in $(seq 120); do pid_alive || { log "stopped"; return 0; }; sleep 1; done
+  warn "guest did not power off in time - killing"; cmd_kill
+}
+
+cmd_kill() { ## hard power-off
+  pid_alive && kill "$(cat "$RUN/qemu.pid")" && sleep 1
+  rm -f "$RUN/qemu.pid"; log "killed"
+}
+
+cmd_status() { ## show VM state, ports, disk usage
+  if pid_alive; then echo "running  pid=$(cat "$RUN/qemu.pid")"; else echo "stopped"; fi
+  echo "ssh      ssh -F $RUN/ssh_config $VM_NAME   (127.0.0.1:$SSH_PORT)"
+  [[ -n $RDP_PORT ]] && echo "rdp      127.0.0.1:$RDP_PORT  user=$WIN_USER"
+  [[ -n $VNC_DISPLAY ]] && echo "vnc      127.0.0.1:$((5900+VNC_DISPLAY))"
+  echo "share    $SHARE_DIR  ->  guest C:\\host (\\\\10.0.2.4\\qemu)"
+  local f; for f in "$BASE" "$DISK" "$BOOT_ISO" "$SLIM_ISO"; do
+    [[ -f $f ]] && printf '%-8s %6s on disk  %s\n' "$(basename "${f%.*}" | sed "s/^$VM_NAME-\?//;s/^$/overlay/")" "$(du -h "$f" | cut -f1)" "$f"
+  done
+  return 0
+}
+
+cmd_screenshot() { ## save a PNG of the guest screen [file]
+  local out=${1:-$RUN/screen.png}
+  qmp "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"$out\",\"format\":\"png\"}}" >/dev/null
+  echo "$out"
+}
+
+cmd_cmdline() { ## print the QEMU command line used by `start`
+  qemu_args run "$DISK" "${1:-}"; printf '%q ' "${Q[@]}"; echo
+}
+
+# ---------------------------------------------------------------- libvirt
+virt() { virsh -c "$LIBVIRT_URI" "$@"; }
+
+cmd_virt_define() { ## define the libvirt domain (qemu:///session) from libvirt/winslim.xml.in
+  need virsh
+  [[ -f $DISK ]] || cmd_reset
+  mkdir -p "$RUN"
+  local net qemu_bin; net=$(netdev_user wsnet0); qemu_bin=$(command -v "$QEMU")
+  sed -e "s|@VM_NAME@|$VM_NAME|g" -e "s|@RAM_MIB@|$(mib "$RAM")|g" -e "s|@CPUS@|$CPUS|g" \
+      -e "s|@DISK@|$DISK|g" -e "s|@RUN_DIR@|$RUN|g" -e "s|@QEMU_BIN@|$qemu_bin|g" -e "s|@NETDEV@|$net|g" \
+      "$REPO/libvirt/winslim.xml.in" > "$RUN/$VM_NAME.xml"
+  virt define "$RUN/$VM_NAME.xml"
+  if ! grep -qsE '^[[:space:]]*seccomp_sandbox[[:space:]]*=[[:space:]]*0' "$HOME/.config/libvirt/qemu.conf"; then
+    warn "libvirt runs QEMU with seccomp spawn=deny, so the SMB share (C:\\host) won't work under libvirt."
+    warn "to enable it: echo 'seccomp_sandbox = 0' >> ~/.config/libvirt/qemu.conf  (then restart virtqemud)"
+  fi
+  log "defined '$VM_NAME' on $LIBVIRT_URI  (virsh -c $LIBVIRT_URI start $VM_NAME; virt-manager -c $LIBVIRT_URI)"
+}
+
+cmd_virt_undefine() { ## remove the libvirt domain (keeps disks)
+  virt undefine --nvram "$VM_NAME"
+}
+
+cmd_virsh() { ## virsh passthrough with the right URI, e.g. ./winvm virsh start winslim
+  virt "$@"
+}
+
+# ---------------------------------------------------------------- housekeeping
+cmd_clean() { ## remove build leftovers [--base also deletes base image+overlay] [--all also ISOs+cache]
+  pid_alive && die "VM is running"
+  rm -rf "$BUILD" "$INSTALL_DISK" "$IMG_DIR"/*.tmp
+  case ${1:-} in
+    --base) rm -f "$BASE" "$DISK" "$RUN/OVMF_VARS.fd";;
+    --all)  rm -f "$BASE" "$DISK" "$BOOT_ISO" "$SLIM_ISO" "$RUN/OVMF_VARS.fd"; rm -rf "$CACHE";;
+  esac
+  log "cleaned"
+}
+
+cmd_all() { ## fetch + build + install
+  cmd_fetch; cmd_build; cmd_install "$@"
+}
+
+cmd_help() {
+  echo "usage: winvm <command> [args]"; echo
+  local name desc
+  while IFS=$'\t' read -r name desc; do printf '  %-14s %s\n' "${name//_/-}" "$desc"; done < <(
+    sed -nE 's/^cmd_([a-z_]+)\(\) \{ ## (.*)/\1\t\2/p' "$0")
+  echo; echo "config: $REPO/config.env (override in config.local.env)   data: $DATA_DIR"
+}
+
+main() {
+  local sub=${1:-help}; shift || true
+  local fn=cmd_${sub//-/_}
+  declare -F "$fn" >/dev/null || { cmd_help; exit 1; }
+  "$fn" "$@"
+}
+main "$@"; exit

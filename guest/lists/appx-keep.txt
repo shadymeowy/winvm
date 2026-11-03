@@ -1,0 +1,10 @@
+# Provisioned AppX packages to KEEP (prefix match on PackageName). Everything else is removed.
+# Frameworks (dependencies of the kept apps):
+Microsoft.VCLibs.
+Microsoft.UI.Xaml.
+Microsoft.NET.Native.
+Microsoft.WindowsAppRuntime.
+# Apps worth having in a slim VM:
+Microsoft.DesktopAppInstaller_
+Microsoft.WindowsTerminal_
+Microsoft.WindowsNotepad_

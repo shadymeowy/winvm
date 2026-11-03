@@ -1,0 +1,7 @@
+# Disabled optional features whose payload is KEPT when WIN_STRIP_PAYLOADS=1
+# (so they can still be enabled later without a source). Prefix match.
+Microsoft-Windows-Subsystem-Linux
+VirtualMachinePlatform
+Microsoft-Hyper-V
+HypervisorPlatform
+Containers

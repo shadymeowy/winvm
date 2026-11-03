@@ -1,0 +1,23 @@
+# Windows capabilities (Features on Demand) to remove (prefix match on identity).
+Accessibility.Braille~
+Analog.Holographic.Desktop~
+App.StepsRecorder~
+App.Support.QuickAssist~
+Browser.InternetExplorer~
+Hello.Face.
+Language.Handwriting~
+Language.OCR~
+Language.Speech~
+Language.TextToSpeech~
+MathRecognizer~
+Media.WindowsMediaPlayer~
+Microsoft.Wallpapers.Extended~
+Microsoft.Windows.MSPaint~
+Microsoft.Windows.PowerShell.ISE~
+Microsoft.Windows.SnippingTool~
+Microsoft.Windows.Wifi.Client.
+Microsoft.Windows.WordPad~
+OneCoreUAP.OneSync~
+Print.Fax.Scan~
+Print.Management.Console~
+VBSCRIPT~

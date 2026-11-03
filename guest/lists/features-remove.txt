@@ -1,0 +1,10 @@
+# Optional features to disable AND strip from disk (exact names, /Remove).
+Recall
+Windows-Defender-Default-Definitions
+Printing-XPSServices-Features
+WorkFolders-Client
+MediaPlayback
+WindowsMediaPlayer
+Microsoft-SnippingTool
+MicrosoftWindowsPowerShellV2Root
+MicrosoftWindowsPowerShellV2

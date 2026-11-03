@@ -1,0 +1,51 @@
+# Services set to Start=4 (disabled) in the offline SYSTEM hive. Missing ones are skipped.
+# Defender / security center
+WinDefend
+WdNisSvc
+WdNisDrv
+WdFilter
+WdBoot
+Sense
+MDCoreSvc
+SecurityHealthService
+wscsvc
+webthreatdefsvc
+webthreatdefusersvc
+# Windows Update / delivery
+wuauserv
+UsoSvc
+WaaSMedicSvc
+DoSvc
+edgeupdate
+edgeupdatem
+MicrosoftEdgeElevationService
+# Telemetry / diagnostics / error reporting
+DiagTrack
+dmwappushservice
+WerSvc
+wercplsupport
+PcaSvc
+TrkWks
+# Search indexing / prefetch
+WSearch
+SysMain
+# Consumer stuff irrelevant in a VM
+MapsBroker
+lfsvc
+RetailDemo
+wisvc
+XblAuthManager
+XblGameSave
+XboxNetApiSvc
+XboxGipSvc
+PhoneSvc
+Fax
+WpcMonSvc
+SEMgrSvc
+WalletService
+icssvc
+CDPSvc
+OneSyncSvc
+# Printing
+Spooler
+PrintNotify

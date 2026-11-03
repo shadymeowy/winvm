@@ -1,0 +1,95 @@
+<!-- winslim libvirt domain (qemu:///session, rootless). Rendered by `./winvm virt-define`.
+     Networking is QEMU user-mode (slirp) via qemu:commandline so we get the same
+     localhost port forwards and the built-in SMB share (\\10.0.2.4\qemu) as ./winvm start. -->
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>@VM_NAME@</name>
+  <title>winslim Windows VM</title>
+  <memory unit='MiB'>@RAM_MIB@</memory>
+  <currentMemory unit='MiB'>@RAM_MIB@</currentMemory>
+  <vcpu placement='static'>@CPUS@</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='secure-boot'/>
+      <feature enabled='no' name='enrolled-keys'/>
+    </firmware>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vpindex state='on'/>
+      <runtime state='on'/>
+      <synic state='on'/>
+      <stimer state='on'/>
+      <reset state='on'/>
+      <frequencies state='on'/>
+      <tlbflush state='on'/>
+      <ipi state='on'/>
+    </hyperv>
+    <vmport state='off'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='on'>
+    <topology sockets='1' dies='1' cores='@CPUS@' threads='1'/>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>@QEMU_BIN@</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='writeback' discard='unmap' detect_zeroes='unmap'/>
+      <source file='@DISK@'/>
+      <target dev='sda' bus='scsi' rotation_rate='1'/>
+    </disk>
+    <controller type='scsi' model='virtio-scsi'/>
+    <controller type='virtio-serial'/>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <channel type='qemu-vdagent'>
+      <source>
+        <clipboard copypaste='yes'/>
+        <mouse mode='client'/>
+      </source>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>
+    <input type='tablet' bus='virtio'/>
+    <input type='keyboard' bus='virtio'/>
+    <graphics type='vnc' listen='127.0.0.1' autoport='yes'/>
+    <video>
+      <model type='vga' vram='16384' heads='1' primary='yes'/>
+    </video>
+    <serial type='file'>
+      <source path='@RUN_DIR@/libvirt-serial.log'/>
+      <target port='0'/>
+    </serial>
+    <memballoon model='virtio'/>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+  <!-- session domain: run unconfined like ./winvm start, so QEMU's built-in smbd can
+       read $SHARE_DIR in your home (svirt labels would block it) -->
+  <seclabel type='none'/>
+  <qemu:commandline>
+    <qemu:arg value='-netdev'/>
+    <qemu:arg value='@NETDEV@'/>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='virtio-net-pci,netdev=wsnet0,mac=52:54:00:57:53:4c,bus=pcie.0,addr=0x10'/>
+  </qemu:commandline>
+</domain>
