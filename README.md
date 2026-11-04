@@ -1,7 +1,7 @@
 # winvm: slim, reproducible Windows VMs from one YAML file
 
 `winvm` turns an **official Microsoft Windows ISO** into a minimal Windows VM on
-QEMU/KVM: unattended, reproducible, no root, not activated (you activate it). Images
+QEMU/KVM: unattended, reproducible, runs as your user, not activated. Images
 build on each other like Dockerfiles, and instances run like compose services, all
 described in one `winvm.yaml`.
 
@@ -17,23 +17,56 @@ described in one `winvm.yaml`.
 * **Layers.** Images are zstd-compressed read-only qcow2 layers; instances run on thin
   disks on top. Several instances run at once, each with its own ports.
 
+## Requirements
+
+* Linux x86-64 with KVM (`/dev/kvm` usable by you; on most distros: be in group `kvm`)
+* Python ≥ 3.10, about 25 GB free disk, 8 GB RAM or more (a VM takes 4 GB by default)
+* an official Windows 10/11 ISO, downloaded in a browser from
+  <https://www.microsoft.com/software-download/windows11>
+* host tools:
+
+  ```sh
+  # Fedora
+  sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils samba guestfs-tools
+  # Debian / Ubuntu (package names not tested)
+  sudo apt install qemu-system-x86 ovmf xorriso p7zip-full wimtools samba libguestfs-tools
+  ```
+
+  `samba` is only needed for mounts, `guestfs-tools` for `slim` images and a small
+  cleanup step. `winvm` itself runs as your user, never as root.
+
+## Install
+
+From a checkout of this repository:
+
+```sh
+uv tool install .            # or: pipx install .   or: pip install --user .
+winvm --help                 # every command also has --help
+```
+
 ## Quick start
 
 ```sh
-# host packages (Fedora names; samba is for mounts, guestfs-tools for slim images)
-sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils samba guestfs-tools
-pip install winvm            # or: pipx install winvm / uv tool install winvm
-
-# Windows ISO: download in a browser from https://www.microsoft.com/software-download/windows11
-winvm up --iso ~/Downloads/Win11_25H2_English_x64.iso    # ~22 min the first time, then seconds
-winvm sh                     # PowerShell in the guest
+winvm up --iso ~/Downloads/Win11_25H2_English_x64.iso   # first time ~22 min: builds image `base`
+winvm sh                     # PowerShell in the guest (exit with `exit`)
 winvm sh Get-ComputerInfo -Property OsName,OsBuildNumber
 winvm stop
 ```
 
-That's all it needs: without a config file `winvm` uses its built-in one, builds
-image `base` from the ISO and starts instance `main` on it. The `--iso` is
-remembered (linked into `~/.local/share/winvm/iso`).
+No config file is needed: `winvm` uses its built-in one, builds image `base` from the
+ISO and starts instance `main` on it. The `--iso` is remembered (linked into
+`~/.local/share/winvm/iso`), so from now on it's just:
+
+```sh
+winvm up                     # ~15 s until SSH answers
+winvm sh <command>           # as often as you like, ~0.6 s each
+winvm stop
+```
+
+`main` keeps everything you do in it across stop/start. `winvm reset` gives it a fresh
+Windows again; `winvm save NAME` freezes its current state as an image to come back
+to or start other instances from. To bake your own tools into images, write a
+`winvm.yaml` (next section).
 
 ## winvm.yaml
 
@@ -250,4 +283,6 @@ delete `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` and set `wuauser
 * The ISO from `winvm iso` wipes disk 0 without asking; it refuses to run unless
   the SMBIOS vendor is QEMU (create `winslim\force` on the media to override).
 * Windows ISOs have to be downloaded by hand; winvm doesn't script Microsoft's site.
-* Development: `uv tool install -e .` (or `pip install -e .`) from a checkout.
+* The debloat lists (what gets removed) ship inside the package. To change them,
+  edit `src/winvm/data/guest/lists/*.txt` in a checkout and install it with
+  `uv tool install -e .` (editable); images rebuild because their hash changes.
