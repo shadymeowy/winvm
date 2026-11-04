@@ -1,7 +1,7 @@
 # winslim: a minimal, reproducible Windows 11 VM
 
 `winvm` turns an **official Microsoft Windows ISO** into a minimal Windows VM for
-QEMU/KVM and libvirt. The build is unattended and reproducible, needs no root,
+QEMU/KVM. The build is unattended and reproducible, needs no root,
 and is not activated (you activate it yourself).
 
 * No Windows Update, Defender, SmartScreen, Copilot/Recall/AI, Edge, OneDrive,
@@ -19,7 +19,6 @@ and is not activated (you activate it yourself).
   agent still works when the network doesn't.
 * **Samba share.** `$SHARE_DIR` on the host is `C:\host` in the guest (QEMU's
   built-in SMB server, no host config needed). It's read-write in both directions.
-* **libvirt** domain (`qemu:///session`) with the same disk, ports and share.
 
 Big files (ISOs, disks, caches) live in `~/Others/vm`. This repo holds only
 scripts and config.
@@ -29,7 +28,7 @@ scripts and config.
 ```sh
 # 1. one-time: host packages (Fedora names)
 sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils samba aria2
-# optional: libvirt-daemon-kvm virt-manager (libvirt mode), guestfs-tools (offline cleanup), freerdp
+# optional: guestfs-tools (offline cleanup), freerdp
 
 # 2. Windows ISO: download in a browser from
 #    https://www.microsoft.com/software-download/windows11  ("Download Windows 11 Disk Image (ISO)")
@@ -73,7 +72,6 @@ sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils sam
 | `balloon [size]` | show or change guest RAM live, returning memory to the host |
 | `screenshot` | PNG of the guest screen, handy when headless |
 | `cmdline` | print the exact QEMU command line used by `start` |
-| `virt-define` / `virt-undefine` / `virsh …` | libvirt session domain |
 | `clean [--base\|--all]` | remove build leftovers, also the base image, or everything |
 
 ## How it works
@@ -166,32 +164,6 @@ with VNC or `./winvm screenshot`) instead of powering off.
   needs `smbd` on the host; QEMU starts its own private instance.
 * All forwards bind to 127.0.0.1 only. The guest firewall is off on purpose.
 
-## libvirt
-
-```sh
-./winvm virt-define                 # renders libvirt/winslim.xml.in into qemu:///session
-./winvm virsh start winslim
-virt-manager -c qemu:///session     # GUI, if you like
-./winvm ssh                         # same ports/share as the plain QEMU launcher
-```
-
-Don't run the libvirt domain and `./winvm start` at the same time. They share the
-working disk, and QEMU's image locking will refuse.
-
-**SMB share under libvirt:** libvirt starts QEMU with a seccomp sandbox that
-forbids spawning processes, so QEMU can't launch its private `smbd`, and the
-sandbox can't be relaxed per domain. SSH, RDP, the guest agent and internet all
-work regardless. To get `C:\host` under libvirt too, turn the sandbox off for
-your session daemon (`virt-define` warns until you do):
-
-```sh
-echo 'seccomp_sandbox = 0' >> ~/.config/libvirt/qemu.conf
-systemctl --user restart virtqemud 2>/dev/null || pkill -u "$USER" virtqemud
-```
-
-The domain runs with `<seclabel type='none'/>` (unconfined, like the plain
-launcher), so QEMU can read the share in your home directory despite SELinux.
-
 ## Results
 
 Measured on this repo's defaults (Windows 11 Pro, build 26300, 4 vCPU/4 GB, KVM):
@@ -246,7 +218,7 @@ shows exactly the same thing as `./winvm layers`.
 Saved layers are never written again, so whatever is built on them stays valid.
 Only one working disk exists at a time. Activate Windows/Office in a layer you then
 `save`, otherwise `reset` throws the activation away. The VM has a fixed SMBIOS UUID
-(`VM_UUID`, same in the libvirt domain) so every layer looks like the same machine.
+(`VM_UUID`) so every layer looks like the same machine.
 
 ### Office
 

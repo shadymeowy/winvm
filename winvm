@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# winvm - build and drive a slim, unattended Windows VM (QEMU/KVM + libvirt).
+# winvm - build and drive a slim, unattended Windows VM (QEMU/KVM).
 # Small files live in this repo; big ones in $DATA_DIR (default ~/Others/vm).
 set -euo pipefail
 
@@ -69,9 +69,7 @@ ovmf() { # sets OVMF_CODE / OVMF_VARS (non-secure-boot, raw)
   die "OVMF firmware not found (install edk2-ovmf, or set OVMF_CODE/OVMF_VARS)"
 }
 
-pid_alive() { [[ -f $RUN/qemu.pid ]] && kill -0 "$(cat "$RUN/qemu.pid")" 2>/dev/null; }
-virt_alive() { command -v virsh >/dev/null && [[ $(virsh -c "$LIBVIRT_URI" domstate "$VM_NAME" 2>/dev/null) == running ]]; }
-vm_alive() { pid_alive || virt_alive; }   # either launcher or libvirt
+vm_alive() { [[ -f $RUN/qemu.pid ]] && kill -0 "$(cat "$RUN/qemu.pid")" 2>/dev/null; }
 
 qmp() { # qmp '{"execute":"..."}'  -> prints reply
   [[ -S $RUN/qmp.sock ]] || die "QMP socket missing - is the VM running via ./winvm start?"
@@ -457,8 +455,7 @@ cmd_drop() { ## delete layer <name> (refused while another layer or the working 
 cmd_start() { ## start the VM headless (daemonized) [--gui for a GTK window with clipboard]
   local gui=''; [[ ${1:-} == --gui ]] && gui=1
   need "$QEMU"
-  pid_alive && { log "already running (pid $(cat "$RUN/qemu.pid"))"; return 0; }
-  virt_alive && { log "already running under libvirt ($LIBVIRT_URI)"; return 0; }
+  vm_alive && { log "already running (pid $(cat "$RUN/qemu.pid"))"; return 0; }
   [[ -f $DISK ]] || cmd_reset
   [[ -f $RUN/OVMF_VARS.fd ]] || { ovmf; cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"; }
   need_mem "$(mib "$RAM")" "the VM"
@@ -469,12 +466,12 @@ cmd_start() { ## start the VM headless (daemonized) [--gui for a GTK window with
   else
     "${Q[@]}" -pidfile "$RUN/qemu.pid" -daemonize
   fi
-  sleep 1; pid_alive || die "QEMU failed to start (see $RUN/qemu.log)"
+  sleep 1; vm_alive || die "QEMU failed to start (see $RUN/qemu.log)"
   log "started $VM_NAME (pid $(cat "$RUN/qemu.pid")) ssh=127.0.0.1:$SSH_PORT${RDP_PORT:+ rdp=127.0.0.1:$RDP_PORT}${VNC_DISPLAY:+ vnc=127.0.0.1:$((5900+VNC_DISPLAY))}"
 }
 
 cmd_gui() { ## start with a GTK window (or attach a viewer if already running headless)
-  if pid_alive; then
+  if vm_alive; then
     [[ -n $VNC_DISPLAY ]] || die "running headless without VNC"
     local port=$((5900+VNC_DISPLAY))
     command -v remote-viewer >/dev/null && exec remote-viewer "vnc://127.0.0.1:$port"
@@ -532,25 +529,19 @@ cmd_ga() { ## talk to qemu-guest-agent (works without network), e.g. ./winvm ga 
 }
 
 cmd_stop() { ## graceful shutdown (ACPI power button), force-kill after 120s
-  if virt_alive; then
-    virt shutdown "$VM_NAME" >/dev/null
-    local j; for j in $(seq 120); do virt_alive || { log "stopped (libvirt)"; return 0; }; sleep 1; done
-    warn "guest did not power off in time - destroying"; virt destroy "$VM_NAME"; return 0
-  fi
-  pid_alive || { log "not running"; return 0; }
+  vm_alive || { log "not running"; return 0; }
   qmp '{"execute":"system_powerdown"}' >/dev/null
-  local i; for i in $(seq 120); do pid_alive || { log "stopped"; return 0; }; sleep 1; done
+  local i; for i in $(seq 120); do vm_alive || { log "stopped"; return 0; }; sleep 1; done
   warn "guest did not power off in time - killing"; cmd_kill
 }
 
 cmd_kill() { ## hard power-off
-  pid_alive && kill "$(cat "$RUN/qemu.pid")" && sleep 1
+  vm_alive && kill "$(cat "$RUN/qemu.pid")" && sleep 1
   rm -f "$RUN/qemu.pid"; log "killed"
 }
 
 cmd_status() { ## show VM state, ports, disk usage
-  if pid_alive; then echo "running  pid=$(cat "$RUN/qemu.pid") (qemu launcher)"
-  elif virt_alive; then echo "running  (libvirt $LIBVIRT_URI)"; else echo "stopped"; fi
+  if vm_alive; then echo "running  pid=$(cat "$RUN/qemu.pid")"; else echo "stopped"; fi
   echo "ssh      ssh -F $RUN/ssh_config $VM_NAME   (127.0.0.1:$SSH_PORT)"
   [[ -n $RDP_PORT ]] && echo "rdp      127.0.0.1:$RDP_PORT  user=$WIN_USER"
   [[ -n $VNC_DISPLAY ]] && echo "vnc      127.0.0.1:$((5900+VNC_DISPLAY))"
@@ -579,33 +570,6 @@ cmd_screenshot() { ## save a PNG of the guest screen [file]
 
 cmd_cmdline() { ## print the QEMU command line used by `start`
   qemu_args run "$DISK" "${1:-}"; printf '%q ' "${Q[@]}"; echo
-}
-
-# ---------------------------------------------------------------- libvirt
-virt() { virsh -c "$LIBVIRT_URI" "$@"; }
-
-cmd_virt_define() { ## define the libvirt domain (qemu:///session) from libvirt/winslim.xml.in
-  need virsh
-  [[ -f $DISK ]] || cmd_reset
-  mkdir -p "$RUN"
-  local net qemu_bin; net=$(netdev_user wsnet0); qemu_bin=$(command -v "$QEMU")
-  sed -e "s|@VM_NAME@|$VM_NAME|g" -e "s|@VM_UUID@|$VM_UUID|g" -e "s|@RAM_MIB@|$(mib "$RAM")|g" -e "s|@CPUS@|$CPUS|g" \
-      -e "s|@DISK@|$DISK|g" -e "s|@RUN_DIR@|$RUN|g" -e "s|@QEMU_BIN@|$qemu_bin|g" -e "s|@NETDEV@|$net|g" \
-      "$REPO/libvirt/winslim.xml.in" > "$RUN/$VM_NAME.xml"
-  virt define "$RUN/$VM_NAME.xml"
-  if ! grep -qsE '^[[:space:]]*seccomp_sandbox[[:space:]]*=[[:space:]]*0' "$HOME/.config/libvirt/qemu.conf"; then
-    warn "libvirt runs QEMU with seccomp spawn=deny, so the SMB share (C:\\host) won't work under libvirt."
-    warn "to enable it: echo 'seccomp_sandbox = 0' >> ~/.config/libvirt/qemu.conf  (then restart virtqemud)"
-  fi
-  log "defined '$VM_NAME' on $LIBVIRT_URI  (virsh -c $LIBVIRT_URI start $VM_NAME; virt-manager -c $LIBVIRT_URI)"
-}
-
-cmd_virt_undefine() { ## remove the libvirt domain (keeps disks)
-  virt undefine --nvram "$VM_NAME"
-}
-
-cmd_virsh() { ## virsh passthrough with the right URI, e.g. ./winvm virsh start winslim
-  virt "$@"
 }
 
 # ---------------------------------------------------------------- housekeeping
