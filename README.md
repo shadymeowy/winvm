@@ -91,8 +91,20 @@ winvm stop
 
 `main` keeps everything you do in it across stop/start. `winvm reset` gives it a fresh
 Windows again; `winvm save NAME` freezes its current state as an image to come back
-to or start other instances from. To bake your own tools into images, write image
-files (next section).
+to or start other instances from:
+
+```sh
+winvm stop                          # save needs the instance stopped
+winvm save office                   # main's disk becomes image "office" (compressed, read-only)
+winvm up work --image office        # a second instance, "work", starting from it
+winvm -i work sh                    # -i picks the instance (default: main)
+winvm reset                         # later: main back to "office", dropping what came after
+```
+
+`main` continues on the saved image, so the image itself never changes. A saved image
+can't be rebuilt (there is no recipe) and stays on the `base` it was made from. To
+bake your own tools into images that rebuild on a newer `base`, write image files
+(next section).
 
 ## Images
 
