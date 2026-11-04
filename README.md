@@ -29,7 +29,8 @@ share and reuse.
   sudo pacman -S qemu-base                       # Arch
   ```
 
-  plus `samba` if you want mounts (host folders in the guest).
+  plus the OpenSSH client (`ssh`, usually there already), and `samba` if you want
+  mounts (host folders in the guest). winvm's errors say what to install on your distro.
 * Python ≥ 3.10, 8 GB RAM or more (a VM takes 4 GB by default), and disk space: about
   9 GB for the downloads (mostly the Windows ISO) plus about 6 GB per built `base`,
   25 GB free to be comfortable
@@ -43,12 +44,18 @@ as root.
 
 ## Install
 
-From a checkout of this repository:
+From PyPI:
 
 ```sh
-uv tool install .            # or: pipx install .   or: pip install --user .
+pipx install winvm           # or: uv tool install winvm   or: pip install winvm
 winvm check                  # what the host has, what will be downloaded
 ```
+
+Upgrade with `pipx upgrade winvm` (or `uv tool upgrade winvm`); built images and
+instances stay. A version that changes how `base` is built marks it outdated
+(`winvm images`): instances keep the version they run on, and the next build of `base`
+(e.g. for a new instance) installs Windows again. From a checkout of this repository: `uv tool install .` (or `pipx
+install .`).
 
 Shell completion: commands and options come from winvm's own definitions (rerun after
 updates); instance and image names (`-i`, `stop`, `--image`, `rmi`, `reset`, ...) are looked

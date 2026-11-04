@@ -27,7 +27,7 @@ RAW = set()   # commands whose arguments are passed through verbatim (PowerShell
 
 
 def arg(*flags, **kw):
-    """An argparse argument; names="instances"/"images": shell completion offers those."""
+    """An argparse argument; names="instances"/"images"/"mounts": shell completion offers those."""
     return flags, kw
 
 
@@ -369,7 +369,7 @@ def cmd_mount(a):
     log(f"{path} -> {vm.name}:{spot}")
 
 
-@command(arg("which", metavar="NAME|WINPATH"))
+@command(arg("which", metavar="NAME|WINPATH", names="mounts"))
 def cmd_umount(a):
     """remove a mount from the running instance, by name or where it is (C:\\work)"""
     log(f"unmounted {inst(a).umount(a.which)}")
@@ -647,7 +647,7 @@ def cmd_completion(a):
                       for k in set(pos_kind.values()))
         sys.stdout.write(f"""# winvm {__version__} bash completion (winvm completion bash)
 _winvm() {{
-  local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} cmd="" opts="" kind="" i
+  local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} cmd="" opts="" kind="" inst="" i
   case $prev in
 {prev}  esac
   if [[ -n $kind ]]; then
@@ -656,6 +656,7 @@ _winvm() {{
   fi
   for ((i = 1; i < COMP_CWORD; i++)); do
     case ${{COMP_WORDS[i]}} in
+      -i|--instance) inst=${{COMP_WORDS[i+1]}}; ((i++));;
       {'|'.join(vals)}) ((i++));;
       -*) ;;
       *) cmd=${{COMP_WORDS[i]}}; break;;
@@ -673,7 +674,7 @@ _winvm() {{
   fi
   case $cmd in
 {pos}  esac
-  [[ -n $kind ]] && COMPREPLY=($(compgen -W "$(winvm __names $kind 2>/dev/null)" -- "$cur"))
+  [[ -n $kind ]] && COMPREPLY=($(compgen -W "$(winvm __names $kind $inst 2>/dev/null)" -- "$cur"))
   case $cmd in {'|'.join(n for names, _ in subs if names[0] in FILE_ARGS for n in names)}) COMPREPLY+=($(compgen -f -- "$cur"));; esac
 }}
 complete -o default -o bashdefault -F _winvm winvm
@@ -695,6 +696,15 @@ complete -o default -o bashdefault -F _winvm winvm
         set -e toks[1]
     end
     return 1
+end""", """function __winvm_inst
+    set -l toks (commandline -opc)[2..]
+    while set -q toks[2]
+        if contains -- $toks[1] -i --instance
+            echo $toks[2]
+            return 0
+        end
+        set -e toks[1]
+    end
 end""", "complete -c winvm -f"]
     top = "'not __winvm_cmd >/dev/null'"
     for act in p._actions:
@@ -713,7 +723,7 @@ end""", "complete -c winvm -f"]
             elif not act.option_strings and act.choices:
                 out.append(f"complete -c winvm -n {seen} -a '{' '.join(act.choices)}'")
             elif not act.option_strings and getattr(act, "names", None):
-                out.append(f"complete -c winvm -n {seen} -a '(winvm __names {act.names})'")
+                out.append(f"complete -c winvm -n {seen} -a '(winvm __names {act.names} (__winvm_inst))'")
     print("\n".join(out))
 
 
@@ -731,12 +741,14 @@ def fish_opt(cond: str, act, q) -> str:
     return f"complete -c winvm -n {cond} {flags}{takes}{names} -d '{q(act.help)}'"
 
 
-def complete_names(kind: str) -> int:
-    """`winvm __names instances|images`: for shell completion - quiet, never fails."""
+def complete_names(kind: str, instance: str | None = None) -> int:
+    """`winvm __names instances|images|mounts [INSTANCE]`: for shell completion - quiet, never fails."""
     try:
         cfg = Config()
         store = Store(cfg)
-        if kind == "instances":
+        if kind == "mounts":                                   # of the running instance (-i, else main)
+            names = list(Instance(cfg, valid(instance or "main")).mounts)
+        elif kind == "instances":
             names = [d.parent.name for d in store.disks()]
         else:
             names = sorted(set(cfg.images) | {f.stem.split("@")[0] for f in store.all()})
@@ -784,7 +796,7 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["__names"]:                                # (hidden) for shell completion
-        return complete_names(argv[1] if len(argv) > 1 else "")
+        return complete_names(*(argv[1:3] or [""]))
     p, _ = parser()
 
     # raw commands get everything after their name untouched (PowerShell, ssh, scp arguments)
