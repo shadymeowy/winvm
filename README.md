@@ -81,6 +81,7 @@ Handy alias: `alias w='~/Projects/vm/winvm sh'`, then `w ipconfig`.
 | `editions` | list the editions inside the Windows ISO |
 | `build` | build `winslim-boot.iso` (~650 MB): patched WinPE, scripts, drivers |
 | `iso` | **iso→iso**: standalone installer `winslim-standalone.iso` holding the *already debloated* image |
+| `iso --payload` | renew only the first-boot scripts, extras and keys in that ISO, keeping its image (~20 s) |
 | `iso-resume` | finish an interrupted `iso` from its kept capture disk |
 | `install [--standalone] [--gui]` | unattended install → read-only layer `base`, plus a disk for instance `main` |
 | `start [--gui] [--from LAYER]` | start headless, or with a GTK window plus clipboard |
@@ -237,7 +238,21 @@ may still grow into. It refuses when the job plus `MEM_RESERVE` won't fit,
 instead of pushing the host into swap or the OOM killer. The `iso` export also
 refuses to run next to any VM.
 
-Debloat is data-driven. Edit `guest/lists/*.txt`, then `./winvm clean --base && ./winvm install`.
+### Adding things to the base
+
+For software you try out or change often, install it in an instance and
+`./winvm save` it as a layer (see above). To bake something into every base build,
+put its installer and a `*.ps1` that runs it into **`guest/extra/`** (details in
+[guest/extra/README.md](guest/extra/README.md)). Setup runs those scripts as
+SYSTEM, offline, after the debloat. What to rerun after a change:
+
+| you changed | Microsoft ISO path | slim ISO path |
+|---|---|---|
+| `guest/extra/`, `guest/payload/`, user/password/keys in the config | `./winvm build` | `./winvm iso --payload` (~20 s) |
+| the image itself: `guest/lists/*.txt`, `guest/pe.cmd`, `WIN_EDITION`, `WIN_STRIP_PAYLOADS` | `./winvm build` | `./winvm iso` (~1 h, new capture) |
+
+then `./winvm clean --base && ./winvm install [--standalone]`.
+
 `WINSLIM_DEBUG=1 ./winvm build` makes a WinPE failure drop to a shell (watch it
 with VNC or `./winvm screenshot`) instead of powering off.
 

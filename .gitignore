@@ -5,3 +5,6 @@ config.local.env
 *.esd
 *.log
 __pycache__/
+guest/extra/*
+!guest/extra/*.ps1
+!guest/extra/README.md

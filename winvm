@@ -111,6 +111,7 @@ SHARE = Path(C.SHARE_DIR)
 BOOT_ISO, SLIM_ISO = ISOS / "winslim-boot.iso", ISOS / "winslim-standalone.iso"
 INSTALL_DISK = IMAGES / "install.qcow2"
 SSH_KEY = KEYS / "id_ed25519"
+EXTRA = REPO / "guest/extra"                                  # your own first-boot additions
 VIRTIO_ISO, OPENSSH_MSI = CACHE / Path(C.VIRTIO_URL).name, CACHE / Path(C.OPENSSH_URL).name
 
 # virtio driver folders injected into Windows (w11/amd64 flavour)
@@ -604,14 +605,20 @@ def stage_tree(tree: Path, mode="install") -> None:
     keys = [SSH_KEY.with_suffix(".pub"), *(Path(p).expanduser() for p in C.SSH_EXTRA_PUBKEYS.split())]
     (pl / "authorized_keys").write_bytes(dos("".join(k.read_text() for k in keys if k.exists())))
     shutil.rmtree(vio)
+    # your additions: setupcomplete.ps1 runs extra/*.ps1 (see guest/extra/README.md)
+    shutil.copytree(EXTRA, pl / "extra", ignore=shutil.ignore_patterns("README.md", ".*"))
+    if scripts := sorted(f.name for f in (pl / "extra").glob("*.ps1")):
+        log(f"extras: {', '.join(scripts)}")
 
 
 def make_iso(tree: Path, out: Path, label: str) -> None:
     """Hybrid BIOS/UEFI ISO; efisys_noprompt skips 'press any key to boot from CD'."""
     log(f"writing {out.name}")
+    tmp = out.with_suffix(".tmp")                              # replaced at the end: never half-written
     run("xorriso", "-as", "mkisofs", "-quiet", "-iso-level", "3", "-J", "-joliet-long", "-relaxed-filenames",
         "-V", label, "-b", "boot/etfsboot.com", "-no-emul-boot", "-boot-load-size", "8", "-hide", "boot.catalog",
-        "-eltorito-alt-boot", "-e", "efi/microsoft/boot/efisys_noprompt.bin", "-no-emul-boot", "-o", out, tree)
+        "-eltorito-alt-boot", "-e", "efi/microsoft/boot/efisys_noprompt.bin", "-no-emul-boot", "-o", tmp, tree)
+    tmp.replace(out)
 
 
 def ensure_key() -> None:
@@ -680,7 +687,12 @@ def iso_from_capture(cap: Path, tree: Path) -> None:
     wim.unlink()
     if esd.stat().st_size >= 4 << 30:
         die("install.esd is over 4 GiB (ISO9660 limit)")
-    write_config_cmd(tree, "install", preserviced=True, index="1")   # same payload: plain apply, no servicing
+    pack_slim(tree)
+
+
+def pack_slim(tree: Path) -> None:
+    """Staged tree + sources/install.esd -> standalone ISO that just applies the pre-serviced image."""
+    write_config_cmd(tree, "install", preserviced=True, index="1")
     make_iso(tree, SLIM_ISO, "WINSLIM_FULL")
     shutil.rmtree(tree)
 
@@ -816,9 +828,13 @@ def cmd_install(a):
     finalize(INSTALL_DISK)
 
 
-@command()
+@command(arg("--payload", action="store_true",
+             help="only renew the first-boot payload (guest/payload, guest/extra, keys, settings) "
+                  "of the existing slim ISO, keeping its captured image (~20 s)"))
 def cmd_iso(a=None):
     """build the standalone slim installer ISO from the debloated image ("iso to iso", ~1 h)"""
+    if getattr(a, "payload", False):
+        return iso_payload()
     # 1. boot a capture variant of the boot ISO: WinPE applies + services offline as usual,
     #    then captures the serviced C: to a spare partition and powers off
     # 2. pull the image out with libguestfs, recompress it on the host, 3. wrap it as an ISO
@@ -835,6 +851,18 @@ def cmd_iso(a=None):
     iso_from_capture(cap, tree)
     log(f"standalone ISO: {SLIM_ISO} ({human(SLIM_ISO)}); install with ./winvm install --standalone")
     warn("this ISO wipes disk 0 without asking - it refuses to run on non-QEMU machines")
+
+
+def iso_payload() -> None:
+    # the captured image holds only the serviced Windows; everything that runs at first
+    # boot is staged next to it on the ISO, so it can be swapped without a new capture
+    SLIM_ISO.exists() or die(f"no {SLIM_ISO.name} yet - run ./winvm iso")
+    tree = BUILD / "tree"
+    stage_tree(tree)
+    log(f"reusing the captured image from {SLIM_ISO.name}")
+    run("7z", "x", "-y", f"-o{tree}", SLIM_ISO, "sources/install.esd", quiet=True)
+    pack_slim(tree)
+    log(f"standalone ISO: {SLIM_ISO} ({human(SLIM_ISO)}); install with ./winvm install --standalone")
 
 
 @command()
