@@ -91,7 +91,7 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
                                                      "default: -i, else main"),
          arg("--image", metavar="IMAGE", help="image (name or file) for a new instance; default: the "
                                               "image named like the instance, else base"),
-         arg("--ram", help="e.g. 8G; kept for this instance"),
+         arg("--ram", help="e.g. 8G, or 2G-8G: dynamic memory between the two; kept for this instance"),
          arg("--cpus", type=int, help="kept for this instance"),
          arg("--all", action="store_true", help="every existing instance"),
          arg("--iso", help="Windows ISO for images without `iso:` (remembered in ${data_dir}/iso)"),
@@ -102,9 +102,13 @@ def cmd_up(a):
     cfg, store = a.cfg, Store(a.cfg)
     if a.iso:
         link_iso(cfg, a.iso)
-    if a.ram:
-        mib(a.ram)                                             # fails early on a bad size
-    run = {k: v for k, v in (("ram", a.ram), ("cpus", a.cpus)) if v}
+    ram = a.ram
+    if ram and "-" in ram:                                     # 2G-8G: dynamic memory
+        lo, hi = ram.split("-", 1)
+        ram = {"min": lo, "max": hi}
+    for size in (ram.values() if isinstance(ram, dict) else [ram] if ram else []):
+        mib(size)                                              # fails early on a bad size
+    run = {k: v for k, v in (("ram", ram), ("cpus", a.cpus)) if v}
     image = cfg.ref(a.image) if a.image else None
     names = [d.parent.name for d in store.disks()] if a.all else \
         [cfg.ref(n) if is_path(n) else valid(n) for n in a.names or [a.instance]]
@@ -137,7 +141,7 @@ def cmd_ps(a):
     """list instances: state, ports, disk size, image"""
     cfg, store = a.cfg, Store(a.cfg)
     names = sorted({d.parent.name for d in store.disks()} | {vm.name for vm in running(cfg)})
-    print(f"{'INSTANCE':<14} {'STATE':<8} {'SSH':>5} {'RDP':>5} {'VNC':>5} {'DISK':>6}  IMAGE")
+    print(f"{'INSTANCE':<14} {'STATE':<8} {'SSH':>5} {'RDP':>5} {'VNC':>5} {'DISK':>6} {'RAM':>9}  IMAGE")
     for n in names:
         vm = Instance(cfg, n, builder=n.startswith("_"))
         st = vm.state if vm.alive else {}
@@ -146,7 +150,19 @@ def cmd_ps(a):
         image = (label(on) if on else "-") + ("  (outdated)" if on and outdated(cfg, store, vm, on) else "")
         mounts = ", ".join(vm.mounts) if st else ""
         print(f"{n:<14} {'running' if st else 'stopped':<8} {ssh:>5} {rdp:>5} {vnc:>5} "
-              f"{du(vm.disk):>6}  {image}" + (f"   mounts: {mounts}" if mounts else ""))
+              f"{du(vm.disk):>6} {ram_text(vm, st):>9}  {image}" + (f"   mounts: {mounts}" if mounts else ""))
+
+
+def ram_text(vm: Instance, st: dict) -> str:
+    """4G, or for dynamic memory what the guest has now / its max (2.1/8G)."""
+    rng = vm.auto_ram
+    if not rng:
+        return f"{vm.ram / 1024:g}G"
+    try:
+        now = json.loads((vm.dir / "balloon.json").read_text())["actual"] if st and vm.balloon_pid else None
+    except (OSError, ValueError, KeyError):
+        now = None
+    return f"{now / 1024:.1f}/{rng[1] / 1024:g}G" if now else f"{rng[0] / 1024:g}-{rng[1] / 1024:g}G"
 
 
 def outdated(cfg: Config, store: Store, vm: Instance, on: Path | None) -> bool:
@@ -269,7 +285,10 @@ def cmd_ga(a):
 @command(arg("size", nargs="?", help="e.g. 2G; omit to show"))
 def cmd_balloon(a):
     """show or set guest RAM live via virtio-balloon (returns memory to the host)"""
-    qmp = Chan(inst(a).dir / "qmp.sock", qmp=True)
+    vm = inst(a)
+    qmp = Chan(vm.dir / "qmp.sock", qmp=True)
+    if a.size and vm.balloon_pid:
+        warn(f"{vm.name} has dynamic memory: winvm will move this again as the guest needs")
     if a.size:
         qmp("balloon", {"value": mib(a.size) << 20})
         time.sleep(2)
@@ -289,7 +308,7 @@ def cmd_screenshot(a):
 def cmd_cmdline(a):
     """print the QEMU command line `up` uses"""
     vm = inst(a)
-    st = vm.state if vm.alive else {"ram": mib(vm.settings["ram"]), **ports(a.cfg, vm.state.get("slot", 0))}
+    st = vm.state if vm.alive else {"ram": vm.ram, **ports(a.cfg, vm.state.get("slot", 0))}
     print(shlex.join(vm.qemu_argv(gui=a.gui, st=st)))
 
 
@@ -495,6 +514,10 @@ def cmd_check(a):
     print("optional")
     smbd = vm_smbd()
     row("Samba", True if smbd else None, smbd or "only for mounts (C:\\mnt): install the samba package")
+    ksm = Path("/sys/kernel/mm/ksm/run")
+    on = ksm.exists() and ksm.read_text().strip() == "1"
+    row("KSM", True if on else None, "shares identical memory between VMs" if on else
+        "off - to share identical memory between VMs: echo 1 | sudo tee /sys/kernel/mm/ksm/run")
     print("downloads")
     isos, win = cfg.linked_isos(), cfg.s.get("windows")
     row("Windows ISO", True if isos else None,

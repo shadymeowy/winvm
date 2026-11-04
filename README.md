@@ -187,6 +187,29 @@ is plain ssh (`winvm ssh -L 8080:localhost:80`, `winvm ssh hostname`),
 `winvm cp a.txt :C:/Users/user/` is scp, and
 `winvm ga exec PROG [ARGS]` goes through the guest agent without network.
 
+## Dynamic memory
+
+```yaml
+run:
+  ram: {min: 2G, max: 8G}            # or: winvm up --ram 2G-8G
+```
+
+The VM gets `max`, and winvm keeps it near what the guest actually uses: a small
+helper per instance reads the guest's memory stats (virtio-balloon) and moves the
+balloon - it grows the guest at once when free memory runs short, and gives memory
+back to the host after it has been free for half a minute, step by step. The guest
+also gets a pagefile (added on its first start in this mode, one reboot), which
+absorbs a sudden large allocation while memory flows back in. If the helper stops or
+the guest's stats go silent, the guest gets its full `max` back; `winvm up`/`sh`
+restart a missing helper. `winvm ps` shows the current size (`2.1/8G`); the log is
+`balloon.log` in the instance's run folder.
+
+Windows touches all of its RAM at boot, so without this a 4 GB instance takes 4 GB
+of the host as long as it runs. The RAM guard still counts `max` when starting VMs:
+dynamic memory leaves room for the host, it doesn't fit more VMs than `max` allows.
+Several instances on the same image can also share identical memory pages with the
+kernel's KSM (off by default; `winvm check` shows the command to turn it on).
+
 ## Mounts
 
 ```sh
@@ -210,9 +233,9 @@ without asking.
 
 | command | |
 |---|---|
-| `up [NAME\|FILE...] [--image IMAGE] [--ram R] [--cpus N] [--iso ISO] [--all] [--gui]` | create (building images as needed) and start; ready when SSH answers |
+| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX] [--cpus N] [--iso ISO] [--all] [--gui]` | create (building images as needed) and start; ready when SSH answers |
 | `stop [NAME...] [--all]` / `kill` | ACPI shutdown (hard kill after 120 s) / power off |
-| `ps` | instances: state, ports, disk, image version, mounts |
+| `ps` | instances: state, ports, disk, RAM, image version, mounts |
 | `sh [-t] [CMD]`, `ssh`, `cp`, `wait` | see above |
 | `mount [PATH [NAME]] [--ro]` / `umount NAME` | host folders in the running guest |
 | `gui` / `rdp` | VNC viewer (or start with a GTK window) / FreeRDP session |

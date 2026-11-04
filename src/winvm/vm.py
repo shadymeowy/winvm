@@ -13,10 +13,12 @@ import shutil
 import signal
 import socket
 import subprocess as sp
+import sys
 import time
 from pathlib import Path
 
 from . import guest, host
+from .balloon import ram_range
 from .config import Config
 from .store import Store, label
 from .util import Chan, die, log, meminfo, mib, run, warn
@@ -149,13 +151,14 @@ class Instance:
                        f"cache={'unsafe' if install else 'writeback'}",
              "-device", "scsi-hd,drive=disk0,bus=scsi0.0,scsi-id=0,rotation_rate=1,bootindex=0",
              # paravirtual devices: balloon (give RAM back), rng, absolute mouse, keyboard
-             "-device", "virtio-balloon-pci", "-device", "virtio-rng-pci",
+             "-device", "virtio-balloon-pci,id=balloon0", "-device", "virtio-rng-pci",
              "-device", "virtio-tablet-pci", "-device", "virtio-keyboard-pci",
              # guest agent + control sockets
              "-device", "virtio-serial-pci",
              "-chardev", f"socket,id=qga0,path={self.dir}/qga.sock,server=on,wait=off",
              "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
              "-qmp", f"unix:{self.dir}/qmp.sock,server=on,wait=off",
+             *(["-qmp", f"unix:{self.dir}/qmp-balloon.sock,server=on,wait=off"] if self.auto_ram else []),
              "-monitor", f"unix:{self.dir}/monitor.sock,server=on,wait=off",
              "-vga", "std", "-serial", f"file:{self.dir}/serial.log"]
         for i, (path, ro) in enumerate(disks, 1):                # Windows numbers them in this order
@@ -213,7 +216,7 @@ class Instance:
             log(f"{self.name} already running (pid {self.pid})")
         else:
             host.qemu(self.cfg)
-            self.claim(mib(self.settings["ram"]))
+            self.claim(self.ram)
             self.write_smb({} if self.builder else self.settings["mounts"])
             self.launch(self.qemu_argv(gui=gui), gui)
             self.ssh_config()                                  # for `Include .../ssh_config`
@@ -225,6 +228,7 @@ class Instance:
             self.wait_ssh()
             if not self.builder:
                 self.sync_mounts()
+                self.auto_memory()
 
     def stop(self, timeout=120) -> bool:
         """ACPI shutdown, a hard kill after `timeout` s. False if it had to be killed."""
@@ -313,7 +317,60 @@ class Instance:
             self.start()
         else:
             self.wait_ssh()
+            if self.auto_ram and not self.balloon_pid:          # its helper died: restart it
+                self.auto_memory()
         return self
+
+    # --- dynamic memory (ram: {min, max}, see balloon.py)
+    @property
+    def auto_ram(self) -> tuple[int, int] | None:
+        return None if self.builder else ram_range(self.settings)
+
+    @property
+    def ram(self) -> int:
+        """MiB the VM gets (with dynamic memory: its max)."""
+        rng = ram_range(self.settings)
+        return rng[1] if rng else mib(self.settings["ram"])
+
+    @property
+    def balloon_pid(self) -> int | None:
+        try:
+            pid = int((self.dir / "balloon.pid").read_text())
+            return pid if b"winvm.balloon" in Path(f"/proc/{pid}/cmdline").read_bytes() else None
+        except (OSError, ValueError):
+            return None
+
+    def auto_memory(self) -> None:
+        """Dynamic memory: a pagefile in the guest (absorbs spikes; set once, one reboot) and
+        the balloon helper process."""
+        if not self.auto_ram or not (self.dir / "qmp-balloon.sock").is_socket():
+            if self.auto_ram:
+                warn(f"{self.name} was started without dynamic memory - restart it to enable it")
+            return
+        mm = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+        r = guest.capture(self.ssh, f"""if (Get-CimInstance Win32_PageFileUsage) {{ 'ok' }} else {{
+    reg add "{mm}" /v PagingFiles /t REG_MULTI_SZ /d "C:\\pagefile.sys 1024 4096" /f | Out-Null; 'set' }}""")
+        if r.stdout.strip().endswith("set"):
+            log(f"dynamic memory: adding a pagefile to {self.name} (once, one reboot)")
+            guest.capture(self.ssh, "shutdown.exe /r /t 0")
+            self.close_ssh()
+            for _ in range(60):                                # until it is really gone
+                if sp.run(self.ssh("-o", "ConnectTimeout=2") + ["exit 0"], stdin=sp.DEVNULL,
+                          stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
+                    break
+                time.sleep(1)
+            self.close_ssh()
+            self.wait_ssh()
+            self.sync_mounts()
+        if self.balloon_pid:
+            return
+        env = {**os.environ, "WINVM_DATA_DIR": str(self.cfg.data), "WINVM_CACHE_DIR": str(self.cfg.cache),
+               **({"WINVM_CONFIG": str(self.cfg.file)} if self.cfg.file else {})}
+        with open(self.dir / "balloon.log", "a") as logf:
+            sp.Popen([sys.executable, "-m", "winvm.balloon", self.name], env=env, stdin=sp.DEVNULL,
+                     stdout=logf, stderr=sp.STDOUT, start_new_session=True)
+        lo, hi = self.auto_ram
+        log(f"dynamic memory: {self.name} uses {lo}-{hi} MiB as needed (log: {self.dir}/balloon.log)")
 
     # --- mounts: each instance has its own Samba server, reached by the guest at
     # \\10.0.2.4 through QEMU (guestfwd starts smbd per connection, as QEMU's smb= does).

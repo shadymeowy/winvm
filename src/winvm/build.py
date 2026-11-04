@@ -33,7 +33,7 @@ from . import __version__, guest, host
 from .config import GUEST, Config
 from .media import check_edition, write_iso
 from .store import Store, label
-from .util import Fatal, die, dos, log, mib, run, warn
+from .util import Fatal, die, dos, log, run, warn
 from .vm import Instance, running
 
 # virtio driver folders injected into Windows (w11/amd64 flavour)
@@ -255,7 +255,7 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     [SC]/[FL]/[WIN] progress lines from the serial log until QEMU exits. Returns the whole
     log and why the VM stopped (QMP SHUTDOWN reason, e.g. guest-shutdown / guest-reset)."""
     shutil.copyfile(host.firmware(inst.cfg)[1], inst.vars)
-    inst.claim(mib(inst.settings["ram"]))
+    inst.claim(inst.ram)
     serial = inst.dir / "serial.log"
     serial.write_bytes(b"")
     if not gui and inst.state.get("vnc"):

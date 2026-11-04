@@ -48,7 +48,8 @@ settings:
     size: 7736125440
 
 run:                                 # how instances run, unless their image's `run:` or
-  ram: 4G                            # `winvm up --ram/--cpus` say otherwise
+  ram: 4G                            # `winvm up --ram/--cpus` say otherwise; dynamic memory:
+                                     # `ram: {min: 2G, max: 8G}` (or `winvm up --ram 2G-8G`)
   cpus: 4
   mounts:                            # host folders, in the guest at C:\mnt\<name>
     share: ${data_dir}/share         # (an image or this file can drop it: `share: null`)

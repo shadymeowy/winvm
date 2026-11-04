@@ -366,6 +366,8 @@ class Config:
         for settings, base, where in layers:
             check_keys(mapping(settings, f"{where}: run"), RUN_KEYS, f"{where}: run")
             for k, v in settings.items():
+                if k == "ram" and isinstance(v, dict):         # dynamic memory: {min, max}
+                    check_keys(v, {"min", "max"}, f"{where}: run.ram")
                 if k != "mounts":
                     out[k] = v
                     continue

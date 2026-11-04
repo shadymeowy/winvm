@@ -32,5 +32,6 @@ debloat:
 setup: []
 
 # How instances of this image run (merged over the machine's `run` defaults; images
-# built on this one inherit it): ram, cpus, mounts.
+# built on this one inherit it): ram (4G, or {min: 2G, max: 8G} for dynamic memory),
+# cpus, mounts.
 run: {}
