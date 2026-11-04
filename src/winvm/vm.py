@@ -21,11 +21,12 @@ from . import guest, host
 from .balloon import ram_range
 from .config import Config
 from .store import Store, label
-from .util import Chan, die, log, meminfo, mib, run, warn
+from .util import Chan, check_mount_points, die, log, meminfo, mib, mount_point, run, warn
 
 HYPERV = ("hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,"
           "hv-stimer,hv-frequencies,hv-tlbflush,hv-ipi,hv-reset")
 SMB_HOST = "10.0.2.4"           # where the guest reaches the instance's Samba server
+LINKS = r"C:\ProgramData\winvm\mount-links.txt"   # in the guest: the folder links winvm made
 
 
 def qfile(path) -> str:
@@ -377,8 +378,10 @@ class Instance:
     # Its config can change while the guest runs: a new share works at once. A removed or
     # changed one stays served by the running smbd (a reload signal does not drop it), so
     # that smbd is ended: Windows reconnects by itself and the new smbd reads the new
-    # config. The guest sees each mount as a folder link C:\mnt\<name> - drive letters
-    # would exist only in the logon session that mapped them.
+    # config. The guest sees each mount as a folder link, C:\mnt\<name> or where its `at`
+    # says - drive letters would exist only in the logon session that mapped them. The
+    # guest keeps a list of the links winvm made (LINKS), so it can remove them later;
+    # anything else at a mount point is never touched.
     @property
     def mounts(self) -> dict[str, dict]:
         try:
@@ -420,51 +423,99 @@ class Instance:
             except OSError:
                 pass
 
-    def sync_mounts(self) -> None:
-        """Make C:\\mnt in the guest match the mounts: one folder link per share."""
-        want = "; ".join(f"{guest.quote(n)} = {guest.quote(f'//{SMB_HOST}/{n}'.replace('/', chr(92)))}"
-                         for n in self.mounts)
+    def sync_mounts(self) -> list[str]:
+        """Make the guest's folder links match the mounts. Returns the mount points left
+        without a link: taken by something else (a folder, a file, another link) or failed."""
+        want = "; ".join(f"{guest.quote(mount_point(n, m))} = {guest.quote(f'//{SMB_HOST}/{n}'.replace('/', chr(92)))}"
+                         for n, m in self.mounts.items())
         r = guest.capture(self.ssh, f"""$want = @{{ {want} }}
-New-Item -ItemType Directory -Force C:\\mnt | Out-Null
-Get-ChildItem -LiteralPath C:\\mnt -Force | Where-Object {{ $_.LinkType -and -not $want.ContainsKey($_.Name) }} |
-    ForEach-Object {{ $_.Delete() }}
-foreach ($n in $want.Keys) {{
-    if (-not (Get-Item -LiteralPath "C:\\mnt\\$n" -Force -ErrorAction SilentlyContinue)) {{
-        New-Item -ItemType SymbolicLink -Path "C:\\mnt\\$n" -Target $want[$n] | Out-Null }}
+$list = '{LINKS}'
+function ours($i) {{ $i -and $i.LinkType -and "$($i.Target)" -like '*{SMB_HOST}\\*' }}
+New-Item -ItemType Directory -Force C:\\mnt, (Split-Path $list) | Out-Null
+$old = @(Get-Content -LiteralPath $list -ErrorAction SilentlyContinue) + @(Get-ChildItem -LiteralPath C:\\mnt -Force | ForEach-Object FullName)
+foreach ($p in $old) {{                         # links no longer wanted, or pointing elsewhere
+    $i = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    if ((ours $i) -and -not ($want.ContainsKey($p) -and "$($i.Target)" -like "*$($want[$p].TrimStart('\\'))")) {{ $i.Delete() }}
+}}
+foreach ($p in $want.Keys) {{
+    $i = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    if ($i) {{ if (-not (ours $i)) {{ "TAKEN $p" }}; continue }}
+    try {{
+        New-Item -ItemType Directory -Force (Split-Path $p) -ErrorAction Stop | Out-Null
+        # mklink, not New-Item: a share just added may take a moment to be seen
+        $out = cmd /c mklink /D "$p" "$($want[$p])" 2>&1
+        if ($LASTEXITCODE) {{ "FAILED $p - $out" }}
+    }} catch {{ "FAILED $p - $($_.Exception.Message)" }}
+}}
+Set-Content -LiteralPath $list -Value @($want.Keys)
+$end = (Get-Date).AddSeconds(15)                 # until the shares answer
+while (@($want.Values | Where-Object {{ -not (Test-Path -LiteralPath $_) }}).Count -and (Get-Date) -lt $end) {{
+    Start-Sleep -Milliseconds 500
 }}
 # images from before winvm 2 link C:\\host to QEMU's old fixed share
 $h = Get-Item -LiteralPath C:\\host -Force -ErrorAction SilentlyContinue
 if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
 """)
+        missing = []
+        for ln in r.stdout.splitlines():
+            if ln.startswith("TAKEN "):
+                missing.append(ln[6:])
+                warn(f"{ln[6:]} already exists in {self.name} and is not a winvm mount - left alone, not mounted there")
+            elif ln.startswith("FAILED "):
+                missing.append(ln[7:].split(" - ", 1)[0])
+                warn(f"could not link {ln[7:]}")
         if r.returncode:
-            warn(f"could not set up C:\\mnt in {self.name}: {r.stdout.strip()[:300]}")
+            warn(f"could not set up the mounts in {self.name}: {r.stdout.strip()[:300]}")
+        return missing
 
     def require_running(self) -> None:
         if not self.alive:
             die(f"{self.name} is not running - start it, or list the mount in its image's "
                 f"`run: mounts:` (or the machine's, ~/.config/winvm/winvm.yaml)")
 
-    def mount(self, name: str, path: Path, readonly=False) -> None:
+    def mount(self, name: str, path: Path, readonly=False, at: str | None = None) -> str:
+        """Share host folder `path` as `name`, linked at `at` (default C:\\mnt\\NAME).
+        Returns the mount point."""
         self.require_running()
         if not (self.dir / "smb").is_dir():
             die(f"no Samba on this instance - {host.install_hint('samba')}, then restart it")
-        mounts = self.mounts
-        changed = name in mounts
-        mounts[name] = {"path": str(path), "readonly": readonly}
-        self.write_smb(mounts)
-        if changed:
+        mounts, spot = self.mounts, mount_point(name, {"at": at})
+        if name in mounts and mount_point(name, mounts[name]).lower() != spot.lower():
+            die(f"mount '{name}' is already at {mount_point(name, mounts[name])} - umount it first, "
+                f"or name this one: winvm mount PATH NAME")
+        new = {**mounts, name: {"path": str(path), "readonly": readonly, **({"at": at} if at else {})}}
+        check_mount_points(new, "mount")
+        self.up()
+        r = guest.capture(self.ssh, f"""if (-not (Test-Path -LiteralPath {guest.quote(spot[:3])})) {{ exit 4 }}
+$i = Get-Item -LiteralPath {guest.quote(spot)} -Force -ErrorAction SilentlyContinue
+if ($i -and -not ($i.LinkType -and "$($i.Target)" -like '*{SMB_HOST}\\*')) {{ exit 3 }}""")
+        if r.returncode == 4:
+            die(f"{self.name} has no drive {spot[:2]}")
+        if r.returncode == 3:
+            die(f"{spot} already exists in {self.name} and is not a winvm mount - pick another place")
+        self.write_smb(new)
+        if name in mounts:
             self.restart_smb()
-        self.up().sync_mounts()
+        if spot in self.sync_mounts():                         # undo: no half-made mount
+            self.write_smb(mounts)
+            self.restart_smb()
+            self.sync_mounts()
+            die(f"could not mount at {spot}")
+        return spot
 
-    def umount(self, name: str) -> None:
+    def umount(self, which: str) -> str:
+        """Remove a mount, by name or by mount point. Returns its name."""
         self.require_running()
         mounts = self.mounts
-        if name not in mounts:
-            die(f"{self.name} has no mount '{name}' (`winvm -i {self.name} mount` lists them)")
+        name = which if which in mounts else \
+            next((n for n, m in mounts.items() if mount_point(n, m).lower() == which.replace("/", "\\").rstrip("\\").lower()), None)
+        if not name:
+            die(f"{self.name} has no mount '{which}' (`winvm -i {self.name} mount` lists them)")
         del mounts[name]
         self.write_smb(mounts)
         self.restart_smb()
         self.up().sync_mounts()
+        return name
 
     def guest_path(self, host: Path) -> str | None:
         """Guest path of a host path inside one of the mounts (longest match wins)."""
@@ -473,7 +524,7 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
             root = Path(m["path"]).resolve()
             if host.is_relative_to(root) and (best is None or len(root.parts) > best[0]):
                 rel = host.relative_to(root).parts
-                best = (len(root.parts), f"C:\\mnt\\{name}" + "".join(f"\\{p}" for p in rel))
+                best = (len(root.parts), mount_point(name, m) + "".join(f"\\{p}" for p in rel))
         return best and best[1]
 
 

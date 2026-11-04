@@ -19,7 +19,7 @@ from .build import build, fetch_step
 from .config import BUILTIN, DEFAULT_FILE, Config, is_path, sha
 from .media import editions
 from .store import Store, label
-from .util import Chan, Fatal, die, du, log, mib, paint, valid, warn
+from .util import Chan, Fatal, die, du, log, mib, mount_point, paint, valid, warn, win_path
 from .vm import Instance, ports, running, smbd as vm_smbd
 
 COMMANDS: dict[str, tuple] = {}
@@ -338,28 +338,41 @@ def cmd_cmdline(a):
 # ------------------------------------------------------------------ mounts
 
 @command(arg("path", nargs="?", help="host folder; omit to list the mounts"),
-         arg("name", nargs="?", help="share name, guest C:\\mnt\\NAME (default: the folder name)"),
+         arg("where", nargs="?", metavar="NAME|WINPATH",
+             help="NAME: at C:\\mnt\\NAME (default: the folder's name); or a Windows path, e.g. C:\\work"),
          arg("--ro", action="store_true", help="read-only"))
 def cmd_mount(a):
-    """mount a host folder into the running instance, at C:\\mnt\\NAME"""
+    """mount a host folder into the running instance, at C:\\mnt\\NAME or any Windows path
+
+    winvm mount ~/code/proj                C:\\mnt\\proj
+    winvm mount ~/code/proj src            C:\\mnt\\src
+    winvm mount ~/code/proj 'C:\\work'      C:\\work (share name: work)
+    winvm mount                            list the mounts
+    """
     vm = inst(a)
     if not a.path:                                             # stopped: what the next start sets up
         for n, m in (vm.mounts if vm.alive else vm.settings["mounts"]).items():
-            print(f"C:\\mnt\\{n:<14} {m['path']}{'  (read-only)' if m['readonly'] else ''}")
+            print(f"{mount_point(n, m):<24} {m['path']}{'  (read-only)' if m['readonly'] else ''}")
         return
     path = Path(a.path).expanduser().resolve()
     if not path.is_dir():
         die(f"not a folder: {path}")
-    name = valid(a.name or re.sub(r"[^A-Za-z0-9._-]", "_", path.name))
-    vm.mount(name, path, a.ro)
-    log(f"{path} -> {vm.name}:C:\\mnt\\{name}")
+    at = None
+    if a.where and re.match(r"[A-Za-z]:", a.where):            # a Windows path: the link goes there
+        at = win_path(a.where) or die(f"not a Windows folder path: {a.where} (e.g. C:\\work)")
+    if a.where and not at:
+        name = valid(a.where)
+    else:
+        last = at.rsplit("\\", 1)[1] if at else path.name
+        name = valid(re.sub(r"[^A-Za-z0-9._-]", "_", last).lstrip("._-") or "mount")
+    spot = vm.mount(name, path, a.ro, at)
+    log(f"{path} -> {vm.name}:{spot}")
 
 
-@command(arg("name"))
+@command(arg("which", metavar="NAME|WINPATH"))
 def cmd_umount(a):
-    """remove a mount from the running instance"""
-    inst(a).umount(valid(a.name))
-    log(f"unmounted {a.name}")
+    """remove a mount from the running instance, by name or where it is (C:\\work)"""
+    log(f"unmounted {inst(a).umount(a.which)}")
 
 
 # ------------------------------------------------------------------ images

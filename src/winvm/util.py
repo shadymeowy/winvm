@@ -59,6 +59,35 @@ def valid(name) -> str:
     return name if NAME_RX.fullmatch(name) else die(f"bad name '{name}' (letters, digits, . _ -)")
 
 
+def win_path(s) -> str | None:
+    """A Windows folder path like C:\\work (/ or \\, no trailing \\), normalized; None if not one."""
+    s = re.sub(r"[\\/]+", r"\\", str(s)).rstrip("\\")              # doubled ones too (YAML's '' quotes)
+    if not re.fullmatch(r'[A-Za-z]:(\\[^\\<>:"|?*\x00-\x1f]+)+', s) or \
+            any(p.strip() in (".", "..") for p in s.split("\\")[1:]):
+        return None
+    return s[0].upper() + s[1:]
+
+
+def mount_point(name: str, m: dict) -> str:
+    """Where mount `name` appears in the guest: its `at`, else C:\\mnt\\NAME."""
+    return m.get("at") or f"C:\\mnt\\{name}"
+
+
+def within(a: str, b: str) -> bool:
+    """Windows path a is b or inside it (case-insensitive)."""
+    a, b = a.lower(), b.lower()
+    return a == b or a.startswith(b + "\\")
+
+
+def check_mount_points(mounts: dict[str, dict], where: str) -> None:
+    """No two mounts at, or inside, the same place."""
+    pts = {n: mount_point(n, m) for n, m in mounts.items()}
+    for n, p in pts.items():
+        for o, q in pts.items():
+            if n < o and (within(p, q) or within(q, p)):
+                die(f"{where}: mounts '{n}' ({p}) and '{o}' ({q}) overlap")
+
+
 # ------------------------------------------------------------------ sizes
 
 def mib(size) -> int:

@@ -53,3 +53,4 @@ run:                                 # how instances run, unless their image's `
   cpus: 4
   mounts:                            # host folders, in the guest at C:\mnt\<name>
     share: ${data_dir}/share         # (an image or this file can drop it: `share: null`)
+                                     # long form: NAME: {path: ~/x, readonly: true, at: 'C:\x'}

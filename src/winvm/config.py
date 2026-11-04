@@ -19,7 +19,7 @@ from urllib.parse import unquote
 
 import yaml
 
-from .util import Fatal, content_hash, die, log, run, sha256_file, valid, warn
+from .util import Fatal, check_mount_points, content_hash, die, log, run, sha256_file, valid, warn, win_path
 
 DATA = Path(__file__).parent / "data"
 DEFAULT_FILE = DATA / "winvm.yaml"
@@ -376,7 +376,12 @@ class Config:
                         mounts.pop(m, None)
                         continue
                     mv = mv if isinstance(mv, dict) else {"path": mv}
+                    check_keys(mv, {"path", "readonly", "at"}, f"{where}: run.mounts.{m}")
                     if not mv.get("path"):
                         die(f"{where}: mount '{m}' has no path")
-                    mounts[valid(m)] = {"path": str(self.path(mv["path"], base)), "readonly": bool(mv.get("readonly"))}
+                    at = mv.get("at") and (win_path(mv["at"]) or die(
+                        f"{where}: mount '{m}': `at: {mv['at']}` is not a Windows folder path like C:\\work"))
+                    mounts[valid(m)] = {"path": str(self.path(mv["path"], base)), "readonly": bool(mv.get("readonly")),
+                                        **({"at": at} if at else {})}
+        check_mount_points(mounts, f"{image or 'machine'}: run.mounts")
         return {**out, "mounts": mounts}

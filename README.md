@@ -13,8 +13,8 @@ share and reuse.
 * **CLI first.** Headless VM with OpenSSH (keys) and PowerShell. `winvm sh <command>`
   runs a guest command like a local one: exit code, stdin, pipes, Unix line endings,
   current folder, in well under a second.
-* **Mounts.** Host folders appear in the guest as `C:\mnt\<name>`, from the config or
-  added and removed while the VM runs (`winvm mount ~/proj`).
+* **Mounts.** Host folders appear in the guest as `C:\mnt\<name>` or any folder path you
+  pick, from the config or added and removed while the VM runs (`winvm mount ~/proj`).
 * **Layers.** Images are zstd-compressed read-only qcow2 layers; instances run on thin
   disks on top. Several instances run at once, each with its own ports.
 
@@ -139,6 +139,7 @@ run:                                 # how instances of dev run (images on dev i
   mounts:
     projects: ~/Projects             # guest C:\mnt\projects
     docs: {path: ~/Documents, readonly: true}
+    src: {path: ~/src, at: 'C:\src'}  # anywhere in the guest instead of C:\mnt
 ```
 
 ```sh
@@ -230,16 +231,19 @@ kernel's KSM (off by default; `winvm check` shows the command to turn it on).
 
 ```sh
 winvm mount ~/data                # running instance: guest C:\mnt\data, at once
-winvm mount ~/data d2 --ro        # another name, read-only
+winvm mount ~/data d2 --ro        # another name (C:\mnt\d2), read-only
+winvm mount ~/src 'C:\src'        # a Windows path instead of a name: the link goes there
 winvm mount                       # list
-winvm umount d2
+winvm umount d2                   # by name, or where it is: winvm umount 'C:\src'
 ```
 
 Mounts from `run:` settings are set up at every start; `mount`/`umount` change a
 running instance until it stops. Each instance runs its own unprivileged Samba server
 (QEMU forwards `\\10.0.2.4` to it), whose config winvm rewrites on the fly. The guest
-gets folder links in `C:\mnt` rather than drive letters, because a drive letter
-exists only in the logon session that mapped it.
+gets folder links (in `C:\mnt`, or where `at:` / a Windows path puts them) rather than
+drive letters, because a drive letter exists only in the logon session that mapped it.
+winvm only ever removes links it made itself (the guest keeps a list of them); a
+mount point taken by a real folder or file is refused, never replaced.
 
 ## Commands
 
@@ -253,7 +257,7 @@ without asking.
 | `stop [NAME...] [--all]` / `kill` | ACPI shutdown (hard kill after 120 s) / power off |
 | `ps` | instances: state, ports, disk, RAM, image version, mounts |
 | `sh [-t] [CMD]`, `ssh`, `cp`, `wait` | see above |
-| `mount [PATH [NAME]] [--ro]` / `umount NAME` | host folders in the running guest |
+| `mount [PATH [NAME\|WINPATH]] [--ro]` / `umount NAME\|WINPATH` | host folders in the running guest |
 | `gui` / `rdp` | VNC viewer (or start with a GTK window) / FreeRDP session |
 | `ga`, `balloon [SIZE]`, `screenshot`, `cmdline` | guest agent, live RAM, PNG of the screen, QEMU argv |
 | `build [IMAGE...] [--force]` | build missing or changed images (default: all known) |
