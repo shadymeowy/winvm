@@ -183,7 +183,7 @@ def cmd_sh(a):
     cwd = vm.guest_path(Path.cwd())
     if not words:                                              # interactive shell
         cd = f"Set-Location -LiteralPath {guest.quote(cwd)}\npowershell -NoLogo" if cwd else None
-        os.execvp("ssh", vm.ssh("-t") + ([guest.encoded(cd)] if cd else []))
+        return guest.terminal(vm.ssh("-t") + ([guest.encoded(cd)] if cd else []))
     script = guest.script(guest.command_line(words), cwd)
     return guest.tty(vm.ssh, script) if tty else guest.pipe(vm.ssh, script)
 

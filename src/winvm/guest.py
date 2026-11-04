@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import signal
 import subprocess as sp
 import sys
 
@@ -67,12 +68,34 @@ def pipe(ssh, script_: str, stdin=None) -> int:
     return proc.wait()
 
 
+def terminal(argv: list[str]) -> int:
+    """Run an ssh terminal session. Windows' pseudo-console (ConPTY) clears the screen
+    (not the scrollback) and then draws at fixed positions, and it sets the window title.
+    So first scroll what is on screen up into the scrollback - like `clear` on Linux:
+    nothing is lost, the session's output stays after it - and save/restore the title
+    (xterm's title stack; terminals without one ignore it)."""
+    tty_out = sys.stdout.isatty()
+    if tty_out:
+        sys.stdout.write("\n" * os.get_terminal_size().lines + "\033[22;0t")
+        sys.stdout.flush()
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)       # Ctrl-C belongs to the session
+    try:
+        return sp.call(argv)
+    finally:
+        signal.signal(signal.SIGINT, old)
+        if tty_out:
+            sys.stdout.write("\033[23;0t")
+            sys.stdout.flush()
+
+
 def tty(ssh, script_: str) -> int:
     """Run with a terminal. Windows' sshd drops the exit code of terminal sessions, so the
-    guest leaves it in a file that a second (multiplexed, cheap) call picks up."""
+    command runs in a child PowerShell (an `exit N` in it can't skip what follows) and its
+    exit code goes to a file that a second (multiplexed, cheap) call picks up."""
     rc = f"$env:TEMP\\winvm-{os.getpid()}.rc"
-    body = script_.removesuffix("exit $rc\n")
-    sp.run(ssh("-t") + [encoded(f"{body}Set-Content {rc} $rc\nexit $rc\n")])
+    child = base64.b64encode(script_.encode("utf-16-le")).decode()   # -EncodedCommand wants UTF-16
+    terminal(ssh("-t") + [encoded(f"powershell -NoLogo -NoProfile -EncodedCommand {child}\n"
+                                  f"Set-Content {rc} $LASTEXITCODE\nexit $LASTEXITCODE\n")])
     r = sp.run(ssh("-o", "BatchMode=yes") + [encoded(f"Get-Content {rc}; Remove-Item {rc}")],
                stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.DEVNULL, text=True)
     return int(r.stdout.strip()) if r.stdout.strip().isdigit() else 1
