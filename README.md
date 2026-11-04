@@ -67,7 +67,9 @@ winvm stop
 ```
 
 No config file is needed: `winvm` uses its built-in one, builds image `base` from the
-Windows ISO and starts instance `main` on it. The first `up` lists what it needs to
+Windows ISO and starts instance `main` on it. `winvm sh` (or `ssh`, `cp`, `rdp`) also
+creates `main` when it doesn't exist yet, so `winvm sh` alone works from scratch; other
+instance names have to be created with `up` first. The first `up` lists what it needs to
 download, about 8.6 GB in all: the Windows 11 25H2 ISO (English, about 7.7 GB,
 straight from Microsoft's servers) and the virtio drivers (about 0.9 GB), and asks
 once. Have an ISO already, or want another language? Download it from

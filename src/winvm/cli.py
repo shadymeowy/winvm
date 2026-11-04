@@ -48,6 +48,15 @@ def inst(a) -> Instance:
     return Instance(a.cfg, name if builder else valid(name), builder=builder)
 
 
+def ready(a) -> Instance:
+    """The -i instance, running with SSH answering. The default instance, main, is created
+    on first use as `winvm up` would (other names must exist: a typo shouldn't start a build)."""
+    vm = inst(a)
+    if vm.name == "main" and not vm.builder and not vm.disk.exists():
+        ensure_disk(a.cfg, vm)
+    return vm.up()
+
+
 # ------------------------------------------------------------------ run instances
 
 def link_iso(cfg: Config, iso: str) -> None:
@@ -193,7 +202,7 @@ def cmd_sh(a):
     The exit code is the command's. Run from inside a mounted host folder, the guest
     command runs in the matching C:\\mnt\\... folder.
     """
-    vm = inst(a).up()
+    vm = ready(a)
     tty = a.rest[:1] == ["-t"]
     words = a.rest[tty:]
     cwd = vm.guest_path(Path.cwd())
@@ -207,7 +216,7 @@ def cmd_sh(a):
 @command(arg("args", nargs="*", metavar="ARG", help="ssh options, then an optional remote command"), raw=True)
 def cmd_ssh(a):
     """plain ssh to the instance, e.g. ssh -L 8080:localhost:80 -N  |  ssh hostname"""
-    vm = inst(a).up()
+    vm = ready(a)
     opts, rest = [], list(a.rest)
     while rest and rest[0].startswith("-"):                    # options go before the host name
         o = rest.pop(0)
@@ -222,7 +231,7 @@ def cmd_ssh(a):
 @command(arg("paths", nargs="*", metavar="PATH", help="':' prefix = guest path"), raw=True)
 def cmd_cp(a):
     """copy files with scp, e.g. cp a.txt :C:/Users/user/  |  cp :C:/x.log ."""
-    vm = inst(a).up()
+    vm = ready(a)
     paths = [f"{vm.name}{p}" if p.startswith(":") else p for p in a.rest]
     os.execvp("scp", ["scp", "-F", str(vm.dir / "ssh_config"), "-r", *paths])
 
@@ -250,7 +259,7 @@ def cmd_gui(a):
 @command(arg("args", nargs="*", metavar="FREERDP_ARG"), raw=True)
 def cmd_rdp(a):
     """RDP session with FreeRDP: dynamic resolution, clipboard"""
-    vm = inst(a).up()                                          # booted = SSH answers
+    vm = ready(a)                                          # booted = SSH answers
     port = vm.state.get("rdp") or die("RDP is off (settings.ports.rdp)")
     meta = vm.layer_meta()
     for x in ("xfreerdp3", "xfreerdp", "sdl-freerdp3"):
