@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import os
 import shutil
+import subprocess as sp
 import sys
 import tarfile
 import time
@@ -40,7 +41,7 @@ def program(cfg: Config, key: str) -> str | None:
 
 
 def qemu(cfg: Config) -> str:
-    return program(cfg, "qemu") or die(f"QEMU not found ({cfg.s.get('qemu')}) - {install_hint()}")
+    return program(cfg, "qemu") or die(f"QEMU not found ({cfg.s.get('qemu')}) - {install_hint('qemu')}")
 
 
 def qemu_img(cfg: Config) -> str:
@@ -49,7 +50,7 @@ def qemu_img(cfg: Config) -> str:
     for p in ("/usr/bin/qemu-img", shutil.which("qemu-img")):
         if p and Path(p).exists():
             return p
-    die(f"qemu-img not found - {install_hint()}")
+    die(f"qemu-img not found - {install_hint('qemu')}")
 
 
 def kvm_problem() -> str | None:
@@ -60,24 +61,60 @@ def kvm_problem() -> str | None:
     return None
 
 
-def install_hint() -> str:
-    """How to install QEMU (+ optional Samba) on this distro."""
-    ids = ""
+# what to install, per distro family (ID / ID_LIKE in /etc/os-release)
+PACKAGES = {
+    "fedora": ("sudo dnf install", {"qemu": "qemu-kvm", "ssh": "openssh-clients", "samba": "samba",
+                                    "gtk": "qemu-ui-gtk", "rdp": "freerdp", "vnc": "virt-viewer"}),
+    "debian": ("sudo apt install", {"qemu": "qemu-system-x86 qemu-utils", "ssh": "openssh-client",
+                                    "samba": "samba", "gtk": "qemu-system-gui", "rdp": "freerdp3-x11",
+                                    "vnc": "virt-viewer"}),
+    "arch": ("sudo pacman -S", {"qemu": "qemu-base", "ssh": "openssh", "samba": "samba",
+                                "gtk": "qemu-ui-gtk", "rdp": "freerdp", "vnc": "virt-viewer"}),
+    "suse": ("sudo zypper install", {"qemu": "qemu-x86 qemu-tools", "ssh": "openssh-clients",
+                                     "samba": "samba", "gtk": "qemu-ui-gtk", "rdp": "freerdp",
+                                     "vnc": "virt-viewer"}),
+}
+WHAT = {"qemu": "QEMU (qemu-system-x86_64, qemu-img)", "ssh": "the OpenSSH client (ssh, scp, ssh-keygen)",
+        "samba": "Samba (smbd)", "gtk": "QEMU's GTK display", "rdp": "FreeRDP", "vnc": "a VNC viewer"}
+
+
+def install_hint(*needs: str) -> str:
+    """How to install what `needs` names ("qemu", "ssh", "samba", "gtk", "rdp", "vnc") here."""
+    ids = []
     try:
         for ln in Path("/etc/os-release").read_text().splitlines():
             if ln.startswith(("ID=", "ID_LIKE=")):
-                ids += " " + ln.split("=", 1)[1].strip('"')
+                ids += ln.split("=", 1)[1].strip('"').split()
     except OSError:
         pass
-    for key, cmd in (("fedora", "sudo dnf install qemu-kvm samba"),
-                     ("rhel", "sudo dnf install qemu-kvm samba"),
-                     ("debian", "sudo apt install qemu-system-x86 qemu-utils samba"),
-                     ("ubuntu", "sudo apt install qemu-system-x86 qemu-utils samba"),
-                     ("arch", "sudo pacman -S qemu-base samba"),
-                     ("suse", "sudo zypper install qemu-x86 qemu-tools samba")):
-        if key in ids:
-            return f"install it: {cmd}   (samba only for mounts)"
-    return "install QEMU (qemu-system-x86_64 + qemu-img) from your distribution, and samba for mounts"
+    for i in ids:
+        i = {"rhel": "fedora", "centos": "fedora", "ubuntu": "debian", "opensuse": "suse"}.get(i, i)
+        if PACKAGES.get(i):
+            cmd, pkgs = PACKAGES[i]
+            return f"install it: {cmd} {' '.join(pkgs[n] for n in needs)}"
+    return "install " + " and ".join(WHAT[n] for n in needs) + " from your distribution"
+
+
+def ssh_missing() -> list[str]:
+    return [t for t in ("ssh", "scp", "ssh-keygen") if not shutil.which(t)]
+
+
+def has_gtk(cfg: Config) -> bool:
+    r = sp.run([qemu(cfg), "-display", "help"], capture_output=True, text=True)
+    return "gtk" in r.stdout.split()
+
+
+def require(cfg: Config, gui=False) -> None:
+    """Fail early - before downloading or booting anything - if the host can't run a VM
+    the way winvm does: QEMU with KVM, and the OpenSSH client to talk to Windows."""
+    qemu(cfg)
+    qemu_img(cfg)
+    if problem := kvm_problem():
+        die(problem)
+    if missing := ssh_missing():
+        die(f"{', '.join(missing)} not found: winvm talks to Windows over SSH - {install_hint('ssh')}")
+    if gui and not has_gtk(cfg):
+        die(f"this QEMU has no GTK display (--gui) - {install_hint('gtk')}")
 
 
 # ------------------------------------------------------------------ downloads

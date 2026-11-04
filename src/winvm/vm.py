@@ -215,7 +215,7 @@ class Instance:
         if self.alive:
             log(f"{self.name} already running (pid {self.pid})")
         else:
-            host.qemu(self.cfg)
+            host.require(self.cfg, gui)
             self.claim(self.ram)
             self.write_smb({} if self.builder else self.settings["mounts"])
             self.launch(self.qemu_argv(gui=gui), gui)
@@ -390,7 +390,7 @@ class Instance:
         d = self.dir / "smb"
         if not smbd():
             if mounts:
-                warn("smbd not found (install samba) - no mounts")
+                warn(f"smbd not found, so no mounts (C:\\mnt) - {host.install_hint('samba')}")
             shutil.rmtree(d, ignore_errors=True)
             (self.dir / "mounts.json").unlink(missing_ok=True)
             return
@@ -447,7 +447,7 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
     def mount(self, name: str, path: Path, readonly=False) -> None:
         self.require_running()
         if not (self.dir / "smb").is_dir():
-            die("no Samba on this instance (install samba, then restart it)")
+            die(f"no Samba on this instance - {host.install_hint('samba')}, then restart it")
         mounts = self.mounts
         changed = name in mounts
         mounts[name] = {"path": str(path), "readonly": readonly}

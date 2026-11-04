@@ -48,13 +48,24 @@ def inst(a) -> Instance:
     return Instance(a.cfg, name if builder else valid(name), builder=builder)
 
 
-def ready(a) -> Instance:
-    """The -i instance, running with SSH answering. The default instance, main, is created
-    on first use as `winvm up` would (other names must exist: a typo shouldn't start a build)."""
+def existing(a) -> Instance:
+    """The -i instance, which must exist - except the default one, main, which is created
+    on first use as `winvm up` would (a mistyped name shouldn't start a download and build)."""
     vm = inst(a)
-    if vm.name == "main" and not vm.builder and not vm.disk.exists():
+    if not vm.builder and not vm.disk.exists():
+        if vm.name != "main":
+            die(f"{vm.name} does not exist yet - winvm up {vm.name}")
         ensure_disk(a.cfg, vm)
-    return vm.up()
+    return vm
+
+
+def ready(a) -> Instance:
+    """The -i instance, running with SSH answering (see existing)."""
+    return existing(a).up()
+
+
+RDP_CLIENTS = ("xfreerdp3", "xfreerdp", "sdl-freerdp3")
+VNC_VIEWERS = ("remote-viewer", "vncviewer")
 
 
 # ------------------------------------------------------------------ run instances
@@ -90,6 +101,7 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
             warn(f"{vm.name} runs on an older version of '{vm.image}' - "
                  f"winvm -i {vm.name} reset to update it (discards its changes)")
         return
+    host.require(cfg)                                          # before creating anything
     image = image or (vm.name if vm.name in cfg.images else "base")
     if image in cfg.images:
         build(cfg, [image])
@@ -121,6 +133,7 @@ def cmd_up(a):
     image = cfg.ref(a.image) if a.image else None
     names = [d.parent.name for d in store.disks()] if a.all else \
         [cfg.ref(n) if is_path(n) else valid(n) for n in a.names or [a.instance]]
+    host.require(cfg, a.gui)                                   # before building or creating
     for n in names:
         vm = Instance(cfg, n)
         ensure_disk(cfg, vm, image, run)
@@ -247,13 +260,13 @@ def cmd_gui(a):
     """open a VNC viewer on a running instance, or start it with a GTK window"""
     vm = inst(a)
     if not vm.alive:
-        ensure_disk(a.cfg, vm)
-        return vm.start(gui=True, wait=False)
+        host.require(a.cfg, gui=True)
+        return existing(a).start(gui=True, wait=False)
     vnc = vm.state.get("vnc") or die(f"{vm.name} runs headless without VNC - winvm rdp")
-    for viewer in ("remote-viewer", "vncviewer"):
+    for viewer in VNC_VIEWERS:
         if shutil.which(viewer):
             os.execvp(viewer, [viewer, f"vnc://127.0.0.1:{vnc}" if viewer == "remote-viewer" else f"127.0.0.1:{vnc}"])
-    die(f"no VNC viewer found - connect one to 127.0.0.1:{vnc}")
+    die(f"no VNC viewer found - connect one to 127.0.0.1:{vnc}, or {host.install_hint('vnc')}")
 
 
 @command(arg("args", nargs="*", metavar="FREERDP_ARG"), raw=True)
@@ -262,12 +275,12 @@ def cmd_rdp(a):
     vm = ready(a)                                          # booted = SSH answers
     port = vm.state.get("rdp") or die("RDP is off (settings.ports.rdp)")
     meta = vm.layer_meta()
-    for x in ("xfreerdp3", "xfreerdp", "sdl-freerdp3"):
+    for x in RDP_CLIENTS:
         if shutil.which(x):
             os.execvp(x, [x, f"/v:127.0.0.1:{port}", f"/u:{meta.get('user', 'user')}",
                           f"/p:{meta.get('password', '')}", "/cert:ignore", "/dynamic-resolution", "+clipboard",
                           *a.rest])
-    die("no FreeRDP client found (dnf install freerdp)")
+    die(f"no FreeRDP client found - {host.install_hint('rdp')}")
 
 
 @command(arg("args", nargs="*", metavar="ARG", help="agent command [json] | exec PROGRAM [ARGS]"), raw=True)
@@ -511,18 +524,27 @@ def cmd_check(a):
     kvm = host.kvm_problem()
     row("KVM", not kvm, kvm or "/dev/kvm")
     qemu = host.program(cfg, "qemu")
-    row("QEMU", bool(qemu), qemu or host.install_hint())
+    row("QEMU", bool(qemu), qemu or host.install_hint("qemu"))
     try:
         row("qemu-img", True, host.qemu_img(cfg))
     except Fatal:
-        row("qemu-img", False, host.install_hint())
-    ssh = all(shutil.which(t) for t in ("ssh", "scp", "ssh-keygen"))
-    row("OpenSSH", ssh, "ssh, scp, ssh-keygen" if ssh else "install openssh-client (ssh, scp, ssh-keygen)")
+        row("qemu-img", False, host.install_hint("qemu"))
+    missing = host.ssh_missing()
+    row("OpenSSH", not missing, f"{', '.join(missing)} missing - {host.install_hint('ssh')}" if missing
+        else "ssh, scp, ssh-keygen")
     fw = host.ovmf(cfg)
     row("UEFI (OVMF)", True if fw else None, fw[0] if fw else "downloaded from Debian when needed (6 MB)")
     print("optional")
     smbd = vm_smbd()
-    row("Samba", True if smbd else None, smbd or "only for mounts (C:\\mnt): install the samba package")
+    row("Samba", True if smbd else None, smbd or f"for mounts (C:\\mnt): {host.install_hint('samba')}")
+    gtk = bool(qemu) and host.has_gtk(cfg)
+    row("GTK display", True if gtk else None, "QEMU window (--gui, winvm gui)" if gtk else
+        f"for --gui / winvm gui on a stopped instance: {host.install_hint('gtk')}")
+    rdp = next(filter(shutil.which, RDP_CLIENTS), None)
+    row("FreeRDP", True if rdp else None, rdp if rdp else f"for winvm rdp: {host.install_hint('rdp')}")
+    vnc = next(filter(shutil.which, VNC_VIEWERS), None)
+    row("VNC viewer", True if vnc else None, vnc if vnc else
+        f"for winvm gui on a running instance: {host.install_hint('vnc')}")
     ksm = Path("/sys/kernel/mm/ksm/run")
     on = ksm.exists() and ksm.read_text().strip() == "1"
     row("KSM", True if on else None, "shares identical memory between VMs" if on else

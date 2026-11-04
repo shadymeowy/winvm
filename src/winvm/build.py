@@ -60,10 +60,8 @@ def build(cfg: Config, names: list[str], force=False, gui=False) -> None:
     todo = [n for n in order if pending(n)]
     if not todo:
         return
-    host.qemu(cfg)                                             # the host can run it at all?
-    host.qemu_img(cfg)                                         # (before downloading gigabytes)
-    if problem := host.kvm_problem():
-        die(problem)
+    host.require(cfg, gui)                                     # the host can run it at all?
+                                                               # (before downloading gigabytes)
     items = host.downloads_for(cfg, todo)
     host.consent(items, cfg.yes)
     host.fetch_all(cfg, items)
