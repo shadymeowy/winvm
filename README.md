@@ -120,7 +120,7 @@ shows the same as `./winvm layers`, and `~/Others/vm` can be moved.
 ```sh
 ./winvm sh                     # install things; everything lands in disks/main.qcow2
 ./winvm stop
-./winvm save office            # disks/main -> layers/office (read-only); main continues on top of it
+./winvm save office            # disks/main -> layers/office (read-only, zstd); main continues on top of it
 ./winvm reset                  # throw away what you did since: back to "office"
 ./winvm reset base             # clean Windows again (office is kept)
 ./winvm -i scratch start --from office   # a second instance on the same layer, at the same time
@@ -129,7 +129,11 @@ shows the same as `./winvm layers`, and `~/Others/vm` can be moved.
 ./winvm drop office            # delete the layer (refused while anything is built on it)
 ```
 
-Saved layers are never written again, so whatever is built on them stays valid.
+An instance's disk keeps its changes across stop/start on its own; `save` is only
+for freezing a state that you want to return to or start other instances from.
+`save` writes the layer zstd-compressed (`COMPRESS_LAYERS=1`), holding only the
+blocks the instance changed. Saved layers are never written again, so whatever is
+built on them stays valid.
 A starting instance takes the lowest free port slot *n* (preferring the one it had
 last time): `SSH_PORT`+*n*, `RDP_PORT`+*n*, `VNC_DISPLAY`+*n*. The first one gets
 the plain ports. `./winvm ps` shows them. The host RAM guard (below) decides how many instances
@@ -242,7 +246,8 @@ refuses to run next to any VM.
 
 For software you try out or change often, install it in an instance and
 `./winvm save` it as a layer (see above). To bake something into every base build,
-put its installer and a `*.ps1` that runs it into **`guest/extra/`** (details in
+put a `*.ps1` that runs its installer into **`guest/extra/`**, with the installer
+next to it or pinned in `guest/extra/downloads.txt` (details in
 [guest/extra/README.md](guest/extra/README.md)). Setup runs those scripts as
 SYSTEM, offline, after the debloat. What to rerun after a change:
 
@@ -291,7 +296,7 @@ Measured on this repo's defaults (Windows 11 Pro, build 26300, 4 vCPU/4 GB, KVM)
 XPRESS4K (CompactOS) only reaches about 1.8:1, and its output is incompressible
 for qcow2. Leaving the guest data raw and letting qcow2's zstd compress it gives
 the smaller host footprint, so that's the default. Blocks you write later land
-uncompressed in the instance disk (and the layers you `save`); `./winvm reset`
+uncompressed in the instance disk until you `save` it as a (compressed) layer; `./winvm reset`
 gets you back to the layer below.
 
 ## Activation and re-enabling things

@@ -8,3 +8,4 @@ __pycache__/
 guest/extra/*
 !guest/extra/*.ps1
 !guest/extra/README.md
+!guest/extra/downloads.txt

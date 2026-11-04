@@ -1,0 +1,6 @@
+# Installers fetched on the host for guest/extra scripts (the build itself is offline).
+# One per line: URL SHA256 [NAME]. Cached in $DATA_DIR/cache/extra, checked against
+# the sha256 on every build, then copied into the extra folder next to your scripts.
+# NAME defaults to the URL's file name. Get the hash with: curl -sL URL | sha256sum
+#
+# https://www.7-zip.org/a/7z2409-x64.msi  <sha256>

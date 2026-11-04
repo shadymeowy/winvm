@@ -172,6 +172,11 @@ def meminfo(key: str) -> int:
     return int(m[1]) // 1024
 
 
+def zstd() -> list[str]:
+    """qemu-img convert options for the read-only layers (COMPRESS_LAYERS)."""
+    return ["-c", "-o", "compression_type=zstd"] if C.COMPRESS_LAYERS == "1" else []
+
+
 def need_mem(want: int, what: str) -> None:
     """Refuse to start something the host can't hold. Running VMs count with the RAM
     they may still grow into, not just what they touched so far."""
@@ -541,6 +546,9 @@ def stage_tree(tree: Path, mode="install") -> None:
     need("7z", "wimlib-imagex", "xorriso")
     if not (VIRTIO_ISO.exists() and OPENSSH_MSI.exists()):
         cmd_fetch()
+    downloads = extra_downloads()
+    for url, f, sha in downloads:                              # checked again: the list may have changed
+        download(url, f, sha)
     ensure_key()
     shutil.rmtree(tree, ignore_errors=True)
     tree.mkdir(parents=True)
@@ -606,7 +614,9 @@ def stage_tree(tree: Path, mode="install") -> None:
     (pl / "authorized_keys").write_bytes(dos("".join(k.read_text() for k in keys if k.exists())))
     shutil.rmtree(vio)
     # your additions: setupcomplete.ps1 runs extra/*.ps1 (see guest/extra/README.md)
-    shutil.copytree(EXTRA, pl / "extra", ignore=shutil.ignore_patterns("README.md", ".*"))
+    shutil.copytree(EXTRA, pl / "extra", ignore=shutil.ignore_patterns("README.md", "downloads.txt", ".*"))
+    for _, f, _ in downloads:
+        shutil.copy(f, pl / "extra")
     if scripts := sorted(f.name for f in (pl / "extra").glob("*.ps1")):
         log(f"extras: {', '.join(scripts)}")
 
@@ -709,8 +719,7 @@ def finalize(disk: Path) -> None:
     log("creating the golden base layer")
     base, tmp = layer("base"), layer("base").with_suffix(".tmp")
     LAYERS.mkdir(parents=True, exist_ok=True)
-    zstd = ["-c", "-o", "compression_type=zstd"] if C.COMPRESS_BASE == "1" else []
-    run(C.QEMU_IMG, "convert", "-p", "-O", "qcow2", *zstd, disk, tmp)
+    run(C.QEMU_IMG, "convert", "-p", "-O", "qcow2", *zstd(), disk, tmp)
     tmp.replace(base)
     base.chmod(0o444)
     disk.unlink()
@@ -746,32 +755,53 @@ def current(a) -> VM:
 
 # ------------------------------------------------------------------ commands: build
 
+def sha_ok(f: Path, want: str) -> bool:
+    if not f.exists():
+        return False
+    h = hashlib.sha256()
+    with f.open("rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest() == want.lower()
+
+
+def download(url: str, f: Path, sha256: str) -> None:
+    """Fetch url to f unless f is already there with this sha256; a mismatch is fatal."""
+    if sha_ok(f, sha256):
+        return
+    log(f"downloading {f.name}")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.which("aria2c"):
+        run("aria2c", "-q", "-x8", "-s8", "--allow-overwrite=true", "--auto-file-renaming=false",
+            "-d", f.parent, "-o", f.name, url)
+    else:
+        run("curl", "-fL", "--progress-bar", "-o", f, url)
+    sha_ok(f, sha256) or die(f"checksum mismatch: {f} (expected {sha256})")
+
+
+def extra_downloads() -> list[tuple[str, Path, str]]:
+    """guest/extra/downloads.txt: `URL SHA256 [NAME]` per line -> (url, cache file, sha256)."""
+    lst = EXTRA / "downloads.txt"
+    out = []
+    for n, ln in enumerate(lst.read_text().splitlines() if lst.exists() else [], 1):
+        ln = re.split(r"(?:^|\s)#", ln, maxsplit=1)[0].strip()
+        if not ln:
+            continue
+        url, sha, *name = ln.split()
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", sha) or len(name) > 1:
+            die(f"{lst}:{n}: expected `URL SHA256 [NAME]`")
+        out.append((url, CACHE / "extra" / (name[0] if name else url.split("?")[0].rsplit("/", 1)[-1]), sha))
+    return out
+
+
 @command()
 def cmd_fetch(a=None):
-    """download the pinned virtio-win ISO + OpenSSH MSI (sha256-checked)"""
-    CACHE.mkdir(parents=True, exist_ok=True)
+    """download the pinned virtio-win ISO, OpenSSH MSI and guest/extra downloads (sha256-checked)"""
     ISOS.mkdir(parents=True, exist_ok=True)
-
-    def ok(f: Path, want: str) -> bool:
-        if not f.exists():
-            return False
-        h = hashlib.sha256()
-        with f.open("rb") as fh:
-            while chunk := fh.read(1 << 20):
-                h.update(chunk)
-        return h.hexdigest() == want
-
-    for url, f, want in ((C.VIRTIO_URL, VIRTIO_ISO, C.VIRTIO_SHA256), (C.OPENSSH_URL, OPENSSH_MSI, C.OPENSSH_SHA256)):
-        if ok(f, want):
-            log(f"ok: {f.name}")
-            continue
-        log(f"downloading {f.name}")
-        if shutil.which("aria2c"):
-            run("aria2c", "-q", "-x8", "-s8", "--allow-overwrite=true", "--auto-file-renaming=false",
-                "-d", f.parent, "-o", f.name, url)
-        else:
-            run("curl", "-fL", "--progress-bar", "-o", f, url)
-        ok(f, want) or die(f"checksum mismatch: {f}")
+    for url, f, sha in [(C.VIRTIO_URL, VIRTIO_ISO, C.VIRTIO_SHA256),
+                        (C.OPENSSH_URL, OPENSSH_MSI, C.OPENSSH_SHA256), *extra_downloads()]:
+        download(url, f, sha)
+        log(f"ok: {f.name}")
     iso = win_iso(required=False)
     log(f"Windows ISO: {iso.name}") if iso else warn(f"no Windows ISO yet - put an official one into {ISOS}")
 
@@ -1111,10 +1141,15 @@ def cmd_save(a):
     dst = layer(name)
     if dst.exists():
         die(f"layer '{name}' already exists")
-    below = parent(vm.disk)
-    vm.disk.replace(dst)
-    run(C.QEMU_IMG, "rebase", "-u", "-F", "qcow2", "-b", f"{below}.qcow2", dst)   # relative to layers/
+    below, tmp = parent(vm.disk), dst.with_suffix(".tmp")
+    # copy only the disk's own clusters (-B: the rest stays in the layer below), compressed;
+    # the backing name is relative to layers/, where the new layer lives
+    log(f"writing layer '{name}' on '{below}'")
+    run(C.QEMU_IMG, "convert", "-p", "-O", "qcow2", *zstd(), "-B", f"{below}.qcow2", "-F", "qcow2",
+        vm.disk, tmp)
+    tmp.replace(dst)
     dst.chmod(0o444)
+    vm.disk.unlink()
     overlay(vm.disk, name)
     log(f"saved layer '{name}' ({human(dst)}): {' -> '.join([vm.name, *chain(vm.disk)])}")
 
