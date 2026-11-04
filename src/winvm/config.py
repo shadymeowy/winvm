@@ -15,10 +15,11 @@ import json
 import os
 import re
 from pathlib import Path
+from urllib.parse import unquote
 
 import yaml
 
-from .util import Fatal, content_hash, die, log, run, valid
+from .util import Fatal, content_hash, die, log, run, sha256_file, valid, warn
 
 DATA = Path(__file__).parent / "data"
 DEFAULT_FILE = DATA / "winvm.yaml"
@@ -110,6 +111,7 @@ class Config:
         # build scratch, keyed like the runtime dir: data dirs may share one cache
         self.build = self.cache / "build" / self.runtime.name
         self.key = self.data / "keys/id_ed25519"
+        self.yes = False                                        # -y: download without asking
 
         # image definitions: built-ins, then your images_dir (may replace a built-in), then
         # files named by path earlier (recorded in instance/image metadata)
@@ -183,16 +185,25 @@ class Config:
         return self.load(Path(ref).expanduser()) if is_path(ref) else valid(ref)
 
     def image(self, name: str) -> dict:
-        return self.images.get(name) or die(
-            f"no image '{name}': no {name}.yaml in {self.images_dir} or the built-ins "
-            f"(an image file elsewhere: give its path)")
+        if name in self.images:
+            return self.images[name]
+        if self.prebuilt(name):
+            die(f"image '{name}' is built, but its file is gone (or it was `save`d): it can be "
+                f"used, not rebuilt - give its file's path to rebuild it")
+        die(f"no image '{name}': no {name}.yaml in {self.images_dir} or the built-ins, and nothing "
+            f"built under that name (an image file elsewhere: give its path)")
+
+    def prebuilt(self, name: str) -> bool:
+        """A name with built versions but no definition (file moved/deleted, or `save`d):
+        usable like a Docker image by name - as is, never rebuilt."""
+        return name not in self.images and bool(self.built_hashes(name))
 
     def context(self, name: str) -> Path:
         """The folder of an image's file: its relative paths start there."""
         return self.sources[name].parent
 
     def parent(self, name: str) -> str | None:
-        return self.image(name).get("from")
+        return None if self.prebuilt(name) else self.image(name).get("from")
 
     def chain(self, name: str) -> list[str]:
         """The image and everything below it, bottom first."""
@@ -210,12 +221,42 @@ class Config:
         if img.get("iso"):
             p = self.path(img["iso"], self.context(name))
         else:
-            # newest first; lstat: a link made by `--iso` counts from when it was made
-            p = max((self.data / "iso").glob("*.iso"), key=lambda q: q.lstat().st_mtime, default=None)
+            p = next(iter(self.linked_isos()), None)
         if not (p and p.exists()):
             die(f"image '{name}' needs a Windows ISO: `winvm up --iso PATH` (official ISO from "
                 f"microsoft.com/software-download), or `iso:` in {self.sources[name]}")
         return p
+
+    def linked_isos(self) -> list[Path]:
+        """The ISOs in ${data_dir}/iso (linked by `--iso`, or downloaded), newest first;
+        links to moved or deleted files don't count. lstat: a link counts from when it was
+        made (or renewed by `--iso`)."""
+        isos = [p for p in (self.data / "iso").glob("*.iso") if p.exists()]
+        return sorted(isos, key=lambda q: q.lstat().st_mtime, reverse=True)
+
+    def iso_id(self, name: str) -> str:
+        """The image's ISO by content: sha256, computed once per file (cached by path,
+        size and mtime) - the same ISO under another name or path is the same input."""
+        iso = self.iso(name)
+        cache = self.data / "iso" / ".sha256.json"
+        try:
+            known = json.loads(cache.read_text())
+        except (OSError, ValueError):
+            known = {}
+        st = iso.stat()
+        key = f"{iso.resolve()}|{st.st_size}|{int(st.st_mtime)}"
+        if key not in known:
+            log(f"checksumming {iso.name} (once)")
+            known[key] = sha256_file(iso)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_name(f"{cache.name}.{os.getpid()}")   # builds may run side by side
+            tmp.write_text(json.dumps(known, indent=1) + "\n")
+            tmp.replace(cache)
+            if known[key] == (self.s.get("windows") or {}).get("sha256"):
+                log(f"{iso.name}: matches Microsoft's published image")
+            else:
+                warn(f"{iso.name} is not an ISO winvm knows - make sure it is an official one from Microsoft")
+        return known[key]
 
     def steps(self, name: str) -> list[dict]:
         """An image's steps (`setup` for ISO images, `steps` otherwise), checked and normalized."""
@@ -232,7 +273,9 @@ class Config:
             elif kind == "download" and isinstance(arg, dict) and {"url", "sha256"} <= arg.keys():
                 if not re.fullmatch(r"[0-9a-fA-F]{64}", str(arg["sha256"])):
                     die(f"{where}: sha256 must be 64 hex digits")
-                fname = arg.get("name") or str(arg["url"]).split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+                fname = str(arg.get("name") or unquote(str(arg["url"]).split("?")[0].rstrip("/").rsplit("/", 1)[-1]))
+                if fname in ("", ".", "..") or "/" in fname or "\\" in fname:
+                    die(f"{where}: `name` must be a plain file name, got {fname!r}")
                 out.append({"download": {"url": arg["url"], "sha256": str(arg["sha256"]).lower(), "name": fname}})
             elif kind == "copy" and isinstance(arg, list) and 1 <= len(arg) <= (1 if offline else 2):
                 if not (src := self.path(arg[0], self.context(name))).exists():
@@ -259,15 +302,19 @@ class Config:
         return "".join(k.read_text().strip() + "\n" for k in keys if k.exists())   # one per line
 
     def slim_key(self, name: str) -> str:
-        """What the captured, debloated image depends on: ISO, edition, offline servicing."""
-        img, iso = self.image(name), self.iso(name)
-        return sha({"iso": [iso.name, iso.stat().st_size], "edition": img.get("edition"), "index": img.get("index"),
+        """What the captured, debloated image depends on: ISO, edition, offline servicing,
+        the virtio drivers injected into it."""
+        img = self.image(name)
+        return sha({"iso": self.iso_id(name), "edition": img.get("edition"), "index": img.get("index"),
                      "strip": (img.get("debloat") or {}).get("strip_payloads"),
+                     "virtio": self.s["virtio"]["sha256"],
                      "pe": content_hash(GUEST / "pe.cmd"), "lists": content_hash(GUEST / "lists")})
 
     def hash(self, name: str) -> str:
         """Content hash of an image: its definition, the files it copies, and the image below.
         Not where its file is: moving a file rebuilds nothing."""
+        if name not in self._hash and self.prebuilt(name):     # as built: its newest version
+            self._hash[name] = self.built_hashes(name)[0]
         if name not in self._hash:
             img = self.image(name)
             steps = [dict(st, src=content_hash(Path(st["copy"][0]))) if "copy" in st else st
@@ -277,18 +324,22 @@ class Config:
                 d = {"from": self.hash(img["from"]), "steps": steps}
             else:
                 try:
-                    iso = self.iso(name)
+                    iso = self.iso_id(name)
                 except Fatal:
                     # the ISO is gone (deleted to save space?): keep using the newest build
                     if built := self.built_hashes(name):
                         self._hash[name] = built[0]
                         return built[0]
                     raise
-                d = {**{k: img.get(k) for k in BASE_KEYS}, "iso": [iso.name, iso.stat().st_size],
+                d = {**{k: img.get(k) for k in BASE_KEYS}, "iso": iso,
                      "setup": steps, "guest": content_hash(GUEST), "keys": self.authorized_keys(),
                      "tools": [self.s["virtio"]["sha256"], self.s["openssh"]["sha256"]]}
             self._hash[name] = sha(d)
         return self._hash[name]
+
+    def forget(self) -> None:
+        """Drop cached hashes (after an ISO arrived, for instance)."""
+        self._hash.clear()
 
     def built_hashes(self, name: str) -> list[str]:
         """Hashes of the built versions of an image, newest first (from images/*.json)."""

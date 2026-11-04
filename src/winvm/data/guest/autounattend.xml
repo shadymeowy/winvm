@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- winvm: on Microsoft's unmodified Windows ISO, Setup reads this from the payload CD
+     and, in the windowsPE pass, runs winslim\start.cmd - which installs Windows itself
+     and reboots before Setup goes any further. The later passes use winslim\unattend.xml,
+     which pe.cmd stages into the installed Windows. -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand>
+          <Order>1</Order>
+          <Path>cmd /c "for %d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do @if exist %d:\winslim\start.cmd call %d:\winslim\start.cmd %d:"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+</unattend>

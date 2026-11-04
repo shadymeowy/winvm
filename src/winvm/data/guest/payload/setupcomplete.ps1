@@ -1,6 +1,6 @@
 # winslim: runs as SYSTEM from SetupComplete.cmd (after OOBE, before first logon).
 # Installs guest tools + OpenSSH, configures the VM, re-checks the debloat online,
-# then compacts and trims the disk. firstlogon.ps1 powers the VM off afterwards.
+# then compacts and trims the disk. firstlogon.ps1 and final.ps1 finish the build.
 $ErrorActionPreference = 'Continue'
 $ScriptDir = $PSScriptRoot
 . "$ScriptDir\common.ps1"

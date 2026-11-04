@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = ["PyYAML>=6"]
+dependencies = ["PyYAML>=6", "pycdlib>=1.22"]
 keywords = ["windows", "qemu", "kvm", "vm", "unattended", "debloat"]
 classifiers = [
     "Environment :: Console",

@@ -1,5 +1,7 @@
 # winslim: runs once at the build's single autologon (creates the user profile
-# inside the base image, so later SSH/GUI logons are fast), then powers off.
+# inside the base image, so later SSH/GUI logons are fast), then reboots once more:
+# files the shell kept locked are deleted during that boot, and final.ps1 (a one-time
+# startup task) finishes the build and powers off.
 $ErrorActionPreference = 'Continue'
 $ScriptDir = $PSScriptRoot
 . "$ScriptDir\common.ps1"
@@ -24,16 +26,35 @@ if ($RemoveWebView) {
         if (Test-Path -LiteralPath $wv) { Start-Sleep -Seconds 3 }
     }
     Remove-Item -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft EdgeWebView' -Recurse -Force -ErrorAction SilentlyContinue
-    $left = (Get-ChildItem -LiteralPath $wv -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-    Log ("  EdgeWebView removed ({0:N1} MB still locked, the host cleans that up offline)" -f ($left/1MB)) 'FL'
+    $left = Get-ChildItem -LiteralPath $wv -Recurse -Force -ErrorAction SilentlyContinue
+    if ($left) {   # still locked: delete during the next boot (files first, then folders bottom-up)
+        Add-Type -Namespace Winslim -Name Kernel32 -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool MoveFileEx(string from, string to, int flags);
+'@
+        $paths = @($left | Where-Object { -not $_.PSIsContainer }) + @($left | Where-Object PSIsContainer |
+            Sort-Object { $_.FullName.Length } -Descending) + @(Get-Item -LiteralPath $wv -Force)
+        foreach ($f in $paths) { [void][Winslim.Kernel32]::MoveFileEx($f.FullName, $null, 4) }   # DELAY_UNTIL_REBOOT
+        Log ("  EdgeWebView: {0:N1} MB still locked, deleted at the next boot" -f
+            (($left | Measure-Object Length -Sum).Sum / 1MB)) 'FL'
+    } else {
+        Log '  EdgeWebView removed' 'FL'
+    }
 }
 
 # Per-user leftovers
 Remove-Item -Force -ErrorAction SilentlyContinue "$env:USERPROFILE\Desktop\Microsoft Edge.lnk"
 Get-ChildItem -LiteralPath $env:TEMP -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-$used = (Get-PSDrive C).Used / 1GB
-Log ("C: used {0:N2} GiB" -f $used) 'FL'
-Optimize-Volume -DriveLetter C -ReTrim -ErrorAction SilentlyContinue
-Log 'WINSLIM-DONE' 'FL'
-& shutdown.exe /s /t 3 /c 'winslim build complete'
+# Finish in one more boot: locked files go away, then final.ps1 runs as SYSTEM at startup.
+$act = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptDir\final.ps1`""
+$task = Register-ScheduledTask -TaskName 'winslim-final' -Action $act -Trigger (New-ScheduledTaskTrigger -AtStartup) `
+    -User 'SYSTEM' -RunLevel Highest -Force
+if ($task) {
+    Log 'rebooting once to finish' 'FL'
+    & shutdown.exe /r /t 3 /c 'winslim: one more boot'
+} else {   # without the task nothing would power the VM off after the reboot: finish now
+    Log 'WARN could not register the startup task - finishing without the extra boot' 'FL'
+    & "$ScriptDir\final.ps1"
+}

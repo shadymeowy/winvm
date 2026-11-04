@@ -14,12 +14,13 @@ from pathlib import Path
 
 import yaml
 
-from . import __version__, guest
-from .build import build, export_iso, fetch_step, fetch_tools
+from . import __version__, guest, host
+from .build import build, fetch_step
 from .config import BUILTIN, DEFAULT_FILE, Config, is_path, sha
+from .media import editions
 from .store import Store, label
-from .util import Chan, Fatal, die, du, log, mib, need, output, paint, run, valid, warn
-from .vm import Instance, ports, running
+from .util import Chan, Fatal, die, du, log, mib, paint, valid, warn
+from .vm import Instance, ports, running, smbd as vm_smbd
 
 COMMANDS: dict[str, tuple] = {}
 RAW = set()   # commands whose arguments are passed through verbatim (PowerShell, ssh, scp, ...)
@@ -56,12 +57,14 @@ def link_iso(cfg: Config, iso: str) -> None:
         die(f"no such ISO: {src}")
     dst = cfg.data / "iso" / src.name
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.resolve() != src:
-        if dst.exists() and not dst.is_symlink():
-            die(f"{dst} is another file with that name - move it away or rename the ISO")
-        dst.unlink(missing_ok=True)
-        dst.symlink_to(src)
-        log(f"using {src} (linked as {dst})")
+    if dst.resolve() == src:                                   # linked before: make it the newest again
+        os.utime(dst, follow_symlinks=False)
+        return
+    if dst.exists() and not dst.is_symlink():
+        die(f"{dst} is another file with that name - move it away or rename the ISO")
+    dst.unlink(missing_ok=True)
+    dst.symlink_to(src)
+    log(f"using {src} (linked as {dst})")
 
 
 def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict | None = None) -> None:
@@ -381,7 +384,7 @@ def cmd_prune(a):
         if d.is_dir() and d.name not in live:
             shutil.rmtree(d)
     if a.cache:
-        for d in ("downloads", "slim"):
+        for d in ("downloads", "slim", "firmware"):
             shutil.rmtree(cfg.cache / d, ignore_errors=True)
     log("pruned")
 
@@ -441,39 +444,74 @@ def cmd_rm(a):
     log(f"removed instance {vm.name}")
 
 
-@command(arg("image", nargs="?", default="base"), arg("-o", "--output", help="default: ./IMAGE.iso"))
-def cmd_iso(a):
-    """write a standalone installer ISO of an ISO image (its slim image + payload)"""
-    out = Path(a.output or f"{Path(a.image).stem}.iso").resolve()
-    export_iso(a.cfg, a.cfg.ref(a.image), out)
-    log(f"{out} ({du(out)}) - it wipes disk 0 without asking and refuses to run outside QEMU")
-
-
 @command(arg("image", nargs="?", default="base"))
 def cmd_editions(a):
     """list the editions inside an image's Windows ISO"""
-    need("7z", "wimlib-imagex")
     root = a.cfg.chain(a.cfg.ref(a.image))[0]                 # the ISO image a `from` image is built on
-    iso, tmp = a.cfg.iso(root), a.cfg.cache / "build/editions"
-    shutil.rmtree(tmp, ignore_errors=True)
-    image = "sources/install.wim" if "install.wim" in output("7z", "l", iso, "sources/install.*") \
-        else "sources/install.esd"
-    run("7z", "x", "-y", f"-o{tmp}", iso, image, quiet=True)
-    info = output("wimlib-imagex", "info", tmp / image)
-    shutil.rmtree(tmp)
-    for idx, name in re.findall(r"^Index:\s+(\d+).*?^Name:\s+(.+?)$", info, re.M | re.S):
+    for idx, name in editions(a.cfg.iso(root)):
         print(f"  {idx}: {name}")
 
 
-@command()
+@command(arg("images", nargs="*", metavar="IMAGE", help="default: every image winvm knows"))
 def cmd_fetch(a):
-    """download everything pinned: virtio-win, OpenSSH, the images' download steps"""
-    for f in fetch_tools(a.cfg).values():
-        log(f"ok: {f.name}")
-    for name in a.cfg.images:
-        for st in a.cfg.steps(name):
+    """download now what building the images needs (ISO, drivers, firmware, download steps)"""
+    cfg = a.cfg
+    names = [cfg.ref(n) for n in a.images] or list(cfg.images)
+    chain = [x for n in names for x in cfg.chain(n)]
+    items = host.downloads_for(cfg, chain)
+    host.consent(items, cfg.yes)
+    host.fetch_all(cfg, items)
+    for name in dict.fromkeys(chain):
+        for st in cfg.steps(name):
             if "download" in st:
-                log(f"ok: {fetch_step(a.cfg, st).name}")
+                fetch_step(cfg, st)
+    log("everything downloaded")
+
+
+@command()
+def cmd_check(a):
+    """what this host has and lacks for winvm, and how to get it"""
+    cfg, bad = a.cfg, 0
+
+    def row(what: str, ok, detail: str) -> None:
+        nonlocal bad
+        word, color = {True: ("ok", "1;32"), False: ("missing", "1;31"), None: ("later", "1;33")}[ok]
+        bad += ok is False
+        print(f"  {what:<13} {paint(color, f'{word:<7}')}  {detail}")   # pad before coloring
+
+    print("required")
+    kvm = host.kvm_problem()
+    row("KVM", not kvm, kvm or "/dev/kvm")
+    qemu = host.program(cfg, "qemu")
+    row("QEMU", bool(qemu), qemu or host.install_hint())
+    try:
+        row("qemu-img", True, host.qemu_img(cfg))
+    except Fatal:
+        row("qemu-img", False, host.install_hint())
+    ssh = all(shutil.which(t) for t in ("ssh", "scp", "ssh-keygen"))
+    row("OpenSSH", ssh, "ssh, scp, ssh-keygen" if ssh else "install openssh-client (ssh, scp, ssh-keygen)")
+    fw = host.ovmf(cfg)
+    row("UEFI (OVMF)", True if fw else None, fw[0] if fw else "downloaded from Debian when needed (6 MB)")
+    print("optional")
+    smbd = vm_smbd()
+    row("Samba", True if smbd else None, smbd or "for mounts (C:\\mnt) - " + host.install_hint())
+    print("downloads")
+    isos, win = cfg.linked_isos(), cfg.s.get("windows")
+    row("Windows ISO", True if isos else None,
+        isos[0].name if isos else
+        f"{win.get('title', 'Windows')}: downloaded when needed (asks first)" if win else
+        "none yet: winvm up --iso PATH")
+    for k in ("virtio", "openssh"):
+        pin = host.pinned(cfg, k)
+        row(k, True if pin["dest"].exists() else None, pin["dest"].name)
+    free = shutil.disk_usage(cfg.data if cfg.data.exists() else Path.home()).free
+    print(f"\n  {du_free(free)} free for {cfg.data} (a first build needs ~25 GB)")
+    if bad:
+        die(f"{bad} requirement(s) missing")
+
+
+def du_free(n: int) -> str:
+    return f"{n / (1 << 30):.0f} GB"
 
 
 # ------------------------------------------------------------------ config
@@ -511,12 +549,93 @@ def tilde(p: Path) -> str:
 
 # ------------------------------------------------------------------ main
 
-def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
+# ------------------------------------------------------------------ shell completion
+
+FILE_ARGS = {"up", "start", "build", "fetch", "editions", "reset", "config", "cp", "mount", "screenshot"}
+
+
+@command(arg("shell", choices=["bash", "fish"]))
+def cmd_completion(a):
+    """print a shell completion script, generated from winvm's own commands
+
+    winvm completion bash > ~/.local/share/bash-completion/completions/winvm
+    winvm completion fish > ~/.config/fish/completions/winvm.fish
+    zsh: autoload -U bashcompinit && bashcompinit && source <(winvm completion bash)
+    """
+    p, subs = parser()
+    glob = [o for act in p._actions for o in act.option_strings]
+    vals = [o for act in p._actions if act.nargs != 0 and act.option_strings for o in act.option_strings]
+    if a.shell == "bash":
+        cases = "".join(f"    {'|'.join(names)}) opts=\"{' '.join(o for act in sp_._actions for o in act.option_strings)}\";;\n"
+                        for names, sp_ in subs)
+        sys.stdout.write(f"""# winvm {__version__} bash completion (winvm completion bash)
+_winvm() {{
+  local cur=${{COMP_WORDS[COMP_CWORD]}} cmd="" opts="" i
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    case ${{COMP_WORDS[i]}} in
+      {'|'.join(vals)}) ((i++));;
+      -*) ;;
+      *) cmd=${{COMP_WORDS[i]}}; break;;
+    esac
+  done
+  if [[ -z $cmd ]]; then
+    COMPREPLY=($(compgen -W "{' '.join(n for names, _ in subs for n in names)} {' '.join(glob)}" -- "$cur"))
+    return
+  fi
+  case $cmd in
+{cases}  esac
+  if [[ $cur == -* ]]; then
+    COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+  else
+    case $cmd in {'|'.join(n for names, _ in subs if names[0] in FILE_ARGS for n in names)}) COMPREPLY=($(compgen -f -- "$cur"));; esac
+  fi
+}}
+complete -o default -o bashdefault -F _winvm winvm
+""")
+        return
+    q = desc
+    out = [f"# winvm {__version__} fish completion (winvm completion fish)", "complete -c winvm -f"]
+    for act in p._actions:
+        if act.option_strings and act.help != argparse.SUPPRESS:
+            out.append(fish_opt("__fish_use_subcommand", act, q))
+    for names, sp_ in subs:
+        out.append(f"complete -c winvm -n __fish_use_subcommand -a {names[0]} -d '{q(sp_.description)}'")
+        for alias in names[1:]:
+            out.append(f"complete -c winvm -n __fish_use_subcommand -a {alias} -d 'same as {names[0]}'")
+        seen = f"'__fish_seen_subcommand_from {' '.join(names)}'"
+        if names[0] in FILE_ARGS:
+            out.append(f"complete -c winvm -n {seen} -F")
+        for act in sp_._actions:
+            if act.option_strings and act.help != argparse.SUPPRESS and "-h" not in act.option_strings:
+                out.append(fish_opt(seen, act, q))
+            elif not act.option_strings and act.choices:
+                out.append(f"complete -c winvm -n {seen} -a '{' '.join(act.choices)}'")
+    print("\n".join(out))
+
+
+def desc(text: str | None) -> str:
+    """First line of a help text, quoted for fish."""
+    return text.splitlines()[0][:80].replace("'", "\\'") if text else ""
+
+
+def fish_opt(cond: str, act, q) -> str:
+    longs = [o[2:] for o in act.option_strings if o.startswith("--")]
+    shorts = [o[1:] for o in act.option_strings if not o.startswith("--")]
+    flags = " ".join([*(f"-l {x}" for x in longs), *(f"-s {x}" for x in shorts)])
+    return f"complete -c winvm -n {cond} {flags}{' -r' if act.nargs != 0 else ''} -d '{q(act.help)}'"
+
+
+cmd_completion.no_config = True
+
+
+# ------------------------------------------------------------------ main
+
+def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.ArgumentParser]]]:
+    """The command line, from COMMANDS; also returns each command's names and parser."""
     p = argparse.ArgumentParser(
         prog="winvm", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Build and run slim, unattended Windows VMs on QEMU/KVM; images defined in YAML files.",
-        epilog="quick start:  winvm up --iso ~/Downloads/Win11_*.iso   then   winvm sh")
+        epilog="quick start:  winvm up   then   winvm sh      (winvm check: what the host has)")
     p.add_argument("-f", "--file", metavar="YAML",
                    help="machine settings (default: $WINVM_CONFIG, ~/.config/winvm/winvm.yaml)")
     p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: main)")
@@ -524,8 +643,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="images and instances (default: $WINVM_DATA_DIR, settings.data_dir)")
     p.add_argument("--cache-dir", metavar="DIR",
                    help="downloads and build scratch (default: $WINVM_CACHE_DIR, settings.cache_dir)")
+    p.add_argument("-y", "--yes", action="store_true", help="download what's needed without asking")
     p.add_argument("-V", "--version", action="version", version=f"winvm {__version__}")
     sub = p.add_subparsers(title="commands", metavar="<command>")
+    subs = []
     for name, (fn, args, aliases) in COMMANDS.items():
         doc = fn.__doc__ or ""
         sp_ = sub.add_parser(name, aliases=aliases, help=doc.splitlines()[0], description=doc,
@@ -533,6 +654,13 @@ def main(argv: list[str] | None = None) -> int:
         for flags, kw in args:
             sp_.add_argument(*flags, **kw)
         sp_.set_defaults(fn=fn)
+        subs.append(([name, *aliases], sp_))
+    return p, subs
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    p, _ = parser()
 
     # raw commands get everything after their name untouched (PowerShell, ssh, scp arguments)
     i = 0
@@ -547,7 +675,10 @@ def main(argv: list[str] | None = None) -> int:
         p.print_help()
         return 1
     try:
+        if getattr(a.fn, "no_config", False):
+            return a.fn(a) or 0
         a.cfg = Config(a.file, a.data_dir, a.cache_dir)
+        a.cfg.yes = a.yes
         a.instance = a.instance or "main"
         return a.fn(a) or 0
     except Fatal as e:

@@ -13,23 +13,39 @@ settings:
   cache_dir: ~/.cache/winvm          # downloads, slim images, build scratch; --cache-dir / $WINVM_CACHE_DIR
   images_dir: null                   # your image files, found by name (NAME.yaml);
                                      # null = ~/.config/winvm/images ($XDG_CONFIG_HOME)
-  qemu: qemu-system-x86_64
-  qemu_img: /usr/bin/qemu-img        # absolute: other qemu-img builds (e.g. Android SDK) may shadow it
-  ovmf_code: null                    # null = autodetect the non-secure-boot UEFI build
-  ovmf_vars: null
+  qemu: qemu-system-x86_64           # the one host program winvm can't download
+  qemu_img: null                     # null = /usr/bin/qemu-img, else from PATH (other builds,
+                                     # e.g. Android SDK's, may shadow it on PATH)
+  ovmf_code: null                    # null = the host's non-secure-boot UEFI build, else
+  ovmf_vars: null                    # Debian's (downloaded, see `ovmf` below)
   compress: true                     # zstd-compress the read-only image layers
-  mem_reserve: 1G                    # host RAM that must stay free when a VM or an export starts
-  wimlib_threads: 2                  # slim-image export; solid LZMS needs ~1 GiB RAM per thread
+  mem_reserve: 1G                    # host RAM that must stay free when a VM starts
   # Every VM gets the same SMBIOS UUID: Windows/Office activation is tied to the
-  # hardware ID, so all images and instances look like one machine.
+  # hardware ID, so all images and instances look like one machine to it. That's for
+  # rebuilding and resetting one licensed machine - running several activated copies
+  # at once needs a license for each (see the README).
   uuid: 39c74881-4470-47a8-a7a6-879b7a7753b8
   ports: {ssh: 2222, rdp: 3390, vnc: 5930}   # host ports of the first instance, +n for the n-th;
                                              # rdp/vnc: null = off
   ssh_pubkeys: [~/.ssh/id_ed25519.pub]       # also allowed to log in (winvm's own key always is)
-  virtio:  {url: "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso",
-            sha256: 303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}
-  openssh: {url: "https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi",
-            sha256: ddec9c53864280759cf9f74791cefd387100e3946aa849a1c138a4ed1b96b7d9}
+  # Pinned downloads (fetched once into cache_dir, checked against sha256)
+  virtio:                            # virtio drivers + guest tools for Windows (Fedora)
+    url: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso
+    sha256: 303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d
+    size: 877373440
+  openssh:                           # Win32-OpenSSH server (Microsoft, GitHub)
+    url: https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi
+    sha256: ddec9c53864280759cf9f74791cefd387100e3946aa849a1c138a4ed1b96b7d9
+    size: 6586368
+  ovmf:                              # UEFI firmware, only if the host has none (Debian's package)
+    url: https://snapshot.debian.org/archive/debian/20261101T000000Z/pool/main/e/edk2/ovmf_2025.02-8%2Bdeb13u1_all.deb
+    sha256: 78e0d54df11fc77406cb7a0bc9a39e5bca6d1cbe06556b91d9a73491c52decdf
+    size: 5779964
+  windows:                           # offered when an image needs an ISO and none is linked
+    title: Windows 11 25H2 (build 26200.6584), English, x64
+    url: https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso
+    sha256: d141f6030fed50f75e2b03e1eb2e53646c4b21e5386047cb860af5223f102a32
+    size: 7736125440
 
 run:                                 # how instances run, unless their image's `run:` or
   ram: 4G                            # `winvm up --ram/--cpus` say otherwise

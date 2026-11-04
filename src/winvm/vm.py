@@ -16,34 +16,14 @@ import subprocess as sp
 import time
 from pathlib import Path
 
-from . import guest
+from . import guest, host
 from .config import Config
 from .store import Store, label
-from .util import Chan, die, log, meminfo, mib, need, run, warn
+from .util import Chan, die, log, meminfo, mib, run, warn
 
 HYPERV = ("hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,"
           "hv-stimer,hv-frequencies,hv-tlbflush,hv-ipi,hv-reset")
-OVMF_PAIRS = [  # (code, vars) of non-secure-boot builds, per distro
-    ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
-    ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
-    ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
-    ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
-    ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
-]
 SMB_HOST = "10.0.2.4"           # where the guest reaches the instance's Samba server
-
-
-def ovmf(cfg: Config) -> tuple[str, str]:
-    """UEFI firmware: (code, empty variable store)."""
-    code, vars_ = cfg.s.get("ovmf_code"), cfg.s.get("ovmf_vars")
-    if code or vars_:
-        if not (code and vars_):
-            die("set both settings.ovmf_code and settings.ovmf_vars (or neither: autodetect)")
-        return str(cfg.path(code)), str(cfg.path(vars_))
-    for pair in OVMF_PAIRS:
-        if all(Path(p).exists() for p in pair):
-            return pair
-    die("OVMF firmware not found (install edk2-ovmf, or set settings.ovmf_code/ovmf_vars)")
 
 
 def qfile(path) -> str:
@@ -135,7 +115,7 @@ class Instance:
         """Fresh, empty disk on layer `on` (a version of `image`) + fresh UEFI variables;
         `run`: the instance's own settings (kept from before if None)."""
         Store(self.cfg).overlay(self.disk, on)
-        shutil.copyfile(ovmf(self.cfg)[1], self.vars)
+        shutil.copyfile(host.firmware(self.cfg)[1], self.vars)
         if not self.builder:
             src = self.cfg.sources.get(image)
             self.meta = {"image": image, "source": str(src) if src else None,
@@ -147,9 +127,12 @@ class Instance:
             die(f"{self.name} is running - winvm -i {self.name} stop first")
 
     # --- QEMU command line
-    def qemu_argv(self, *, install=False, gui=False, cdroms=(), st: dict | None = None) -> list[str]:
+    def qemu_argv(self, *, install=False, gui=False, cdroms=(), disks=(), st: dict | None = None) -> list[str]:
+        """install: offline build VM (no NIC, own QMP socket); cdroms: the first one boots
+        (the disk is still empty); disks: extra (path, readonly) disks after the main one."""
         st, cfg = st or self.state, self.cfg
-        a = [cfg.s["qemu"], "-name", self.qemu_name, "-enable-kvm",
+        code = host.firmware(cfg)[0]
+        a = [host.qemu(cfg), "-name", self.qemu_name, "-enable-kvm",
              "-uuid", cfg.s["uuid"],
              # q35 + host CPU with Hyper-V enlightenments: what Windows runs fastest on
              "-machine", "q35,hpet=off,vmport=off", "-cpu", f"host,{HYPERV}",
@@ -157,14 +140,14 @@ class Instance:
              "-rtc", "base=utc,driftfix=slew", "-global", "kvm-pit.lost_tick_policy=delay",
              "-global", "ICH9-LPC.disable_s3=1", "-global", "ICH9-LPC.disable_s4=1",
              # UEFI: shared read-only firmware + this instance's variable store
-             "-drive", f"if=pflash,format=raw,readonly=on,file={qfile(ovmf(cfg)[0])}",
+             "-drive", f"if=pflash,format=raw,readonly=on,file={qfile(code)}",
              "-drive", f"if=pflash,format=raw,file={qfile(self.vars)}",
              # disk on virtio-scsi; discard passes guest TRIM down so qcow2 files shrink.
              # cache=unsafe while installing: a host crash means reinstalling anyway
              "-device", "virtio-scsi-pci,id=scsi0",
              "-drive", f"if=none,id=disk0,file={qfile(self.disk)},format=qcow2,discard=unmap,detect-zeroes=unmap,"
                        f"cache={'unsafe' if install else 'writeback'}",
-             "-device", "scsi-hd,drive=disk0,bus=scsi0.0,rotation_rate=1,bootindex=0",
+             "-device", "scsi-hd,drive=disk0,bus=scsi0.0,scsi-id=0,rotation_rate=1,bootindex=0",
              # paravirtual devices: balloon (give RAM back), rng, absolute mouse, keyboard
              "-device", "virtio-balloon-pci", "-device", "virtio-rng-pci",
              "-device", "virtio-tablet-pci", "-device", "virtio-keyboard-pci",
@@ -175,9 +158,13 @@ class Instance:
              "-qmp", f"unix:{self.dir}/qmp.sock,server=on,wait=off",
              "-monitor", f"unix:{self.dir}/monitor.sock,server=on,wait=off",
              "-vga", "std", "-serial", f"file:{self.dir}/serial.log"]
+        for i, (path, ro) in enumerate(disks, 1):                # Windows numbers them in this order
+            a += ["-drive", f"if=none,id=disk{i},file={qfile(path)},format=qcow2,readonly={'on' if ro else 'off'}",
+                  "-device", f"scsi-hd,drive=disk{i},bus=scsi0.0,scsi-id={i}"]
         if install:
-            # no NIC while installing: nothing phones home and Windows knows it is offline
-            a += ["-nic", "none"]
+            # no NIC while installing: nothing phones home and Windows knows it is offline;
+            # a second QMP socket for the build's keypresses and shutdown events
+            a += ["-nic", "none", "-qmp", f"unix:{self.dir}/qmp-build.sock,server=on,wait=off"]
         else:
             # user-mode network: localhost-only port forwards; Samba for mounts (see write_smb)
             net = f"user,id=net0,hostname={self.name},hostfwd=tcp:127.0.0.1:{st['ssh']}-:22"
@@ -187,7 +174,7 @@ class Instance:
                 cmd = f"{smbd()} -l {smb} -s {smb}/smb.conf".replace(",", ",,")   # ',' is QEMU's separator
                 net += f",guestfwd=tcp:{SMB_HOST}:445-cmd:{cmd}"
             a += ["-netdev", net, "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:57:53:4c"]
-        for i, iso in enumerate(cdroms):                       # the first CD boots (disk is still empty)
+        for i, iso in enumerate(cdroms):
             a += ["-drive", f"if=none,id=cd{i},media=cdrom,readonly=on,file={qfile(iso)}",
                   "-device", f"ide-cd,drive=cd{i},bus=ide.{i}" + (",bootindex=1" if i == 0 else "")]
         if gui:
@@ -225,7 +212,7 @@ class Instance:
         if self.alive:
             log(f"{self.name} already running (pid {self.pid})")
         else:
-            need(self.cfg.s["qemu"])
+            host.qemu(self.cfg)
             self.claim(mib(self.settings["ram"]))
             self.write_smb({} if self.builder else self.settings["mounts"])
             self.launch(self.qemu_argv(gui=gui), gui)

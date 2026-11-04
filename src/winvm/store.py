@@ -15,6 +15,7 @@ import os
 import time
 from pathlib import Path
 
+from . import host
 from .config import Config
 from .util import die, output, run
 
@@ -60,7 +61,7 @@ class Store:
         """The layer below an image or disk (None for a bottom layer)."""
         mtime = img.stat().st_mtime_ns if img.exists() else die(f"missing: {img}")
         if self._parents.get(img, (None,))[0] != mtime:
-            info = json.loads(output(self.cfg.s["qemu_img"], "info", "-U", "--output=json", img))
+            info = json.loads(output(host.qemu_img(self.cfg), "info", "-U", "--output=json", img))
             b = info.get("backing-filename")
             self._parents[img] = (mtime, (img.parent / b).resolve() if b else None)
         return self._parents[img][1]
@@ -79,7 +80,7 @@ class Store:
         """An empty qcow2 at `disk` on top of layer `on`."""
         disk.parent.mkdir(parents=True, exist_ok=True)
         disk.unlink(missing_ok=True)
-        run(self.cfg.s["qemu_img"], "create", "-q", "-f", "qcow2", "-F", "qcow2",
+        run(host.qemu_img(self.cfg), "create", "-q", "-f", "qcow2", "-F", "qcow2",
             "-b", os.path.relpath(on, disk.parent), disk)
 
     def add(self, name: str, h: str, src: Path, below: Path | None, **meta) -> Path:
@@ -91,7 +92,7 @@ class Store:
         zstd = ["-c", "-o", "compression_type=zstd"] if self.cfg.s.get("compress", True) else []
         back = ["-B", below.name, "-F", "qcow2"] if below else []   # relative: same folder
         try:
-            run(self.cfg.s["qemu_img"], "convert", "-p", "-O", "qcow2", *zstd, *back, src, tmp)
+            run(host.qemu_img(self.cfg), "convert", "-p", "-O", "qcow2", *zstd, *back, src, tmp)
             tmp.replace(dst)
         finally:
             tmp.unlink(missing_ok=True)                        # left only by a failed convert

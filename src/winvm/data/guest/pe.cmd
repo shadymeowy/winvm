@@ -1,19 +1,21 @@
 @echo off
 rem ===========================================================================
-rem  winslim WinPE installer (runs instead of setup.exe, as WinPE's shell).
+rem  winslim WinPE installer. Microsoft's own, unmodified Windows ISO boots; its
+rem  Setup finds autounattend.xml on winvm's payload CD and runs start.cmd, which
+rem  runs this script in place of Setup:
 rem    1. safety checks (QEMU only, no existing winslim install)
-rem    2. load virtio storage drivers, partition disk 0 (GPT: ESP + MSR + C:)
-rem    3. dism /Apply-Image /Compact  (CompactOS from the start)
+rem    2. load virtio storage drivers (virtio-win CD), partition disk 0 (ESP + MSR + C:)
+rem    3. dism /Apply-Image (the ISO's install image, or a captured slim image)
 rem    4. offline debloat: appx, capabilities, features, services, registry
-rem    5. inject virtio drivers, stage unattend + first-boot scripts, bcdboot
-rem  Usage: pe.cmd <media-drive>      (called by winslim-start.cmd)
+rem    5. inject virtio drivers, stage unattend + first-boot scripts, bcdboot, reboot
+rem  Capture mode (slim images) instead captures the serviced image to disk 1.
+rem  Setup's WinPE has no COM1: the host learns the outcome from reboot vs. shutdown.
+rem  Usage: pe.cmd <payload-drive>      (called by start.cmd)
 rem ===========================================================================
 setlocal EnableExtensions DisableDelayedExpansion
 set "M=%~1"
 set "WS=%M%\winslim"
 set "LOG=X:\winslim-pe.log"
-set "SERIAL="
-mode COM1 BAUD=115200 PARITY=n DATA=8 STOP=1 >nul 2>&1 && set "SERIAL=1"
 call "%WS%\config.cmd"
 
 call :log "winslim WinPE stage start (media %M%, edition '%WIN_EDITION%')"
@@ -29,7 +31,16 @@ if not defined ISQEMU if not exist "%WS%\force" (
 )
 
 rem ------------------------------------------------------------------ storage drivers
-for %%I in ("%M%\drivers\vioscsi\vioscsi.inf" "%M%\drivers\viostor\viostor.inf") do (
+set "VIO="
+for %%D in (C D E F G H I J K L N O P Q R S T U V W Y Z) do (
+  if not defined VIO if exist "%%D:\vioscsi\w11\amd64\vioscsi.inf" set "VIO=%%D:"
+)
+if not defined VIO (
+  call :fail "virtio-win CD not found - attach it"
+  goto :eof
+)
+call :log "virtio-win drivers: %VIO%"
+for %%I in ("%VIO%\vioscsi\w11\amd64\vioscsi.inf" "%VIO%\viostor\w11\amd64\viostor.inf") do (
   if exist "%%~I" drvload "%%~I" >>"%LOG%" 2>&1
 )
 ping -n 4 127.0.0.1 >nul
@@ -42,8 +53,16 @@ for %%D in (C D E F G H I J K L N O P Q R S T U V W Y Z) do (
 )
 
 rem ------------------------------------------------------------------ locate install image
+rem a captured slim image (read-only disk 1) wins over the ISO's own
 set "IMG="
 set "SWM="
+if "%WIN_PRESERVICED%"=="1" for %%D in (C D E F G H I J K L N O P Q R S T U V W Y Z) do (
+  if not defined IMG if exist "%%D:\winslim-image\install.wim" set "IMG=%%D:\winslim-image\install.wim"
+)
+if "%WIN_PRESERVICED%"=="1" if not defined IMG (
+  call :fail "slim image (winslim-image\install.wim) not found on any drive"
+  goto :eof
+)
 for %%D in (C D E F G H I J K L N O P Q R S T U V W Y Z) do (
   if not defined IMG if exist "%%D:\sources\install.wim" set "IMG=%%D:\sources\install.wim"
   if not defined IMG if exist "%%D:\sources\install.esd" set "IMG=%%D:\sources\install.esd"
@@ -71,7 +90,26 @@ if not defined IDX (
 call :log "edition '%WIN_EDITION%' = index %IDX%"
 
 rem ------------------------------------------------------------------ partition
-rem capture mode (./winvm iso) adds an O: volume that receives the serviced image
+rem capture mode: disk 1 (an empty %CAPTURE_GB% GB disk) receives the serviced image
+if "%WINSLIM_MODE%"=="capture" (
+  echo list disk| diskpart > X:\winslim-disks.txt
+  find "Disk 1" X:\winslim-disks.txt | find " %CAPTURE_GB% GB" >nul || (
+    type X:\winslim-disks.txt >>"%LOG%"
+    call :fail "disk 1 is not the %CAPTURE_GB% GB capture disk - refusing to touch it"
+    goto :eof
+  )
+  > X:\winslim-dp1.txt echo select disk 1
+  >>X:\winslim-dp1.txt echo clean
+  >>X:\winslim-dp1.txt echo convert gpt
+  >>X:\winslim-dp1.txt echo create partition primary
+  >>X:\winslim-dp1.txt echo format quick fs=ntfs label=WinslimImage
+  >>X:\winslim-dp1.txt echo assign letter=O
+  diskpart /s X:\winslim-dp1.txt >>"%LOG%" 2>&1
+  if not exist O:\ (
+    call :fail "could not prepare the capture disk"
+    goto :eof
+  )
+)
 > X:\winslim-dp.txt echo select disk 0
 >>X:\winslim-dp.txt echo clean
 >>X:\winslim-dp.txt echo convert gpt
@@ -79,18 +117,9 @@ rem capture mode (./winvm iso) adds an O: volume that receives the serviced imag
 >>X:\winslim-dp.txt echo format quick fs=fat32 label=System
 >>X:\winslim-dp.txt echo assign letter=S
 >>X:\winslim-dp.txt echo create partition msr size=16
-if "%WINSLIM_MODE%"=="capture" (
-  >>X:\winslim-dp.txt echo create partition primary size=40960
-) else (
-  >>X:\winslim-dp.txt echo create partition primary
-)
+>>X:\winslim-dp.txt echo create partition primary
 >>X:\winslim-dp.txt echo format quick fs=ntfs label=Windows
 >>X:\winslim-dp.txt echo assign letter=W
-if "%WINSLIM_MODE%"=="capture" (
-  >>X:\winslim-dp.txt echo create partition primary
-  >>X:\winslim-dp.txt echo format quick fs=ntfs label=Output
-  >>X:\winslim-dp.txt echo assign letter=O
-)
 call :log "partitioning disk 0"
 diskpart /s X:\winslim-dp.txt >>"%LOG%" 2>&1
 if not exist W:\ (
@@ -116,7 +145,7 @@ set "DI=W:\Windows\System32\Dism.exe /English /Image:W:\ /ScratchDir:W:\scratch"
 set "FINDSTR=W:\Windows\System32\findstr.exe"
 if not exist W:\Windows\System32\Dism.exe set "DI=dism /English /Image:W:\ /ScratchDir:W:\scratch"
 
-rem An image captured by ./winvm iso is already serviced: just stage and boot it.
+rem A captured slim image is already serviced: just stage and boot it.
 if "%WIN_PRESERVICED%"=="1" (
   call :log "pre-serviced image - skipping offline servicing"
   goto :staging
@@ -124,7 +153,9 @@ if "%WIN_PRESERVICED%"=="1" (
 
 rem ------------------------------------------------------------------ drivers
 call :log "injecting virtio drivers"
-%DI% /Add-Driver /Driver:"%M%\drivers" /Recurse >>"%LOG%" 2>&1 || call :log "WARN add-driver returned error"
+for %%d in (%VIRTIO_DRIVERS%) do (
+  %DI% /Add-Driver /Driver:"%VIO%\%%d\w11\amd64" /Recurse >>"%LOG%" 2>&1 || call :log "WARN add-driver %%d returned error"
+)
 
 rem ------------------------------------------------------------------ appx
 call :log "removing provisioned appx packages"
@@ -183,6 +214,8 @@ call :log "staging unattend.xml and first-boot scripts"
 mkdir W:\Windows\Panther >nul 2>&1
 copy /y "%WS%\unattend.xml" W:\Windows\Panther\unattend.xml >nul
 xcopy /e /i /q /y "%WS%\payload" W:\Windows\Setup\Scripts >nul
+copy /y "%VIO%\virtio-win-guest-tools.exe" W:\Windows\Setup\Scripts\ >nul
+copy /y "%VIO%\cert\Virtio_Win_Red_Hat_CA.cer" W:\Windows\Setup\Scripts\virtio-ca.cer >nul
 >W:\Windows\winslim.installed echo winslim %WINSLIM_BUILD% edition=%WIN_EDITION% index=%IDX%
 
 rem ------------------------------------------------------------------ boot files
@@ -202,40 +235,37 @@ wpeutil reboot
 exit /b 0
 
 
-rem ------------------------------------------------------------------ capture (./winvm iso)
+rem ------------------------------------------------------------------ capture (slim images)
+rem The host keeps disk 1 as its slim-image cache; a reboot (vs. shutdown) means success.
 :capture
 rd /s /q W:\scratch >nul 2>&1
-mkdir O:\scratch >nul 2>&1
+mkdir O:\scratch O:\winslim-image >nul 2>&1
 call :log "capturing the serviced image"
-dism /English /Capture-Image /ImageFile:O:\install.wim /CaptureDir:W:\ /Name:"%WIN_EDITION%" /Description:"winslim %WINSLIM_BUILD%" /Compress:fast /ScratchDir:O:\scratch >>"%LOG%" 2>&1
+dism /English /Capture-Image /ImageFile:O:\winslim-image\install.wim /CaptureDir:W:\ /Name:"%WIN_EDITION%" /Description:"winslim %WINSLIM_BUILD%" /Compress:max /ScratchDir:O:\scratch >>"%LOG%" 2>&1
 if errorlevel 1 (
   call :fail "dism /Capture-Image failed"
   goto :eof
 )
-rem (the host re-exports it as solid LZMS with wimlib; WinPE lacks the RAM for that)
 rd /s /q O:\scratch >nul 2>&1
 call :log "WINSLIM-CAPTURE-DONE"
-copy /y "%LOG%" O:\winslim-pe.log >nul
->O:\WINSLIM-CAPTURE-DONE echo ok
-wpeutil shutdown
+copy /y "%LOG%" O:\winslim-image\winslim-pe.log >nul
+wpeutil reboot
 exit /b 0
 
 
 rem ===========================================================================
+rem :fail logs, powers off and returns 1 (the caller then ends pe.cmd). With
+rem WINSLIM_DEBUG=1 it leaves the VM on: start.cmd opens a visible window with the log
+rem (this script runs hidden, a shell here would wait unseen).
 :log
 echo [%TIME%] %~1
 >>"%LOG%" echo [%TIME%] %~1
-if defined SERIAL 2>nul >COM1 echo [PE %TIME%] %~1
 exit /b 0
 
 :fail
 call :log "WINSLIM-FAIL: %~1"
 if exist W:\Windows\Setup copy /y "%LOG%" W:\Windows\Setup\winslim-pe.log >nul 2>&1
-if "%WINSLIM_DEBUG%"=="1" (
-  echo Debug mode: dropping to a shell. Log: %LOG%
-  cmd.exe /k
-)
-wpeutil shutdown
+if not "%WINSLIM_DEBUG%"=="1" wpeutil shutdown
 exit /b 1
 
 :idxline

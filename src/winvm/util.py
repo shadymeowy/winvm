@@ -1,10 +1,9 @@
-"""Shared helpers: output, external tools, sizes, hashing, downloads, QMP/QGA sockets."""
+"""Shared helpers: output, external tools, sizes, hashing, QMP/QGA sockets."""
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-import shutil
 import socket
 import subprocess as sp
 import sys
@@ -44,7 +43,7 @@ def run(*cmd, check=True, quiet=False, **kw) -> sp.CompletedProcess:
     try:
         r = sp.run(cmd, **kw)
     except FileNotFoundError:
-        die(f"{cmd[0]} not found (see README: host packages)")
+        die(f"{cmd[0]} not found (winvm check)")
     if check and r.returncode:
         die(f"{Path(cmd[0]).name} failed (exit {r.returncode}): {' '.join(cmd[1:])[:300]}")
     return r
@@ -52,12 +51,6 @@ def run(*cmd, check=True, quiet=False, **kw) -> sp.CompletedProcess:
 
 def output(*cmd, **kw) -> str:
     return run(*cmd, stdout=sp.PIPE, text=True, **kw).stdout
-
-
-def need(*tools: str) -> None:
-    missing = [t for t in tools if not shutil.which(t)]
-    if missing:
-        die(f"missing tools: {' '.join(missing)} (see README: host packages)")
 
 
 def valid(name) -> str:
@@ -98,7 +91,7 @@ def meminfo(key: str) -> int:
     return int(m[1]) // 1024
 
 
-# ------------------------------------------------------------------ hashing / downloads
+# ------------------------------------------------------------------ hashing
 
 def sha256_file(f: Path) -> str:
     h = hashlib.sha256()
@@ -118,25 +111,6 @@ def content_hash(path: Path) -> str:
     for f in sorted(p for p in path.rglob("*") if p.is_file()):
         h.update(f"{f.relative_to(path).as_posix()}\0{sha256_file(f)}\0".encode())
     return h.hexdigest()
-
-
-def download(url: str, f: Path, sha256: str) -> Path:
-    """Fetch url to f unless f is already there with this sha256; a mismatch is fatal."""
-    if f.exists() and sha256_file(f) == sha256.lower():
-        return f
-    log(f"downloading {f.name}")
-    f.parent.mkdir(parents=True, exist_ok=True)
-    tmp = f.with_name(f.name + ".part")
-    if shutil.which("aria2c"):
-        run("aria2c", "-q", "-x8", "-s8", "--allow-overwrite=true", "--auto-file-renaming=false",
-            "-d", tmp.parent, "-o", tmp.name, url)
-    else:
-        run("curl", "-fL", "--progress-bar", "-o", tmp, url)
-    if (got := sha256_file(tmp)) != sha256.lower():
-        tmp.unlink()
-        die(f"checksum mismatch for {url}: got {got}, expected {sha256}")
-    tmp.replace(f)
-    return f
 
 
 def dos(text: str) -> bytes:
