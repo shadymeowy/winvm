@@ -43,8 +43,7 @@ Log ("  powershell startup: {0:N2}s" -f (Measure-Command { powershell -NoProfile
 # ------------------------------------------------------------------ network / sharing
 Log 'firewall off (VM is only reachable through localhost port forwards)' 'SC'
 Set-NetFirewallProfile -All -Enabled False
-& cmd.exe /c mklink /D C:\host \\10.0.2.4\qemu | Out-Null   # QEMU user-net SMB share
-Log ("  C:\host -> \\10.0.2.4\qemu: {0}" -f (Test-Path -LiteralPath 'C:\host' -PathType Container -ErrorAction SilentlyContinue)) 'SC'
+# host folders (winvm mounts) appear as links in C:\mnt, made by winvm at each start
 
 # ------------------------------------------------------------------ power
 & powercfg.exe /hibernate off
@@ -91,18 +90,18 @@ foreach ($tp in $taskPaths) {
 }
 Log "  disabled $n scheduled tasks" 'SC'
 
-# ------------------------------------------------------------------ your extras (guest/extra)
-# Every extra\*.ps1 runs in name order as SYSTEM, from inside extra\ so it can use the
-# installers next to it. Runs after the debloat sweep (which would remove apps it adds)
-# and before the shrink (which cleans up after it). The folder is deleted afterwards.
+# ------------------------------------------------------------------ the image's `setup` steps
+# winvm stages them as extra\setup.ps1 plus the files they use. Runs as SYSTEM from inside
+# extra\, after the debloat sweep (which would remove apps it adds) and before the shrink
+# (which cleans up after it). A failure fails the build. The folder is deleted afterwards.
 $extra = "$ScriptDir\extra"
 foreach ($ps in Get-ChildItem -LiteralPath $extra -Filter *.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name) {
     Log "extra: $($ps.Name)" 'SC'
     Push-Location -LiteralPath $extra
     $global:LASTEXITCODE = 0
     try { & $ps.FullName *>&1 | ForEach-Object { Log "  $_" 'SC' } }
-    catch { Log "  WARN $($ps.Name) failed: $_" 'SC' }
-    if ($LASTEXITCODE) { Log "  WARN $($ps.Name) exited with $LASTEXITCODE" 'SC' }
+    catch { Log "WINSLIM-FAIL $($ps.Name): $_" 'SC' }
+    if ($LASTEXITCODE) { Log "WINSLIM-FAIL $($ps.Name) exited with $LASTEXITCODE" 'SC' }
     Pop-Location
 }
 Remove-Item -LiteralPath $extra -Recurse -Force -ErrorAction SilentlyContinue

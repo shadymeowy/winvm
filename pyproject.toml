@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winvm"
+dynamic = ["version"]
+description = "Build and run slim, unattended Windows VMs on QEMU/KVM from one YAML file"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6"]
+license = "MIT"
+keywords = ["windows", "qemu", "kvm", "vm", "unattended", "debloat"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Emulators",
+]
+
+[project.scripts]
+winvm = "winvm.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "winvm.__version__"}
+
+[tool.setuptools.package-data]
+winvm = ["data/*.yaml", "data/guest/*", "data/guest/*/*"]

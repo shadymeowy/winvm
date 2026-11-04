@@ -1,316 +1,249 @@
-# winslim: a minimal, reproducible Windows 11 VM
+# winvm: slim, reproducible Windows VMs from one YAML file
 
-`winvm` turns an **official Microsoft Windows ISO** into a minimal Windows VM for
-QEMU/KVM. The build is unattended and reproducible, needs no root, and is not
-activated (you activate it yourself). `winvm` is a single Python 3 file with no
-dependencies beyond the standard library.
+`winvm` turns an **official Microsoft Windows ISO** into a minimal Windows VM on
+QEMU/KVM: unattended, reproducible, no root, not activated (you activate it). Images
+build on each other like Dockerfiles, and instances run like compose services, all
+described in one `winvm.yaml`.
 
 * No Windows Update, Defender, SmartScreen, Copilot/Recall/AI, Edge, OneDrive,
-  Store or inbox apps, telemetry, search indexer, hibernation or pagefile. WinRE
-  is removed too.
-* The component store is reset (ResetBase), payloads of disabled optional
-  features are stripped, and Smart App Control is off (in evaluation mode it makes
-  every signed installer wait 2 minutes once Defender is gone). The golden image
-  is a zstd-compressed qcow2 **layer**. Instances run on thin disks on top of it,
-  so a reset is instant, and installed software can be kept as further layers.
-  Numbers are in [Results](#results).
-* Guest tools are installed: virtio drivers (storage, net, balloon, serial, rng,
-  input, gpu), **qemu-guest-agent** and spice-vdagent (clipboard in the GTK window).
-* **Pure CLI mode.** Headless VM, OpenSSH server with key auth, PowerShell as the
-  default shell. `./winvm sh <command>` runs a guest command like a local one:
-  exit code, stdin, pipes, Unix line endings, and the current folder when you're
-  inside the share. About 0.6 s per command.
-* **Samba share.** `$SHARE_DIR` on the host is `C:\host` in the guest (QEMU's
-  built-in SMB server, no host config needed). It's read-write in both directions.
-* **Several instances at once**, each with its own disk and ports.
-
-Big files (ISOs, disks, caches) live in `~/Others/vm`. This repo holds only
-scripts and config.
+  Store or inbox apps, telemetry, search indexer, hibernation, pagefile or WinRE.
+  The component store is reset and payloads of disabled features are stripped.
+* Guest tools: virtio drivers, **qemu-guest-agent**, spice-vdagent (clipboard).
+* **CLI first.** Headless VM with OpenSSH (keys) and PowerShell. `winvm sh <command>`
+  runs a guest command like a local one: exit code, stdin, pipes, Unix line endings,
+  current folder. About 0.6 s per command.
+* **Mounts.** Host folders appear in the guest as `C:\mnt\<name>`, from the config or
+  added and removed while the VM runs (`winvm mount ~/proj`).
+* **Layers.** Images are zstd-compressed read-only qcow2 layers; instances run on thin
+  disks on top. Several instances run at once, each with its own ports.
 
 ## Quick start
 
 ```sh
-# 1. one-time: host packages (Fedora names)
-sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils samba aria2
-# optional: guestfs-tools (offline cleanup, needed by `iso`), freerdp
+# host packages (Fedora names; samba is for mounts, guestfs-tools for slim images)
+sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils samba guestfs-tools
+pip install winvm            # or: pipx install winvm / uv tool install winvm
 
-# 2. Windows ISO: download in a browser from
-#    https://www.microsoft.com/software-download/windows11  ("Download Windows 11 Disk Image (ISO)")
-#    and save it as ~/Others/vm/iso/Win11_*.iso  (any official Win10/11 ISO works)
-
-# 3. build (unattended)
-./winvm install                 # ~22 min: boot ISO + Microsoft ISO -> layer "base"
-#   or, recommended if you rebuild often / want the smallest image:
-./winvm iso                     # ~1 h once: capture the debloated image -> 4.2 GB slim ISO
-./winvm install --standalone    # ~10 min each time -> layer "base"
-
-# 4. use it
-./winvm sh                      # interactive PowerShell (starts the VM if needed)
-./winvm sh Get-ComputerInfo -Property OsName,OsBuildNumber
-./winvm cp ./tool.exe :C:/Users/user/    # ':' prefix = guest path
-./winvm stop
+# Windows ISO: download in a browser from https://www.microsoft.com/software-download/windows11
+winvm up --iso ~/Downloads/Win11_25H2_English_x64.iso    # ~22 min the first time, then seconds
+winvm sh                     # PowerShell in the guest
+winvm sh Get-ComputerInfo -Property OsName,OsBuildNumber
+winvm stop
 ```
+
+That's all it needs: without a config file `winvm` uses its built-in one, builds
+image `base` from the ISO and starts instance `main` on it. The `--iso` is
+remembered (linked into `~/.local/share/winvm/iso`).
+
+## winvm.yaml
+
+`winvm config dump > winvm.yaml` writes the built-in config with all its comments.
+Your file is merged over it, so it only needs what it changes or adds. winvm uses
+the first of `-f FILE`, `$WINVM_CONFIG`, `./winvm.yaml`, `~/.config/winvm/winvm.yaml`.
+
+```yaml
+settings:
+  ports: {ssh: 2222, rdp: 3390, vnc: 5930}    # instance n gets port + n
+
+images:
+  base:                                  # from an ISO: unattended install + debloat, offline
+    iso: ~/Downloads/Win11_25H2_English_x64.iso
+    edition: Windows 11 Pro N            # `winvm editions` lists them
+    keyboard: "041f:0000041f"            # Turkish Q
+    slim: true                           # cache the debloated image: rebuilds ~10 min
+    setup:                               # runs during the install, as SYSTEM, without network
+      - download: {url: "https://www.7-zip.org/a/7z2409-x64.msi", sha256: <sha256>}
+      - run: Start-Process msiexec -Wait -ArgumentList '/i', '7z2409-x64.msi', '/qn'
+
+  dev:                                   # from another image: boot it, run steps, keep the changes
+    from: base
+    steps:                               # with network; files land in a work folder
+      - download: {url: "https://www.python.org/ftp/python/3.13.1/python-3.13.1-amd64.exe",
+                   sha256: <sha256>}
+      - run: .\python-3.13.1-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 | Out-Null
+      - copy: [./dotfiles, 'C:\Users\user\dotfiles']
+      - restart: true
+
+instances:
+  main: {}                               # on base, 4G, 4 CPUs, mount `share`
+  work:
+    image: dev
+    ram: 8G
+    mounts:
+      projects: ~/Projects               # guest C:\mnt\projects
+      docs: {path: ~/Documents, readonly: true}
+```
+
+**Steps.** `run` is PowerShell; a thrown error or a non-zero exit fails the build.
+`download` fetches on the host, checks the sha256 (get it with
+`curl -sL URL | sha256sum`) and puts the file into the work folder. `copy: [HOST]`
+puts a file or folder there too, `copy: [HOST, GUEST]` anywhere in the guest
+(`from` images only). `restart` reboots (`from` images only). Run steps start in
+the work folder, which is deleted when the build ends.
+
+**Rebuilds work like Docker layers.** Every image has a content hash over its
+definition, the files it copies and the image below it. Change any of it and the
+image (and everything built on it) gets a new version on the next `build`, `reset`,
+or `up` of a new instance. Existing instances keep running on the version they were
+created on; `winvm ps` marks them outdated and `winvm reset` moves them over
+(discarding their changes). `winvm prune` deletes versions nothing uses.
 
 ## Running commands in the guest: `winvm sh`
 
 ```sh
-./winvm sh                          # interactive shell
-./winvm sh ipconfig /all            # a command line; PowerShell parses it
-./winvm sh 'gci C:\ | select Name'  # one quoted argument = PowerShell code as is
-./winvm sh notepad "a b.txt"        # words with spaces stay one argument
-./winvm sh -t python                # -t: a terminal, for interactive programs
-cat x | ./winvm sh findstr foo      # stdin reaches native programs ...
-cat x | ./winvm sh 'stdin | sort'   # ... and PowerShell code reads it with `stdin`
-./winvm sh ipconfig | grep IPv4     # output has Unix line endings
-./winvm sh cmd /c exit 3; echo $?   # 3: the exit code is the command's (1 for a failed cmdlet)
-cd ~/Others/vm/share/proj && ~/Projects/vm/winvm sh dir   # runs in C:\host\proj
+winvm sh                          # interactive shell
+winvm sh ipconfig /all            # a command line; PowerShell parses it
+winvm sh 'gci C:\ | select Name'  # one quoted argument = PowerShell code as is
+winvm sh notepad "a b.txt"        # words with spaces stay one argument
+winvm sh -t python                # -t: a terminal, for interactive programs
+cat x | winvm sh findstr foo      # stdin reaches native programs ...
+cat x | winvm sh 'stdin | sort'   # ... and PowerShell code reads it with `stdin`
+winvm sh ipconfig | grep IPv4     # output has Unix line endings
+winvm sh cmd /c exit 3; echo $?   # 3: the exit code is the command's (1 for a failed cmdlet)
+cd ~/Projects/x && winvm -i work sh dir   # inside a mount: runs in C:\mnt\projects\x
 ```
 
-The command is shipped base64-encoded, so no quoting is lost between your shell,
-ssh, sshd and Windows. All commands to an instance share one SSH connection.
-Handy alias: `alias w='~/Projects/vm/winvm sh'`, then `w ipconfig`.
+The command travels base64-encoded, so no quoting is lost between your shell, ssh,
+sshd and Windows; all commands to an instance share one SSH connection. `winvm ssh`
+is plain ssh (port forwards etc.), `winvm cp a.txt :C:/Users/user/` is scp, and
+`winvm ga exec PROG [ARGS]` goes through the guest agent without network.
 
-`./winvm ssh [options]` is plain ssh (port forwards, `-v`, ...).
-`./winvm ga exec <prog> [args]` goes through the guest agent and works without network.
+## Mounts
+
+```sh
+winvm mount ~/data                # running instance: guest C:\mnt\data, at once
+winvm mount ~/data d2 --ro        # another name, read-only
+winvm mount                       # list
+winvm umount d2
+```
+
+Mounts in the config are set up at every start; `mount`/`umount` change a running
+instance until it stops. Each instance runs its own unprivileged Samba server
+(QEMU forwards `\\10.0.2.4` to it), whose config winvm rewrites on the fly. The guest
+gets folder links in `C:\mnt` rather than drive letters, because a drive letter
+exists only in the logon session that mapped it.
 
 ## Commands
 
-| command | what it does |
+Instance commands act on `-i NAME`, default the first instance in the config (`main`).
+
+| command | |
 |---|---|
-| `fetch` | download the pinned virtio-win ISO and Win32-OpenSSH MSI, verify sha256 |
-| `editions` | list the editions inside the Windows ISO |
-| `build` | build `winslim-boot.iso` (~650 MB): patched WinPE, scripts, drivers |
-| `iso` | **iso→iso**: standalone installer `winslim-standalone.iso` holding the *already debloated* image |
-| `iso --payload` | renew only the first-boot scripts, extras and keys in that ISO, keeping its image (~20 s) |
-| `iso-resume` | finish an interrupted `iso` from its kept capture disk |
-| `install [--standalone] [--gui]` | unattended install → read-only layer `base`, plus a disk for instance `main` |
-| `start [--gui] [--from LAYER]` | start headless, or with a GTK window plus clipboard |
-| `stop` / `kill` | ACPI shutdown (hard kill after 120 s) / hard power-off |
-| `ps` | instances: state, ports, disk size, layer chain |
-| `sh [-t] [CMD]` | PowerShell in the guest, see above |
-| `ssh`, `cp`, `wait` | plain ssh, scp (`:` = guest path), wait for SSH |
-| `rdp` / `gui` | FreeRDP session (resolution, clipboard, share) / VNC viewer or GTK window |
-| `ga [CMD] / ga exec PROG [ARGS]` | qemu-guest-agent, e.g. `./winvm ga guest-info` |
-| `balloon [SIZE]` | show or change guest RAM live, returning memory to the host |
-| `screenshot [FILE]` | PNG of the guest screen, handy when headless |
-| `cmdline` | print the exact QEMU command line `start` uses |
-| `layers` | layers, sizes, what each is built on and who uses it |
-| `save NAME` / `reset [LAYER]` | freeze the disk as a layer / discard changes |
-| `drop NAME` / `rm` | delete a layer / delete an instance |
-| `clean [--base] [--all]` | remove build leftovers, also the base layer, or everything |
+| `up [NAME...] [--all] [--iso ISO] [--image IMG] [--gui]` | create (building images as needed) and start; ready when SSH answers |
+| `stop [NAME...] [--all]` / `kill` | ACPI shutdown (hard kill after 120 s) / power off |
+| `ps` | instances: state, ports, disk, image version, mounts |
+| `sh [-t] [CMD]`, `ssh`, `cp`, `wait` | see above |
+| `mount [PATH [NAME]] [--ro]` / `umount NAME` | host folders in the running guest |
+| `gui` / `rdp` | VNC viewer (or start with a GTK window) / FreeRDP session |
+| `ga`, `balloon [SIZE]`, `screenshot`, `cmdline` | guest agent, live RAM, PNG of the screen, QEMU argv |
+| `build [IMAGE...] [--force]` | build missing or changed images (default: all in the config) |
+| `images` | config images and built versions: status, size, base, users |
+| `save NAME` | freeze the instance's disk as image NAME; the instance continues on it |
+| `reset [IMAGE]` | discard the instance's changes: fresh disk on the current version |
+| `rm` / `rmi IMAGE` / `prune [--cache]` | delete an instance / an image / unused versions and leftovers |
+| `iso [IMAGE] [-o FILE]` | standalone installer ISO of an image (slim image + payload) |
+| `editions [IMAGE]`, `fetch` | editions in the ISO / download everything pinned |
+| `config dump\|show\|path` | built-in config / merged config / files and folders in use |
 
-Every command acts on instance `main` unless you put `-i NAME` before it
-(`./winvm -i dev sh`), or set `INSTANCE` in the environment or `config.local.env`.
+`save` is for states you produce by hand (e.g. after activating something); an
+instance's disk keeps its changes across stop/start anyway.
 
-## Layers and instances
-
-Disks are plain qcow2 files in `~/Others/vm/images`. Nothing else holds state:
+## Where things live
 
 ```
-layers/base.qcow2     read-only   golden image from `install`
-layers/office.qcow2   read-only   a layer you saved, backed by base
-disks/main.qcow2      read-write  instance "main", backed by one layer
-disks/dev.qcow2       read-write  instance "dev", backed by another (or the same) layer
+~/.config/winvm/winvm.yaml          your config (optional)
+~/.local/share/winvm/               --data-dir / $WINVM_DATA_DIR / settings.data_dir
+  images/base@fb97f6be18d2.qcow2    read-only layers, <name>@<hash>, + .json metadata
+  instances/main/disk.qcow2         an instance's own changes, backed by a layer
+  iso/  keys/  share/               linked ISOs, the SSH key the guests trust, default mount
+~/.cache/winvm/                     --cache-dir / $WINVM_CACHE_DIR / settings.cache_dir
+  downloads/  slim/  build/         pinned downloads, cached slim images, build scratch
+$XDG_RUNTIME_DIR/winvm-*/<name>/    while running: pid, ports, sockets, serial.log, ssh_config, smb/
 ```
 
-Each file stores only the blocks that differ from the file below it. Backing files
-are referenced by relative path, so `qemu-img info --backing-chain disks/main.qcow2`
-shows the same as `./winvm layers`, and `~/Others/vm` can be moved.
+Backing files are relative paths, so `qemu-img info --backing-chain` shows the
+same chain as `winvm images` and the data folder can be moved.
 
-```sh
-./winvm sh                     # install things; everything lands in disks/main.qcow2
-./winvm stop
-./winvm save office            # disks/main -> layers/office (read-only, zstd); main continues on top of it
-./winvm reset                  # throw away what you did since: back to "office"
-./winvm reset base             # clean Windows again (office is kept)
-./winvm -i scratch start --from office   # a second instance on the same layer, at the same time
-./winvm ps                     # main 2222/3390/5930, scratch 2223/3391/5931, ...
-./winvm -i scratch rm          # delete that instance
-./winvm drop office            # delete the layer (refused while anything is built on it)
-```
+**Access.** SSH `127.0.0.1:2222` (+*n*), user `user`, key `~/.local/share/winvm/keys/id_ed25519`
+(`~/.ssh/id_ed25519.pub` is authorized too). For plain `ssh main` or VS Code
+Remote-SSH, add `Include /run/user/*/winvm-*/*/ssh_config` to `~/.ssh/config`.
+RDP `127.0.0.1:3390`, user `user`, password `winslim`. VNC `127.0.0.1:5930`.
+All forwards bind to 127.0.0.1; the guest firewall is off on purpose.
 
-An instance's disk keeps its changes across stop/start on its own; `save` is only
-for freezing a state that you want to return to or start other instances from.
-`save` writes the layer zstd-compressed (`COMPRESS_LAYERS=1`), holding only the
-blocks the instance changed. Saved layers are never written again, so whatever is
-built on them stays valid.
-A starting instance takes the lowest free port slot *n* (preferring the one it had
-last time): `SSH_PORT`+*n*, `RDP_PORT`+*n*, `VNC_DISPLAY`+*n*. The first one gets
-the plain ports. `./winvm ps` shows them. The host RAM guard (below) decides how many instances
-fit. Activate Windows/Office in a layer you then `save`, otherwise `reset` throws
-the activation away. Every instance has the same SMBIOS UUID (`VM_UUID`), so all
-layers look like the same machine to activation.
+**Host RAM guard.** Before starting a VM or a slim-image export, winvm checks
+`MemAvailable` minus what running VMs may still grow into, and refuses when the job
+plus `settings.mem_reserve` doesn't fit.
 
-### Office
-
-Office installs fine into a layer. Use the [Office Deployment Tool][odt]. It
-downloads from Microsoft's Office CDN, not Windows Update.
-
-```powershell
-winget install Microsoft.EdgeWebView2Runtime   # Microsoft 365 Apps need it (sign-in, add-ins); removed by winslim
-winget install Microsoft.OfficeDeploymentTool  # or download setup.exe by hand
-# config.xml: pick a product (O365ProPlusRetail, ProPlus2024Volume, ...), one language,
-# exclude what you don't want and freeze updates like the rest of the VM:
-#   <Add OfficeClientEdition="64" Channel="Current"><Product ID="O365ProPlusRetail">
-#     <Language ID="en-us"/><ExcludeApp ID="Teams"/><ExcludeApp ID="OneDrive"/>
-#     <ExcludeApp ID="Outlook"/><ExcludeApp ID="Groove"/><ExcludeApp ID="Lync"/></Product></Add>
-#   <Updates Enabled="FALSE"/><Display Level="None" AcceptEULA="TRUE"/>
-& "C:\Program Files\OfficeDeploymentTool\setup.exe" /configure config.xml
-```
-
-Then `./winvm stop && ./winvm save office`, activate, stop, `./winvm save office-activated`.
-Expect 3–4 GB. Office wants more than 4 GB RAM with no pagefile, so start it with
-`RAM=6G ./winvm start` (or set `RAM` in `config.local.env`).
-
-[odt]: https://learn.microsoft.com/microsoft-365-apps/deploy/overview-office-deployment-tool
-
-## How it works
+## How an ISO image is built
 
 ```
-Win11.iso ─┬─ boot.wim (WinPE, index 2) ─ wimlib: winpeshl.ini → winslim-start.cmd
-           │                                   │
-           │          winslim-boot.iso = WinPE + winslim/ (pe.cmd, lists, unattend,
-           │                              payload) + drivers/ (virtio w11/amd64)
-           │
-           └─ sources/install.wim ◄──── read by pe.cmd from the 2nd CD-ROM
+Win11.iso ─┬─ boot.wim (WinPE) ─ wimlib: shell → winslim (pe.cmd)
+           │     + drivers (virtio) + unattend.xml + first-boot payload + setup steps
+           └─ install.wim ◄── applied by pe.cmd from the 2nd CD
 ```
 
-1. **WinPE stage** (`guest/pe.cmd`, replaces setup.exe). It refuses to run unless
-   the SMBIOS vendor is QEMU. Then it loads vioscsi, partitions disk 0 (ESP 100 MB
-   + MSR + C:, no recovery partition) and runs `dism /Apply-Image` (with
-   `/Compact` if `WIN_COMPACT=1`). From there it uses the applied image's own DISM,
-   because WinPE's is older and lacks the AppX provider. It removes provisioned AppX
-   packages not listed in `appx-keep.txt`, the capabilities in
-   `capabilities-remove.txt` and the features in `features-remove.txt`, strips the
-   payloads of disabled features, and runs `/Cleanup-Image /ResetBase`. Next come
-   the offline registry edits (`offline-reg.txt`), disabling services
-   (`services-disable.txt`) and deleting Edge, OneDrive setup and WinRE
-   (`offline-delete.txt`). Finally it injects the virtio drivers, stages
-   `unattend.xml` and the first-boot scripts, and runs bcdboot.
-2. **specialize/OOBE**: fully unattended, local admin account, no network
-   (the installer VM has no NIC), no TPM or Secure Boot needed.
-3. **SetupComplete** (`setupcomplete.ps1`, SYSTEM): installs the virtio guest tools
-   and the OpenSSH server (with your keys), compiles .NET native images (PowerShell
-   starts in 0.2 s instead of 2 s), turns the firewall off, creates the `C:\host`
-   link and sets power settings. It repeats the debloat sweep online, disables
-   scheduled tasks, runs ResetBase (plus CompactOS if `WIN_COMPACT=1`), and re-trims.
-4. **First logon** (`firstlogon.ps1`): a single autologon creates the user profile
-   inside the base image, removes the Edge WebView2 runtime (after the user
-   OOBE, which may still need it), clears the autologon secrets and powers off.
-5. Host: libguestfs, if installed, deletes the few WebView2 files the logged-in
-   shell kept locked, then fstrims. `qemu-img convert -c` (zstd) gives the
-   read-only layer `base`, and instance `main` gets an empty disk on top of it.
+1. **WinPE** (`data/guest/pe.cmd`, instead of setup.exe) refuses to run unless the
+   SMBIOS vendor is QEMU, partitions disk 0 (ESP + MSR + C:, no recovery), applies
+   the image and services it offline with the image's own DISM: AppX packages not in
+   `appx-keep.txt`, capabilities, features, payloads, ResetBase, registry edits,
+   services, Edge/OneDrive/WinRE files (all in `data/guest/lists/`). Then drivers,
+   unattend, payload, bcdboot.
+2. **Setup/OOBE**, unattended and offline (the build VM has no network card).
+3. **SetupComplete** (SYSTEM): guest tools, OpenSSH, .NET native images (PowerShell
+   starts in 0.2 s instead of 2 s), firewall/power settings, an online debloat
+   sweep, your `setup` steps, cleanup and trim.
+4. **First logon** creates the profile, removes WebView2 and powers off.
+5. Host: libguestfs removes WebView2 leftovers; `qemu-img convert` (zstd) writes the layer.
 
-Progress streams over the serial port (`~/Others/vm/run/_install/install-serial.log`).
-Logs inside the guest are in `C:\Windows\Setup\winslim*.log`.
+With `slim: true` WinPE instead captures the serviced image right after step 1;
+the host recompresses it (solid LZMS, 2 threads, low RAM) into `~/.cache/winvm/slim`,
+and from then on builds apply it directly and skip the servicing. The cache key is
+the ISO, edition and debloat lists, so it is shared by every image using them.
+`winvm iso` wraps it into a standalone installer ISO.
 
-### iso → iso (`./winvm iso`)
-
-`./winvm install` needs two CDs: the small boot ISO plus Microsoft's ISO. `./winvm iso`
-instead produces one self-contained installer that holds the already-slimmed
-image. It boots the boot ISO in capture mode, where WinPE applies and services
-the image exactly as above. Then, before the first boot, it runs
-`dism /Capture-Image`, writing the serviced `C:` to a spare partition, and
-powers off. The host pulls `install.wim` out with libguestfs, re-exports it with
-wimlib as a solid LZMS `install.esd` (WinPE runs out of memory doing that), and
-wraps it with the WinPE tree. The installer on that ISO skips servicing (it's
-already done) and only applies, stages the first-boot scripts and boots.
-`./winvm install --standalone` uses it.
-
-## Customizing
-
-`config.env` holds the defaults as plain `KEY=value` lines. Put overrides in
-`config.local.env` (git-ignored), or pass them as environment variables
-(`RAM=8G ./winvm start`). Example `config.local.env`:
-
-```sh
-WIN_EDITION=Windows 11 Pro N      # N editions are smaller (no media stack)
-WIN_PASSWORD=s3cret
-WIN_KEYBOARD=041f:0000041f        # Turkish Q
-RAM=8G
-CPUS=8
-SHARE_DIR=$HOME/Projects
-WIN_REMOVE_WEBVIEW=0              # keep Edge WebView2 (some apps need it)
-WIN_COMPACT=1                     # CompactOS inside the guest instead (see Results)
-WIMLIB_THREADS=2                  # `iso` export threads; solid LZMS needs ~1 GiB RAM each
-MEM_RESERVE=1024                  # MiB of host RAM that must stay free
-```
-
-**Host RAM guard.** Before every VM start (`install`, `iso`, `start`) and every
-wimlib export, `winvm` checks `MemAvailable`, minus the RAM that running instances
-may still grow into. It refuses when the job plus `MEM_RESERVE` won't fit,
-instead of pushing the host into swap or the OOM killer. The `iso` export also
-refuses to run next to any VM.
-
-### Adding things to the base
-
-For software you try out or change often, install it in an instance and
-`./winvm save` it as a layer (see above). To bake something into every base build,
-put a `*.ps1` that runs its installer into **`guest/extra/`**, with the installer
-next to it or pinned in `guest/extra/downloads.txt` (details in
-[guest/extra/README.md](guest/extra/README.md)). Setup runs those scripts as
-SYSTEM, offline, after the debloat. What to rerun after a change:
-
-| you changed | Microsoft ISO path | slim ISO path |
-|---|---|---|
-| `guest/extra/`, `guest/payload/`, user/password/keys in the config | `./winvm build` | `./winvm iso --payload` (~20 s) |
-| the image itself: `guest/lists/*.txt`, `guest/pe.cmd`, `WIN_EDITION`, `WIN_STRIP_PAYLOADS` | `./winvm build` | `./winvm iso` (~1 h, new capture) |
-
-then `./winvm clean --base && ./winvm install [--standalone]`.
-
-`WINSLIM_DEBUG=1 ./winvm build` makes a WinPE failure drop to a shell (watch it
-with VNC or `./winvm screenshot`) instead of powering off.
-
-## Access details
-
-* SSH: `127.0.0.1:2222` (+*n* for further instances), user `user`. The key is
-  `~/Others/vm/keys/id_ed25519`, and `~/.ssh/id_ed25519.pub` is also authorized.
-  To use plain `ssh main`, or VS Code Remote-SSH, add
-  `Include ~/Others/vm/run/*/ssh_config` to `~/.ssh/config`.
-* RDP: `127.0.0.1:3390`, user `user`, password `winslim` (`./winvm rdp`).
-* VNC (headless console): `127.0.0.1:5930`.
-* Share: host `~/Others/vm/share` ⇄ guest `C:\host` = `\\10.0.2.4\qemu`. This
-  needs `smbd` on the host; QEMU starts its own private instance.
-* All forwards bind to 127.0.0.1 only. The guest firewall is off on purpose.
+Progress streams from the build VM's serial port; inside the guest the logs are in
+`C:\Windows\Setup\winslim*.log`. `WINVM_DEBUG=1 winvm build` makes a WinPE failure
+drop to a shell (watch with VNC or `winvm screenshot`) instead of powering off.
 
 ## Results
 
-Measured on this repo's defaults (Windows 11 Pro, build 26300, 4 vCPU/4 GB, KVM):
+Windows 11 Pro 25H2 (build 26300), 4 vCPU / 4 GB, KVM:
 
 | | |
 |---|---|
-| `install` (Microsoft ISO → base layer) | ~22 min |
-| `iso` (Microsoft ISO → slim standalone ISO, 2 wimlib threads) | ~30 min VM + ~30 min export |
-| slim standalone ISO (Microsoft's is 9.0 GB) | **4.2 GB** |
-| `install --standalone` (slim ISO → base layer, incl. compression) | **~10 min** |
-| boot to SSH prompt | ~12 s |
-| `./winvm sh hostname` (connection open) | **~0.6 s** |
-| graceful shutdown | ~7 s |
-| base layer, from the slim ISO (incl. ~0.2 GB .NET native images) | **5.5 GB** |
-| base layer, from Microsoft's ISO (`WIN_COMPACT=0`, zstd qcow2) | ~6.4 GB |
-| same with CompactOS in the guest (`WIN_COMPACT=1`) | ~7.7 GB |
+| `base` from Microsoft's ISO | ~22 min |
+| first `slim` build (capture + export + install) | ~70 min |
+| later `slim` builds | **~10 min** |
+| boot to SSH | ~12 s |
+| `winvm sh hostname` | **~0.6 s** |
+| base layer | **5.4 GB** (Microsoft's ISO is 9.0 GB) |
+| slim image in the cache | 3.6 GB |
 | fresh instance disk | < 1 MB |
-| idle RAM in the guest (headless, nobody logged in) | ~950 MB, 86 processes |
-| host RSS of a 4 GB VM after `./winvm balloon 2G` | 4.2 GB → 2.1 GB |
+| idle guest RAM (headless) | ~950 MB, 86 processes |
 
-XPRESS4K (CompactOS) only reaches about 1.8:1, and its output is incompressible
-for qcow2. Leaving the guest data raw and letting qcow2's zstd compress it gives
-the smaller host footprint, so that's the default. Blocks you write later land
-uncompressed in the instance disk until you `save` it as a (compressed) layer; `./winvm reset`
-gets you back to the layer below.
+CompactOS (`debloat.compact_os`) reaches only ~1.8:1 and its output doesn't
+compress further, so raw guest data plus qcow2 zstd is smaller and the default.
 
-## Activation and re-enabling things
+## Activation, Office, re-enabling things
 
-The VM is unactivated (do it in a layer you `save`, see above). Run
-`slmgr /ipk <your-key>` then `slmgr /ato`, or use Settings › Activation. Updates
-are blocked by policy (a WSUS pointing to 127.0.0.1) plus disabled services. To
-undo: delete `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`, and set
-`wuauserv`, `UsoSvc` and `WaaSMedicSvc` back to manual (Start=3).
+The VM is unactivated. Every VM has the same SMBIOS UUID (`settings.uuid`), so all
+images and instances look like one machine to activation: activate in an instance
+and `winvm save` it. `slmgr /ipk <key>` then `slmgr /ato`, or Settings › Activation.
+
+Office installs fine as an image step or by hand with the [Office Deployment Tool][odt],
+which downloads from Microsoft's CDN, not Windows Update. Microsoft 365 Apps need
+the WebView2 runtime (`debloat.remove_webview: false`, or `winget install
+Microsoft.EdgeWebView2Runtime`) and more than 4 GB RAM without a pagefile.
+
+Updates are blocked by policy (a WSUS at 127.0.0.1) and disabled services. To undo:
+delete `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` and set `wuauserv`,
+`UsoSvc` and `WaaSMedicSvc` back to manual (Start=3).
+
+[odt]: https://learn.microsoft.com/microsoft-365-apps/deploy/overview-office-deployment-tool
 
 ## Notes
 
-* The standalone ISO from `./winvm iso` wipes disk 0 without asking. It refuses
-  to run unless the machine reports SMBIOS vendor QEMU (create `winslim\force`
-  on the media to override).
-* The Windows ISO has to be downloaded by hand. `winvm` doesn't script
-  Microsoft's download site.
+* The ISO from `winvm iso` wipes disk 0 without asking; it refuses to run unless
+  the SMBIOS vendor is QEMU (create `winslim\force` on the media to override).
+* Windows ISOs have to be downloaded by hand; winvm doesn't script Microsoft's site.
+* Development: `uv tool install -e .` (or `pip install -e .`) from a checkout.
