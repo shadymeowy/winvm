@@ -103,7 +103,8 @@ def build_iso(cfg: Config, name: str, gui=False) -> None:
             first = (r.stderr.strip().splitlines() or ["?"])[0]
             warn(f"guestfish failed, WebView2 leftovers kept (~1 GB): {first}")
     log(f"writing image layer {name}@{h[:12]}")
-    store.add(name, h, inst.disk, None, user=img["user"], password=img["password"])
+    store.add(name, h, inst.disk, None, user=img["user"], password=img["password"],
+              source=str(cfg.sources[name]))
     shutil.rmtree(inst.home)
     shutil.rmtree(inst.dir, ignore_errors=True)
 
@@ -389,7 +390,8 @@ def build_overlay(cfg: Config, name: str, gui=False) -> None:
         stop_clean(inst)
         log(f"writing image layer {name}@{h[:12]}")
         meta = store.meta(below)
-        store.add(name, h, inst.disk, below, user=meta.get("user"), password=meta.get("password"))
+        store.add(name, h, inst.disk, below, user=meta.get("user"), password=meta.get("password"),
+                  source=str(cfg.sources[name]))
     finally:
         if inst.alive:
             inst.kill()

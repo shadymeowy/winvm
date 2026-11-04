@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "winvm"
 dynamic = ["version"]
-description = "Build and run slim, unattended Windows VMs on QEMU/KVM from one YAML file"
+description = "Build and run slim, unattended Windows VMs on QEMU/KVM from small YAML image files"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -25,4 +25,4 @@ winvm = "winvm.cli:main"
 version = {attr = "winvm.__version__"}
 
 [tool.setuptools.package-data]
-winvm = ["data/*.yaml", "data/guest/*", "data/guest/*/*"]
+winvm = ["data/*.yaml", "data/images/*.yaml", "data/guest/*", "data/guest/*/*"]

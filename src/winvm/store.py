@@ -44,7 +44,7 @@ class Store:
         return sorted(fs, key=lambda f: self.meta(f).get("built", ""), reverse=True)
 
     def current(self, name: str) -> Path | None:
-        """The version matching the config (images you `save`d have just one: the newest)."""
+        """The version matching the image's file (images you `save`d have just one: the newest)."""
         if name in self.cfg.images:
             f = self.file(name, self.cfg.hash(name))
             return f if f.exists() else None
@@ -52,7 +52,7 @@ class Store:
 
     def require(self, name: str) -> Path:
         if name not in self.cfg.images:
-            return self.current(name) or die(f"no image '{name}' in the config or built (winvm images)")
+            return self.current(name) or die(f"no image '{name}': no image file and nothing built (winvm images)")
         return self.current(name) or die(f"image '{name}' is not built - winvm build {name}")
 
     # --- backing chains

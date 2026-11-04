@@ -1,7 +1,15 @@
-"""winvm.yaml: lookup, merging over the packaged defaults, paths, image definitions and their
-content hashes (an image is rebuilt when its hash changes, like a Docker layer)."""
+"""Configuration: machine settings (winvm.yaml) and image definitions (one NAME.yaml per
+image), their paths and content hashes (an image is rebuilt when its hash changes, like a
+Docker layer).
+
+Image files are found by name in `images_dir` (~/.config/winvm/images), then among the
+built-in ones (data/images); any other file is named by its path (`winvm up ./x.yaml`,
+`from: ../shared/base.yaml`) and remembered, so later commands find it from anywhere.
+A file's folder is its context: relative paths in it are relative to the file.
+"""
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -14,10 +22,13 @@ from .util import Fatal, content_hash, die, log, run, valid
 
 DATA = Path(__file__).parent / "data"
 DEFAULT_FILE = DATA / "winvm.yaml"
+BUILTIN = DATA / "images"
 GUEST = DATA / "guest"
 # image fields that change what an ISO install produces (`slim` only changes how fast)
 BASE_KEYS = ("edition", "index", "hostname", "user", "password", "timezone", "locale", "keyboard",
              "disk_size", "debloat")
+FROM_KEYS = {"from", "steps", "run"}
+RUN_KEYS = {"ram", "cpus", "mounts"}
 
 
 def merge(a, b):
@@ -30,26 +41,41 @@ def merge(a, b):
 def read_yaml(p: Path) -> dict:
     try:
         d = yaml.safe_load(p.read_text()) or {}
-    except yaml.YAMLError as e:
+    except (OSError, yaml.YAMLError) as e:
         die(f"{p}: {e}")
     return d if isinstance(d, dict) else die(f"{p}: expected a mapping at the top level")
 
 
+def config_home() -> Path:
+    """~/.config/winvm, or under $XDG_CONFIG_HOME."""
+    return Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "winvm"
+
+
 def find_config(explicit: str | None) -> Path | None:
-    """-f FILE, $WINVM_CONFIG, ./winvm.yaml, ~/.config/winvm/winvm.yaml - or None (defaults only)."""
+    """-f FILE, $WINVM_CONFIG, ~/.config/winvm/winvm.yaml - or None (built-in settings only)."""
     for c in (explicit, os.environ.get("WINVM_CONFIG")):
         if c:
             p = Path(c).expanduser()
             return p.resolve() if p.exists() else die(f"config file not found: {p}")
-    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser()
-    for p in (Path.cwd() / "winvm.yaml", xdg / "winvm/winvm.yaml"):
-        if p.exists():
-            return p.resolve()
-    return None
+    p = config_home() / "winvm.yaml"
+    return p.resolve() if p.exists() else None
 
 
 def mapping(value, where: str) -> dict:
     return value if isinstance(value, dict) else die(f"{where}: expected a mapping, got {value!r}")
+
+
+def check_keys(d: dict, known: set, where: str) -> None:
+    for k in d:
+        if k not in known:
+            hint = difflib.get_close_matches(str(k), known, n=1)
+            die(f"{where}: unknown key `{k}`" + (f" - did you mean `{hint[0]}`?" if hint else
+                                                  f" (allowed: {', '.join(sorted(known))})"))
+
+
+def is_path(ref: str) -> bool:
+    """An image reference that is a file path rather than a name."""
+    return "/" in ref or ref.endswith((".yaml", ".yml"))
 
 
 def sha(obj) -> str:
@@ -62,10 +88,18 @@ class Config:
         self.base = self.file.parent if self.file else Path.cwd()
         raw = read_yaml(DEFAULT_FILE)
         if self.file:
+            user = read_yaml(self.file)
+            if old := sorted({"images", "instances", "defaults"} & user.keys()):
+                die(f"{self.file}: `{'`, `'.join(old)}` no longer go in winvm.yaml. Each image is "
+                    f"its own file now, ~/.config/winvm/images/NAME.yaml (`winvm config dump base` "
+                    f"shows one); instance settings go in an image's `run:` or on the command line "
+                    f"(`winvm up --ram 8G`). See the README, section Images.")
+            check_keys(user, set(raw), str(self.file))
             # an empty section (`settings:` with everything below commented out) changes nothing
-            raw = merge(raw, {k: v for k, v in read_yaml(self.file).items() if v is not None})
+            raw = merge(raw, {k: v for k, v in user.items() if v is not None})
         self.raw = raw
-        self.s = raw.get("settings") or {}
+        self.s = mapping(raw.get("settings") or {}, "settings")
+        self.run_defaults = mapping(raw.get("run") or {}, "run")
         # resolved: layers are compared with the (resolved) backing files qemu-img reports
         self.data = self.folder(data_dir, "WINVM_DATA_DIR", "data_dir")
         self.cache = self.folder(cache_dir, "WINVM_CACHE_DIR", "cache_dir")
@@ -77,35 +111,26 @@ class Config:
         self.build = self.cache / "build" / self.runtime.name
         self.key = self.data / "keys/id_ed25519"
 
-        defaults = raw.get("defaults") or {}
-        self.image_defaults = defaults.get("image") or {}
-        self.instance_defaults = defaults.get("instance") or {}
+        # image definitions: built-ins, then your images_dir (may replace a built-in), then
+        # files named by path earlier (recorded in instance/image metadata)
+        self.builtin = read_yaml(BUILTIN / "base.yaml")      # also the defaults of ISO images
         self.images: dict[str, dict] = {}
-        for name, img in (raw.get("images") or {}).items():
-            if img is None:                                    # `name: null` removes a default
-                continue
-            name, img = valid(name), mapping(img, f"images.{name}")
-            if img.get("from") is not None:
-                if img.get("iso") is not None:
-                    die(f"image '{name}': `iso` or `from`, not both")
-                img = {k: v for k, v in img.items() if k != "iso"}   # a default `iso: null`
-                known = {"from", "steps"}
-            else:
-                img = merge(self.image_defaults, img)
-                known = {"iso", *self.image_defaults}
-            if unknown := set(img) - known:                   # e.g. `steps` on an ISO image
-                die(f"image '{name}': unknown key(s) {', '.join(map(str, unknown))} "
-                    f"(allowed: {', '.join(sorted(known))})")
-            self.images[name] = img
-        self.instances: dict[str, dict] = {}
-        for name, i in (raw.get("instances") or {}).items():
-            if i is not None:
-                name, i = valid(name), mapping(i, f"instances.{name}")
-                if unknown := set(i) - set(self.instance_defaults):
-                    die(f"instance '{name}': unknown key(s) {', '.join(map(str, unknown))} "
-                        f"(allowed: {', '.join(sorted(self.instance_defaults))})")
-                self.instances[name] = merge(self.instance_defaults, i)
+        self.sources: dict[str, Path] = {}
+        self.replaced: set[str] = set()                         # built-ins your files replace
         self._hash: dict[str, str] = {}
+        for f in sorted(BUILTIN.glob("*.yaml")):
+            self.load(f)
+        d = self.s.get("images_dir")
+        self.images_dir = self.path(d) if d else config_home() / "images"
+        for f in sorted(self.images_dir.glob("*.yaml")) + sorted(self.images_dir.glob("*.yml")):
+            self.load(f)
+        for meta in [*(self.data / "instances").glob("*/instance.json"), *(self.data / "images").glob("*.json")]:
+            try:
+                src = json.loads(meta.read_text()).get("source")
+            except (OSError, ValueError):
+                continue
+            if src and Path(src).is_file() and Path(src).stem not in self.sources:
+                self.load(Path(src))
 
     # --- paths
     def folder(self, cli: str | None, env: str, key: str) -> Path:
@@ -115,19 +140,56 @@ class Config:
             return Path(v).expanduser().resolve()
         return self.path(self.s.get(key) or die(f"settings.{key} is not set"), plain=True).resolve()
 
-    def path(self, value, plain=False) -> Path:
-        """~, ${ENV}, ${data_dir}, ${cache_dir}; relative to the config file's folder."""
+    def path(self, value, base: Path | None = None, plain=False) -> Path:
+        """~, ${ENV}, ${data_dir}, ${cache_dir}; relative to `base` (default: the config's folder)."""
         def var(m):
             k = m[1] or m[2]
             if not plain and k in ("data_dir", "cache_dir"):
                 return str(self.data if k == "data_dir" else self.cache)
             return os.environ.get(k, "")
         p = Path(os.path.expanduser(re.sub(r"\$\{(\w+)\}|\$(\w+)", var, str(value))))
-        return p if p.is_absolute() else (self.base / p).resolve()
+        return p if p.is_absolute() else ((base or self.base) / p).resolve()
 
-    # --- images
+    # --- image definitions
+    def load(self, f: Path) -> str:
+        """Read an image file; its name is the file name. Returns the name."""
+        f = f.resolve()
+        if not f.is_file():
+            die(f"no such image file: {f}")
+        name = valid(f.stem)
+        if (have := self.sources.get(name)) and have != f:
+            if have.parent != BUILTIN:
+                die(f"two image files named '{name}': {have} and {f} - rename one")
+            self.replaced.add(name)                            # your file replaces the built-in
+        elif have:
+            return name
+        d = read_yaml(f)
+        if d.get("from") is not None:
+            if d.get("iso") is not None:
+                die(f"{f}: `iso` or `from`, not both")
+            check_keys(d, FROM_KEYS, str(f))
+            img = {**d, "steps": d.get("steps") or []}
+        else:   # an ISO image: the built-in base's values, then the file's
+            check_keys(d, set(self.builtin) | {"index"}, str(f))
+            img = merge({k: v for k, v in self.builtin.items() if k not in ("setup", "run")}, d)
+        self.images[name], self.sources[name] = img, f
+        self._hash.clear()
+        if "from" in img and is_path(str(img["from"])):       # `from: ../shared/base.yaml`
+            img["from"] = self.load(self.path(img["from"], f.parent))
+        return name
+
+    def ref(self, ref: str) -> str:
+        """An image named on the command line: a name, or a path to an image file."""
+        return self.load(Path(ref).expanduser()) if is_path(ref) else valid(ref)
+
     def image(self, name: str) -> dict:
-        return self.images.get(name) or die(f"no image '{name}' in the config (winvm images)")
+        return self.images.get(name) or die(
+            f"no image '{name}': no {name}.yaml in {self.images_dir} or the built-ins "
+            f"(an image file elsewhere: give its path)")
+
+    def context(self, name: str) -> Path:
+        """The folder of an image's file: its relative paths start there."""
+        return self.sources[name].parent
 
     def parent(self, name: str) -> str | None:
         return self.image(name).get("from")
@@ -146,13 +208,13 @@ class Config:
         """The image's Windows ISO: `iso:`, else the newest *.iso in ${data_dir}/iso."""
         img = self.image(name)
         if img.get("iso"):
-            p = self.path(img["iso"])
+            p = self.path(img["iso"], self.context(name))
         else:
             # newest first; lstat: a link made by `--iso` counts from when it was made
             p = max((self.data / "iso").glob("*.iso"), key=lambda q: q.lstat().st_mtime, default=None)
         if not (p and p.exists()):
             die(f"image '{name}' needs a Windows ISO: `winvm up --iso PATH` (official ISO from "
-                f"microsoft.com/software-download), or set images.{name}.iso")
+                f"microsoft.com/software-download), or `iso:` in {self.sources[name]}")
         return p
 
     def steps(self, name: str) -> list[dict]:
@@ -163,7 +225,7 @@ class Config:
         for i, st in enumerate(img.get("setup" if offline else "steps") or [], 1):
             where = f"image '{name}' step {i}"
             if not isinstance(st, dict) or len(st) != 1:
-                die(f"{where}: expected one of run / download / copy / restart")
+                die(f"{where}: expected one of run / download / copy" + ("" if offline else " / restart"))
             (kind, arg), = st.items()
             if kind == "run" and isinstance(arg, str):
                 out.append({"run": arg})
@@ -173,13 +235,13 @@ class Config:
                 fname = arg.get("name") or str(arg["url"]).split("?")[0].rstrip("/").rsplit("/", 1)[-1]
                 out.append({"download": {"url": arg["url"], "sha256": str(arg["sha256"]).lower(), "name": fname}})
             elif kind == "copy" and isinstance(arg, list) and 1 <= len(arg) <= (1 if offline else 2):
-                if not (src := self.path(arg[0])).exists():
+                if not (src := self.path(arg[0], self.context(name))).exists():
                     die(f"{where}: no such file or folder: {src}")
                 out.append({"copy": [str(src), *(str(a) for a in arg[1:])]})
             elif kind == "restart" and arg is True and not offline:
                 out.append({"restart": True})
             else:
-                die(f"{where}: bad `{kind}` (see `winvm config dump`)"
+                die(f"{where}: bad `{kind}` (see `winvm config dump base` and the README)"
                     + (" - ISO images take only run / download / copy [HOST_PATH]" if offline else ""))
         return out
 
@@ -204,7 +266,8 @@ class Config:
                      "pe": content_hash(GUEST / "pe.cmd"), "lists": content_hash(GUEST / "lists")})
 
     def hash(self, name: str) -> str:
-        """Content hash of an image: its definition, the files it copies, and the image below."""
+        """Content hash of an image: its definition, the files it copies, and the image below.
+        Not where its file is: moving a file rebuilds nothing."""
         if name not in self._hash:
             img = self.image(name)
             steps = [dict(st, src=content_hash(Path(st["copy"][0]))) if "copy" in st else st
@@ -237,19 +300,30 @@ class Config:
                 pass
         return [m["hash"] for m in sorted(metas, key=lambda m: m.get("built", ""), reverse=True) if "hash" in m]
 
-    # --- instances
-    def instance(self, name: str) -> dict:
-        """An instance's settings: from the config, or the defaults for ad-hoc ones (-i NAME)."""
-        return self.instances.get(name) or dict(self.instance_defaults)
-
-    def mounts(self, name: str) -> dict[str, dict]:
-        """Configured mounts of an instance: {name: {path, readonly}}."""
-        out = {}
-        for m, v in (self.instance(name).get("mounts") or {}).items():
-            if v is None:                                      # `share: null` drops a default mount
-                continue
-            v = v if isinstance(v, dict) else {"path": v}
-            if not v.get("path"):
-                die(f"instance '{name}' mount '{m}': no path")
-            out[valid(m)] = {"path": str(self.path(v["path"])), "readonly": bool(v.get("readonly"))}
-        return out
+    # --- how instances run
+    def run_settings(self, image: str | None, overrides: dict | None = None) -> dict:
+        """ram/cpus/mounts of an instance: the machine's `run`, then the `run:` of its image and
+        the images below it (bottom first), then the instance's own overrides. Mount paths are
+        relative to the file that names them; `name: null` drops a mount."""
+        layers = [(self.run_defaults, self.base, str(self.file or DEFAULT_FILE))]
+        if image in self.images:
+            layers += [(self.images[n].get("run") or {}, self.context(n), str(self.sources[n]))
+                       for n in self.chain(image)]
+        layers.append((overrides or {}, Path.cwd(), "instance settings"))
+        out: dict = {}
+        mounts: dict[str, dict] = {}
+        for settings, base, where in layers:
+            check_keys(mapping(settings, f"{where}: run"), RUN_KEYS, f"{where}: run")
+            for k, v in settings.items():
+                if k != "mounts":
+                    out[k] = v
+                    continue
+                for m, mv in mapping(v or {}, f"{where}: run.mounts").items():
+                    if mv is None:
+                        mounts.pop(m, None)
+                        continue
+                    mv = mv if isinstance(mv, dict) else {"path": mv}
+                    if not mv.get("path"):
+                        die(f"{where}: mount '{m}' has no path")
+                    mounts[valid(m)] = {"path": str(self.path(mv["path"], base)), "readonly": bool(mv.get("readonly"))}
+        return {**out, "mounts": mounts}

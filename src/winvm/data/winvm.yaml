@@ -1,14 +1,18 @@
-# winvm configuration - `winvm config dump > winvm.yaml` gives you this file to edit.
+# winvm machine settings - `winvm config dump > ~/.config/winvm/winvm.yaml` to edit them.
 #
-# winvm uses the first of: -f FILE, $WINVM_CONFIG, ./winvm.yaml, ~/.config/winvm/winvm.yaml.
-# That file is merged over this one, so it only needs what it changes or adds; set a
-# built-in image, instance or mount to null to drop it (e.g. `instances: {main: null}`).
-# Values may use ~, ${ENV_VAR}, ${data_dir} and ${cache_dir}; relative paths are
-# relative to the config file.
+# This file holds what belongs to your machine: folders, ports, tools, and how
+# instances run by default. What goes into an image (edition, user, steps, ...) lives in
+# image files instead: one NAME.yaml per image in `images_dir` (see `winvm config dump base`).
+#
+# winvm reads the first of: -f FILE, $WINVM_CONFIG, ~/.config/winvm/winvm.yaml, merged
+# over this built-in one, so it only needs what it changes. Values may use ~, ${ENV_VAR},
+# ${data_dir} and ${cache_dir}; relative paths are relative to the file.
 
 settings:
   data_dir: ~/.local/share/winvm     # images + instance disks (big); --data-dir / $WINVM_DATA_DIR
   cache_dir: ~/.cache/winvm          # downloads, slim images, build scratch; --cache-dir / $WINVM_CACHE_DIR
+  images_dir: null                   # your image files, found by name (NAME.yaml);
+                                     # null = ~/.config/winvm/images ($XDG_CONFIG_HOME)
   qemu: qemu-system-x86_64
   qemu_img: /usr/bin/qemu-img        # absolute: other qemu-img builds (e.g. Android SDK) may shadow it
   ovmf_code: null                    # null = autodetect the non-secure-boot UEFI build
@@ -27,58 +31,8 @@ settings:
   openssh: {url: "https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi",
             sha256: ddec9c53864280759cf9f74791cefd387100e3946aa849a1c138a4ed1b96b7d9}
 
-defaults:
-  image:                             # every image built from an ISO starts with these
-    edition: Windows 11 Pro          # as listed by `winvm editions`; or `index: N`
-    hostname: WINSLIM                # max 15 chars
-    user: user                       # local administrator; SSH logs in with keys
-    password: winslim                # console / RDP
-    timezone: W. Europe Standard Time
-    locale: en-US
-    keyboard: "0409:00000409"        # e.g. "041f:0000041f" = Turkish Q
-    disk_size: 64G                   # virtual; qcow2 only stores what is used
-    slim: false                      # true: keep the debloated image in the cache, so rebuilds
-                                     # take ~10 min instead of ~22 (the first one takes ~1 h)
-    debloat:
-      strip_payloads: true           # drop payloads of disabled features (re-enabling needs media)
-      compact_os: false              # CompactOS in the guest; false = raw, qcow2's zstd compresses better
-      remove_webview: true           # Edge WebView2 runtime (~1 GB)
-    setup: []                        # offline steps during the install, see `images` below
-  instance:                          # every instance starts with these
-    image: base
-    ram: 4G
-    cpus: 4
-    mounts:                          # host folders, in the guest at C:\mnt\<name>
-      share: ${data_dir}/share
-
-# Images build on each other, like Dockerfiles. An image has either
-#   iso:  an official Windows 10/11 ISO -> unattended install + debloat, offline;
-#         `setup` steps run during that install, as SYSTEM, without network
-#   from: another image -> boots it with network, runs `steps`, keeps the changes
-#         as a compressed layer
-# Steps:   - run: <PowerShell>                 fails the build on an error / non-zero exit
-#          - download: {url: U, sha256: H}     fetched on the host, checked, put in the work folder
-#                                              (as `name: F` if given, else the URL's file name)
-#          - copy: [HOST_PATH]                 into the work folder (run steps start there)
-#          - copy: [HOST_PATH, 'C:\guest\path']   (images with `from` only) anywhere in the guest
-#          - restart: true                     reboot the guest (images with `from` only)
-# The work folder is deleted when the build ends. An image is rebuilt when its definition
-# (or one below it) changes; instances keep the old version until `winvm reset`.
-images:
-  base:
-    iso: null                        # path to the ISO; or `winvm up --iso PATH` once
-  # dev:
-  #   from: base
-  #   steps:
-  #     - download: {url: "https://www.python.org/ftp/python/3.13.1/python-3.13.1-amd64.exe",
-  #                  sha256: <sha256 of that file>}
-  #     - run: .\python-3.13.1-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 | Out-Null
-  #     - copy: [./dotfiles, 'C:\Users\user\dotfiles']
-
-# Instances are the VMs you run; each keeps its own changes on top of its image.
-instances:
-  main: {}
-  # work:
-  #   image: dev
-  #   ram: 8G
-  #   mounts: {projects: ~/Projects}
+run:                                 # how instances run, unless their image's `run:` or
+  ram: 4G                            # `winvm up --ram/--cpus` say otherwise
+  cpus: 4
+  mounts:                            # host folders, in the guest at C:\mnt\<name>
+    share: ${data_dir}/share         # (an image or this file can drop it: `share: null`)

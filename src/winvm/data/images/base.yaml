@@ -1,0 +1,36 @@
+# Image `base`: Windows from an ISO, installed unattended and debloated, offline.
+# `winvm config dump base` prints this file. Copy it to ~/.config/winvm/images/base.yaml
+# to change it (that file then replaces this one), or make more images like it.
+#
+# Every image built from an ISO starts with the values below; its own file only needs
+# what differs. An image built on another image instead says `from: NAME` (or a path to
+# its file) and lists `steps` - see the README.
+
+iso: null                        # the Windows ISO; null = the newest one in ${data_dir}/iso
+                                 # (where `winvm up --iso PATH` links it). Leave it null in
+                                 # files you share: everyone links their own ISO once.
+edition: Windows 11 Pro          # as listed by `winvm editions`; or `index: N`
+hostname: WINSLIM                # max 15 chars
+user: user                       # local administrator; SSH logs in with keys
+password: winslim                # console / RDP
+timezone: W. Europe Standard Time
+locale: en-US
+keyboard: "0409:00000409"        # e.g. "041f:0000041f" = Turkish Q
+disk_size: 64G                   # virtual; qcow2 only stores what is used
+slim: false                      # true: keep the debloated image in the cache, so rebuilds
+                                 # take ~10 min instead of ~22 (the first one takes ~1 h)
+debloat:
+  strip_payloads: true           # drop payloads of disabled features (re-enabling needs media)
+  compact_os: false              # CompactOS in the guest; false = raw, qcow2's zstd compresses better
+  remove_webview: true           # Edge WebView2 runtime (~1 GB)
+
+# Steps run during the install, as SYSTEM, without network, in a work folder:
+#   - run: <PowerShell>                    fails the build on an error / non-zero exit
+#   - download: {url: U, sha256: H}        fetched on the host, checked, put in the work folder
+#                                          (as `name: F` if given, else the URL's file name)
+#   - copy: [HOST_PATH]                    a file or folder into the work folder
+setup: []
+
+# How instances of this image run (merged over the machine's `run` defaults; images
+# built on this one inherit it): ram, cpus, mounts.
+run: {}

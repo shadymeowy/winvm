@@ -16,7 +16,7 @@ import yaml
 
 from . import __version__, guest
 from .build import build, export_iso, fetch_step, fetch_tools
-from .config import DEFAULT_FILE, Config, sha
+from .config import BUILTIN, DEFAULT_FILE, Config, is_path, sha
 from .store import Store, label
 from .util import Chan, Fatal, die, du, log, mib, need, output, paint, run, valid, warn
 from .vm import Instance, ports, running
@@ -64,40 +64,52 @@ def link_iso(cfg: Config, iso: str) -> None:
         log(f"using {src} (linked as {dst})")
 
 
-def ensure_disk(cfg: Config, vm: Instance, image: str | None = None) -> None:
-    """A new instance gets a disk on its image (built first if needed); an existing one is
-    only told when its image has a newer version."""
+def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict | None = None) -> None:
+    """A new instance gets a disk on its image (built first if needed): `image`, else the
+    image named like the instance, else base. An existing one keeps its disk; new `run`
+    settings are added to its own, and it is told when its image has a newer version."""
     store = Store(cfg)
     if vm.disk.exists():
+        if run:
+            vm.meta = {**vm.meta, "run": {**vm.meta.get("run", {}), **run}}
         if image and image != vm.image:
             warn(f"{vm.name} runs on '{vm.image}' - winvm -i {vm.name} reset {image} to switch")
         if outdated(cfg, store, vm, store.parent(vm.disk)):
             warn(f"{vm.name} runs on an older version of '{vm.image}' - "
                  f"winvm -i {vm.name} reset to update it (discards its changes)")
         return
-    image = valid(image or vm.settings["image"])
+    image = image or (vm.name if vm.name in cfg.images else "base")
     if image in cfg.images:
         build(cfg, [image])
-    vm.create(image, store.require(image))
+    vm.create(image, store.require(image), run or {})
 
 
-@command(arg("names", nargs="*", metavar="INSTANCE", help="default: -i / the first configured instance"),
-         arg("--all", action="store_true", help="every instance in the config"),
-         arg("--image", help="image for a new instance (default: from the config)"),
+@command(arg("names", nargs="*", metavar="NAME", help="instance, or an image file (instance named like it); "
+                                                     "default: -i, else main"),
+         arg("--image", metavar="IMAGE", help="image (name or file) for a new instance; default: the "
+                                              "image named like the instance, else base"),
+         arg("--ram", help="e.g. 8G; kept for this instance"),
+         arg("--cpus", type=int, help="kept for this instance"),
+         arg("--all", action="store_true", help="every existing instance"),
          arg("--iso", help="Windows ISO for images without `iso:` (remembered in ${data_dir}/iso)"),
          arg("--gui", action="store_true", help="GTK window with clipboard instead of headless"),
          aliases=("start",))
 def cmd_up(a):
     """create (building images as needed) and start instances; ready when SSH answers"""
-    cfg = a.cfg
+    cfg, store = a.cfg, Store(a.cfg)
     if a.iso:
         link_iso(cfg, a.iso)
-    names = list(cfg.instances) if a.all else [valid(n) for n in a.names or [a.instance]]
+    if a.ram:
+        mib(a.ram)                                             # fails early on a bad size
+    run = {k: v for k, v in (("ram", a.ram), ("cpus", a.cpus)) if v}
+    image = cfg.ref(a.image) if a.image else None
+    names = [d.parent.name for d in store.disks()] if a.all else \
+        [cfg.ref(n) if is_path(n) else valid(n) for n in a.names or [a.instance]]
     for n in names:
         vm = Instance(cfg, n)
-        ensure_disk(cfg, vm, a.image)
+        ensure_disk(cfg, vm, image, run)
         vm.start(gui=a.gui)
-        log(f"{n} is up - winvm{'' if n == default_instance(cfg) else f' -i {n}'} sh")
+        log(f"{n} is up - winvm{'' if n == 'main' else f' -i {n}'} sh")
 
 
 @command(arg("names", nargs="*", metavar="INSTANCE"),
@@ -142,10 +154,6 @@ def outdated(cfg: Config, store: Store, vm: Instance, on: Path | None) -> bool:
         return store.current(vm.image) != on
     except Fatal:                                              # e.g. a `copy` source is gone
         return False
-
-
-def default_instance(cfg: Config) -> str:
-    return next(iter(cfg.instances), "main")
 
 
 # ------------------------------------------------------------------ guest access
@@ -291,7 +299,7 @@ def cmd_mount(a):
     """mount a host folder into the running instance, at C:\\mnt\\NAME"""
     vm = inst(a)
     if not a.path:                                             # stopped: what the next start sets up
-        for n, m in (vm.mounts if vm.alive else a.cfg.mounts(vm.name)).items():
+        for n, m in (vm.mounts if vm.alive else vm.settings["mounts"]).items():
             print(f"C:\\mnt\\{n:<14} {m['path']}{'  (read-only)' if m['readonly'] else ''}")
         return
     path = Path(a.path).expanduser().resolve()
@@ -311,41 +319,45 @@ def cmd_umount(a):
 
 # ------------------------------------------------------------------ images
 
-@command(arg("images", nargs="*", metavar="IMAGE", help="default: every image in the config"),
+@command(arg("images", nargs="*", metavar="IMAGE", help="name or image file; default: every image winvm knows"),
          arg("--force", action="store_true", help="rebuild even if up to date (refused while in use)"),
          arg("--gui", action="store_true", help="show the build VM in a window"))
 def cmd_build(a):
     """build images (and what they build on) whose definition changed or that are missing"""
-    names = [valid(n) for n in a.images] or list(a.cfg.images)
+    names = [a.cfg.ref(n) for n in a.images] or list(a.cfg.images)
     build(a.cfg, names, force=a.force, gui=a.gui)
     log("images up to date")
 
 
 @command()
 def cmd_images(a):
-    """list images: config + built versions, size, what each builds on, who uses it"""
+    """list images: their file, built versions, size, what each builds on, who uses it"""
     cfg, store = a.cfg, Store(a.cfg)
-    print(f"{'IMAGE':<22} {'STATUS':<10} {'SIZE':>6}  {'ON':<22} USED BY")
+    rows = [("IMAGE", "STATUS", "SIZE", "ON", "USED BY", "DEFINED IN")]
     for name in list(cfg.images) + sorted({store.meta(f)["name"] for f in store.all()} - set(cfg.images)):
         try:
             cur = store.current(name)
         except Fatal as e:                                     # no ISO, a `copy` source gone, ...
             warn(str(e))
             cur = None
-        versions = store.versions(name)
+        src = cfg.sources.get(name)
+        where = ("built-in" if src.parent == BUILTIN else tilde(src)) if src else "-"
+        where += "  (replaces the built-in)" if name in cfg.replaced else ""
         if name in cfg.images and not cur:
-            on = cfg.parent(name) or "iso"
-            print(f"{name:<22} {'not built':<10} {'-':>6}  {on:<22}")
-        for f in versions:
+            rows.append((name, "not built", "-", cfg.parent(name) or "iso", "", where))
+        for f in store.versions(name):
             meta = store.meta(f)
             status = "saved" if meta.get("saved") else "current" if f == cur else "old"
-            print(f"{label(f):<22} {status:<10} {du(f):>6}  {meta.get('from') or 'iso':<22} "
-                  f"{' '.join(store.users(f))}")
+            rows.append((label(f), status, du(f), meta.get("from") or "iso", " ".join(store.users(f)),
+                         where if f == cur or status == "saved" else ""))
+    widths = [max(len(r[i]) for r in rows) for i in range(5)]
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r[:5], widths)) + "  " + r[5])
 
 
 @command(arg("--cache", action="store_true", help="also the download and slim-image cache"))
 def cmd_prune(a):
-    """delete image versions nothing uses (old or no longer in the config), build leftovers"""
+    """delete image versions nothing uses (old, or whose file is gone), build leftovers"""
     cfg, store = a.cfg, Store(a.cfg)
     keep = set()
     for name in cfg.images:
@@ -384,7 +396,7 @@ def cmd_rmi(a):
             die(f"{label(f)} is used by {', '.join(users)} - rm/reset those first")
     for f in versions:
         store.remove(f)
-    log(f"removed image '{a.name}'" + (" (still in the config: rebuilt when needed)" if a.name in a.cfg.images else ""))
+    log(f"removed image '{a.name}'" + (" (its file is still there: rebuilt when needed)" if a.name in a.cfg.images else ""))
 
 
 @command(arg("name", help="new image name"))
@@ -394,7 +406,7 @@ def cmd_save(a):
     vm.require_stopped()
     vm.disk.exists() or die(f"{vm.name} has no disk")
     if name in cfg.images:
-        die(f"'{name}' is defined in the config - pick another name for a saved image")
+        die(f"'{name}' is an image file ({tilde(cfg.sources[name])}) - pick another name for a saved image")
     if store.versions(name):
         die(f"image '{name}' exists (winvm rmi {name} first)")
     below = store.parent(vm.disk)
@@ -411,7 +423,7 @@ def cmd_reset(a):
     """discard the instance's changes: fresh disk on the current version of its image"""
     cfg, vm = a.cfg, inst(a)
     vm.require_stopped()
-    image = valid(a.image) if a.image else vm.image
+    image = a.cfg.ref(a.image) if a.image else vm.image
     if image in cfg.images:
         build(cfg, [image])
     vm.create(image, Store(cfg).require(image))
@@ -432,8 +444,8 @@ def cmd_rm(a):
 @command(arg("image", nargs="?", default="base"), arg("-o", "--output", help="default: ./IMAGE.iso"))
 def cmd_iso(a):
     """write a standalone installer ISO of an ISO image (its slim image + payload)"""
-    out = Path(a.output or f"{a.image}.iso").resolve()
-    export_iso(a.cfg, valid(a.image), out)
+    out = Path(a.output or f"{Path(a.image).stem}.iso").resolve()
+    export_iso(a.cfg, a.cfg.ref(a.image), out)
     log(f"{out} ({du(out)}) - it wipes disk 0 without asking and refuses to run outside QEMU")
 
 
@@ -441,7 +453,7 @@ def cmd_iso(a):
 def cmd_editions(a):
     """list the editions inside an image's Windows ISO"""
     need("7z", "wimlib-imagex")
-    root = a.cfg.chain(valid(a.image))[0]                     # the ISO image a `from` image is built on
+    root = a.cfg.chain(a.cfg.ref(a.image))[0]                 # the ISO image a `from` image is built on
     iso, tmp = a.cfg.iso(root), a.cfg.cache / "build/editions"
     shutil.rmtree(tmp, ignore_errors=True)
     image = "sources/install.wim" if "install.wim" in output("7z", "l", iso, "sources/install.*") \
@@ -466,18 +478,35 @@ def cmd_fetch(a):
 
 # ------------------------------------------------------------------ config
 
-@command(arg("what", choices=["dump", "show", "path"], nargs="?", default="path",
-             help="dump: the default config with comments; show: the merged config; path: files in use"))
+@command(arg("what", choices=["dump", "show", "path"], nargs="?", default="path"),
+         arg("image", nargs="?", help="an image (name or file) instead of the machine settings"))
 def cmd_config(a):
-    """the configuration: `config dump > winvm.yaml` to start your own"""
+    """machine settings and image definitions
+
+    winvm config dump                 built-in machine settings, with comments
+    winvm config dump base            built-in image `base`: the template for image files
+    winvm config show [IMAGE]         what is in effect: merged settings, or a resolved image
+    winvm config path                 files and folders in use
+    """
     cfg = a.cfg
     if a.what == "dump":
-        sys.stdout.write(DEFAULT_FILE.read_text())
+        f = DEFAULT_FILE if not a.image else BUILTIN / f"{valid(a.image)}.yaml"
+        sys.stdout.write(f.read_text() if f.exists() else die(f"no built-in image '{a.image}'"))
+    elif a.what == "show" and a.image:
+        name = cfg.ref(a.image)
+        print(f"# {cfg.sources[name]}")
+        print(yaml.safe_dump({**cfg.image(name), "run": cfg.run_settings(name)}, sort_keys=False, width=120), end="")
     elif a.what == "show":
-        print(yaml.safe_dump(cfg.raw, sort_keys=False, width=120), end="")
+        print(yaml.safe_dump({k: cfg.raw[k] for k in ("settings", "run")}, sort_keys=False, width=120), end="")
     else:
-        print(f"config:  {cfg.file or '(none - built-in defaults: winvm config dump)'}")
-        print(f"data:    {cfg.data}\ncache:   {cfg.cache}\nruntime: {cfg.runtime}")
+        print(f"settings: {cfg.file or '(built-in only: winvm config dump)'}")
+        print(f"images:   {cfg.images_dir}  (NAME.yaml, then the built-ins)")
+        print(f"data:     {cfg.data}\ncache:    {cfg.cache}\nruntime:  {cfg.runtime}")
+
+
+def tilde(p: Path) -> str:
+    home = str(Path.home())
+    return "~" + str(p)[len(home):] if str(p).startswith(home + "/") else str(p)
 
 
 # ------------------------------------------------------------------ main
@@ -486,11 +515,11 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     p = argparse.ArgumentParser(
         prog="winvm", formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Build and run slim, unattended Windows VMs on QEMU/KVM, from one YAML file.",
+        description="Build and run slim, unattended Windows VMs on QEMU/KVM; images defined in YAML files.",
         epilog="quick start:  winvm up --iso ~/Downloads/Win11_*.iso   then   winvm sh")
     p.add_argument("-f", "--file", metavar="YAML",
-                   help="config file (default: $WINVM_CONFIG, ./winvm.yaml, ~/.config/winvm/winvm.yaml)")
-    p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: the first configured)")
+                   help="machine settings (default: $WINVM_CONFIG, ~/.config/winvm/winvm.yaml)")
+    p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: main)")
     p.add_argument("--data-dir", metavar="DIR",
                    help="images and instances (default: $WINVM_DATA_DIR, settings.data_dir)")
     p.add_argument("--cache-dir", metavar="DIR",
@@ -519,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         a.cfg = Config(a.file, a.data_dir, a.cache_dir)
-        a.instance = a.instance or default_instance(a.cfg)
+        a.instance = a.instance or "main"
         return a.fn(a) or 0
     except Fatal as e:
         print(paint("1;31", "error:"), e, file=sys.stderr)

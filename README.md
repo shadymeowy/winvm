@@ -1,9 +1,10 @@
-# winvm: slim, reproducible Windows VMs from one YAML file
+# winvm: slim, reproducible Windows VMs from YAML image files
 
 `winvm` turns an **official Microsoft Windows ISO** into a minimal Windows VM on
-QEMU/KVM: unattended, reproducible, runs as your user, not activated. Images
-build on each other like Dockerfiles, and instances run like compose services, all
-described in one `winvm.yaml`.
+QEMU/KVM: unattended, reproducible, runs as your user, not activated. Each image is
+described by one small YAML file, like a Dockerfile: built from an ISO, or on top of
+another image. Files refer to each other by name, so bases and images are easy to
+share and reuse.
 
 * No Windows Update, Defender, SmartScreen, Copilot/Recall/AI, Edge, OneDrive,
   Store or inbox apps, telemetry, search indexer, hibernation, pagefile or WinRE.
@@ -65,48 +66,55 @@ winvm stop
 
 `main` keeps everything you do in it across stop/start. `winvm reset` gives it a fresh
 Windows again; `winvm save NAME` freezes its current state as an image to come back
-to or start other instances from. To bake your own tools into images, write a
-`winvm.yaml` (next section).
+to or start other instances from. To bake your own tools into images, write image
+files (next section).
 
-## winvm.yaml
+## Images
 
-`winvm config dump > winvm.yaml` writes the built-in config with all its comments.
-Your file is merged over it, so it only needs what it changes or adds (`null` drops a
-built-in image, instance or mount, e.g. `instances: {main: null}`). winvm uses
-the first of `-f FILE`, `$WINVM_CONFIG`, `./winvm.yaml`, `~/.config/winvm/winvm.yaml`.
+An image is one YAML file; its file name is its name. Either it is built **from an
+ISO** (unattended install + debloat, offline), or **from another image** (boot it, run
+steps with network, keep the changes):
 
 ```yaml
-settings:
-  ports: {ssh: 2222, rdp: 3390, vnc: 5930}    # instance n gets port + n
-
-images:
-  base:                                  # from an ISO: unattended install + debloat, offline
-    iso: ~/Downloads/Win11_25H2_English_x64.iso
-    edition: Windows 11 Pro N            # `winvm editions` lists them
-    keyboard: "041f:0000041f"            # Turkish Q
-    slim: true                           # cache the debloated image: rebuilds ~10 min
-    setup:                               # runs during the install, as SYSTEM, without network
-      - download: {url: "https://www.7-zip.org/a/7z2409-x64.msi", sha256: <sha256>}
-      - run: Start-Process msiexec -Wait -ArgumentList '/i', '7z2409-x64.msi', '/qn'
-
-  dev:                                   # from another image: boot it, run steps, keep the changes
-    from: base
-    steps:                               # with network; files land in a work folder
-      - download: {url: "https://www.python.org/ftp/python/3.13.1/python-3.13.1-amd64.exe",
-                   sha256: <sha256>}
-      - run: .\python-3.13.1-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 | Out-Null
-      - copy: [./dotfiles, 'C:\Users\user\dotfiles']
-      - restart: true
-
-instances:
-  main: {}                               # on base, 4G, 4 CPUs, mount `share`
-  work:
-    image: dev
-    ram: 8G
-    mounts:
-      projects: ~/Projects               # guest C:\mnt\projects
-      docs: {path: ~/Documents, readonly: true}
+# ~/.config/winvm/images/base.yaml - replaces the built-in base (`winvm config dump base`);
+# an ISO image's file only needs what differs from the built-in base
+edition: Windows 11 Pro N            # `winvm editions` lists them
+keyboard: "041f:0000041f"            # Turkish Q
+slim: true                           # cache the debloated image: rebuilds ~10 min
+setup:                               # during the install, as SYSTEM, without network
+  - download: {url: "https://www.7-zip.org/a/7z2409-x64.msi", sha256: <sha256>}
+  - run: Start-Process msiexec -Wait -ArgumentList '/i', '7z2409-x64.msi', '/qn'
 ```
+
+```yaml
+# ~/.config/winvm/images/dev.yaml
+from: base                           # an image name, or a path: ../shared/base.yaml
+steps:                               # with network; files land in a work folder
+  - download: {url: "https://www.python.org/ftp/python/3.13.1/python-3.13.1-amd64.exe",
+               sha256: <sha256>}
+  - run: .\python-3.13.1-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 | Out-Null
+  - copy: [./dotfiles, 'C:\Users\user\dotfiles']   # ./ = next to this file
+  - restart: true
+run:                                 # how instances of dev run (images on dev inherit it)
+  ram: 8G
+  mounts:
+    projects: ~/Projects             # guest C:\mnt\projects
+    docs: {path: ~/Documents, readonly: true}
+```
+
+```sh
+winvm up dev                         # builds base and dev as needed, runs instance "dev"
+winvm -i work up --image dev --ram 6G    # another instance of dev, with its own RAM
+winvm up ./team/office.yaml          # an image file anywhere: instance "office"
+```
+
+**Where image files come from.** A name like `dev` means `dev.yaml` in
+`~/.config/winvm/images/` (setting `images_dir`), else a built-in (only `base`). Any
+other file is given by its path; winvm remembers it, so later commands work from any
+folder. Your `base.yaml` replaces the built-in `base` (`winvm images` says so); two
+files with the same name are an error, never a silent pick. A file's folder is its
+context: `copy: [./dotfiles]` and mount paths are relative to the file. For files
+you share, leave `iso:` out: everyone links their own ISO once with `--iso`.
 
 **Steps.** `run` is PowerShell; a thrown error or a non-zero exit fails the build.
 `download` fetches on the host, checks the sha256 (get it with
@@ -115,12 +123,22 @@ puts a file or folder there too, `copy: [HOST, GUEST]` anywhere in the guest
 (`from` images only). `restart` reboots (`from` images only). Run steps start in
 the work folder, which is deleted when the build ends.
 
+**Instances.** `winvm up NAME` runs the instance NAME, on the image of the same name
+if there is one, else on `base` (or `--image`). Its settings come from the machine's
+`run` defaults, then the `run:` of its image and the images below, then its own
+`--ram/--cpus` (kept in its folder).
+
 **Rebuilds work like Docker layers.** Every image has a content hash over its
-definition, the files it copies and the image below it. Change any of it and the
-image (and everything built on it) gets a new version on the next `build`, `reset`,
-or `up` of a new instance. Existing instances keep running on the version they were
-created on; `winvm ps` marks them outdated and `winvm reset` moves them over
-(discarding their changes). `winvm prune` deletes versions nothing uses.
+definition, the files it copies and the image below it (not over where its file is).
+Change any of it and the image (and everything built on it) gets a new version on the
+next `build`, `reset`, or `up` of a new instance. Existing instances keep running on
+the version they were created on; `winvm ps` marks them outdated and `winvm reset`
+moves them over (discarding their changes). `winvm prune` deletes versions nothing uses.
+
+**Machine settings** (folders, ports, UUID, RAM reserve, default `run`) are in
+`~/.config/winvm/winvm.yaml`, merged over the built-in ones (`winvm config dump`).
+They never change what an image contains, so an image file means the same on every
+machine.
 
 ## Running commands in the guest: `winvm sh`
 
@@ -152,33 +170,34 @@ winvm mount                       # list
 winvm umount d2
 ```
 
-Mounts in the config are set up at every start; `mount`/`umount` change a running
-instance until it stops. Each instance runs its own unprivileged Samba server
+Mounts from `run:` settings are set up at every start; `mount`/`umount` change a
+running instance until it stops. Each instance runs its own unprivileged Samba server
 (QEMU forwards `\\10.0.2.4` to it), whose config winvm rewrites on the fly. The guest
 gets folder links in `C:\mnt` rather than drive letters, because a drive letter
 exists only in the logon session that mapped it.
 
 ## Commands
 
-Instance commands act on `-i NAME`, default the first instance in the config (`main`).
+Instance commands act on `-i NAME`, default `main`. Wherever an IMAGE is asked for,
+a name or the path of an image file works.
 
 | command | |
 |---|---|
-| `up [NAME...] [--all] [--iso ISO] [--image IMG] [--gui]` | create (building images as needed) and start; ready when SSH answers |
+| `up [NAME\|FILE...] [--image IMAGE] [--ram R] [--cpus N] [--iso ISO] [--all] [--gui]` | create (building images as needed) and start; ready when SSH answers |
 | `stop [NAME...] [--all]` / `kill` | ACPI shutdown (hard kill after 120 s) / power off |
 | `ps` | instances: state, ports, disk, image version, mounts |
 | `sh [-t] [CMD]`, `ssh`, `cp`, `wait` | see above |
 | `mount [PATH [NAME]] [--ro]` / `umount NAME` | host folders in the running guest |
 | `gui` / `rdp` | VNC viewer (or start with a GTK window) / FreeRDP session |
 | `ga`, `balloon [SIZE]`, `screenshot`, `cmdline` | guest agent, live RAM, PNG of the screen, QEMU argv |
-| `build [IMAGE...] [--force]` | build missing or changed images (default: all in the config) |
-| `images` | config images and built versions: status, size, base, users |
+| `build [IMAGE...] [--force]` | build missing or changed images (default: all known) |
+| `images` | images: built versions, status, size, base, users, defining file |
 | `save NAME` | freeze the instance's disk as image NAME; the instance continues on it |
 | `reset [IMAGE]` | discard the instance's changes: fresh disk on the current version |
 | `rm` / `rmi IMAGE` / `prune [--cache]` | delete an instance / an image / unused versions and leftovers |
 | `iso [IMAGE] [-o FILE]` | standalone installer ISO of an image (slim image + payload) |
 | `editions [IMAGE]`, `fetch` | editions in the ISO / download everything pinned |
-| `config dump\|show\|path` | built-in config / merged config / files and folders in use |
+| `config dump [base]`, `config show [IMAGE]`, `config path` | built-in settings or base / what is in effect / files and folders |
 
 `save` is for states you produce by hand (e.g. after activating something); an
 instance's disk keeps its changes across stop/start anyway.
@@ -186,7 +205,8 @@ instance's disk keeps its changes across stop/start anyway.
 ## Where things live
 
 ```
-~/.config/winvm/winvm.yaml          your config (optional)
+~/.config/winvm/winvm.yaml          machine settings (optional)
+~/.config/winvm/images/NAME.yaml    your image files (optional)
 ~/.local/share/winvm/               --data-dir / $WINVM_DATA_DIR / settings.data_dir
   images/base@fb97f6be18d2.qcow2    read-only layers, <name>@<hash>, + .json metadata
   instances/main/disk.qcow2         an instance's own changes, backed by a layer

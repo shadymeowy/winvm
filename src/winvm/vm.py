@@ -101,17 +101,29 @@ class Instance:
         except (OSError, IndexError, TypeError):
             return 0
 
+    # --- instance.json: the image it was created on, that image's file, its own settings
     @property
-    def settings(self) -> dict:
-        return self.cfg.instance(self.name)
+    def meta(self) -> dict:
+        try:
+            return json.loads((self.home / "instance.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
+    @meta.setter
+    def meta(self, value: dict) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "instance.json").write_text(json.dumps(value, indent=1) + "\n")
 
     @property
     def image(self) -> str:
-        """The image this instance was created on (instance.json), else the configured one."""
-        try:
-            return json.loads((self.home / "instance.json").read_text())["image"]
-        except (OSError, ValueError, KeyError):
-            return self.settings["image"]
+        return self.meta.get("image") or "base"
+
+    @property
+    def settings(self) -> dict:
+        """ram/cpus/mounts: machine defaults < its image's `run:` < its own (up --ram/--cpus)."""
+        if self.builder:
+            return self.cfg.run_settings(None)
+        return self.cfg.run_settings(self.image, self.meta.get("run"))
 
     def layer_meta(self) -> dict:
         """Metadata of the image layer the disk sits on (guest user/password live there)."""
@@ -119,12 +131,15 @@ class Instance:
         return store.meta(store.parent(self.disk)) if self.disk.exists() else {}
 
     # --- disk
-    def create(self, image: str, on: Path) -> None:
-        """Fresh, empty disk on layer `on` (a version of `image`) + fresh UEFI variables."""
+    def create(self, image: str, on: Path, run: dict | None = None) -> None:
+        """Fresh, empty disk on layer `on` (a version of `image`) + fresh UEFI variables;
+        `run`: the instance's own settings (kept from before if None)."""
         Store(self.cfg).overlay(self.disk, on)
         shutil.copyfile(ovmf(self.cfg)[1], self.vars)
         if not self.builder:
-            (self.home / "instance.json").write_text(json.dumps({"image": image}) + "\n")
+            src = self.cfg.sources.get(image)
+            self.meta = {"image": image, "source": str(src) if src else None,
+                         "run": self.meta.get("run", {}) if run is None else run}
         log(f"fresh disk for {self.name} on {label(on)}")
 
     def require_stopped(self) -> None:
@@ -212,7 +227,7 @@ class Instance:
         else:
             need(self.cfg.s["qemu"])
             self.claim(mib(self.settings["ram"]))
-            self.write_smb({} if self.builder else self.cfg.mounts(self.name))
+            self.write_smb({} if self.builder else self.settings["mounts"])
             self.launch(self.qemu_argv(gui=gui), gui)
             self.ssh_config()                                  # for `Include .../ssh_config`
             st = self.state
@@ -261,7 +276,7 @@ class Instance:
     # --- SSH
     def ssh_config(self) -> Path:
         st = self.state or die(f"{self.name} has never been started")
-        user = self.layer_meta().get("user") or self.cfg.image_defaults.get("user") or "user"
+        user = self.layer_meta().get("user") or self.cfg.builtin["user"]
         cfg = self.dir / "ssh_config"
         cfg.write_text(f"""Host {self.name}
   HostName 127.0.0.1
@@ -382,8 +397,8 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
 
     def require_running(self) -> None:
         if not self.alive:
-            die(f"{self.name} is not running - start it, or change the mounts in the config "
-                f"(instances.{self.name}.mounts)")
+            die(f"{self.name} is not running - start it, or list the mount in its image's "
+                f"`run: mounts:` (or the machine's, ~/.config/winvm/winvm.yaml)")
 
     def mount(self, name: str, path: Path, readonly=False) -> None:
         self.require_running()
