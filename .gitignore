@@ -4,3 +4,4 @@ config.local.env
 *.wim
 *.esd
 *.log
+__pycache__/

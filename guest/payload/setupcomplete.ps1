@@ -15,6 +15,10 @@ Run "$ScriptDir\virtio-win-guest-tools.exe" @('/install', '/quiet', '/norestart'
 # ------------------------------------------------------------------ OpenSSH server
 Log 'installing OpenSSH server' 'SC'
 Run 'msiexec.exe' @('/i', "`"$ScriptDir\OpenSSH.msi`"", '/qn', '/norestart', 'ADDLOCAL=Server') | Out-Null
+# sshd starts subsystems through the default shell (PowerShell), so `Subsystem sftp sftp-server.exe`
+# - and with it scp, which uses SFTP - only works when the OpenSSH folder is on PATH
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+[Environment]::SetEnvironmentVariable('Path', "$machinePath;$env:ProgramFiles\OpenSSH", 'Machine')
 New-Item -ItemType Directory -Force -Path 'C:\ProgramData\ssh' | Out-Null
 $ak = 'C:\ProgramData\ssh\administrators_authorized_keys'
 Copy-Item "$ScriptDir\authorized_keys" $ak -Force
@@ -25,6 +29,16 @@ New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType
 Set-Service sshd -StartupType Automatic
 Start-Service sshd   # generates host keys now, so they are baked into the base image
 Log ("  sshd: {0}" -f (Get-Service sshd).Status) 'SC'
+
+# ------------------------------------------------------------------ .NET native images
+# Windows queues NGEN work and runs it when idle, which a fresh image never was. Without
+# native images every PowerShell start JIT-compiles its engine: ~2 s instead of ~0.2 s
+# for each `winvm sh` command.
+Log 'compiling .NET native images (ngen)' 'SC'
+& "$env:windir\Microsoft.NET\Framework64\v4.0.30319\ngen.exe" executeQueuedItems /nologo /silent | Out-Null
+$sma = Get-ChildItem "$env:windir\Microsoft.Net\assembly\GAC_MSIL\System.Management.Automation" -Recurse -Filter *.dll | Select-Object -First 1
+& "$env:windir\Microsoft.NET\Framework64\v4.0.30319\ngen.exe" install $sma.FullName /nologo /silent | Out-Null
+Log ("  powershell startup: {0:N2}s" -f (Measure-Command { powershell -NoProfile -Command 1 }).TotalSeconds) 'SC'
 
 # ------------------------------------------------------------------ network / sharing
 Log 'firewall off (VM is only reachable through localhost port forwards)' 'SC'
