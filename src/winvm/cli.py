@@ -27,6 +27,7 @@ RAW = set()   # commands whose arguments are passed through verbatim (PowerShell
 
 
 def arg(*flags, **kw):
+    """An argparse argument; names="instances"/"images": shell completion offers those."""
     return flags, kw
 
 
@@ -108,9 +109,9 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
     vm.create(image, store.require(image), run or {})
 
 
-@command(arg("names", nargs="*", metavar="NAME", help="instance, or an image file (instance named like it); "
+@command(arg("names", nargs="*", metavar="NAME", names="instances", help="instance, or an image file (instance named like it); "
                                                      "default: -i, else main"),
-         arg("--image", metavar="IMAGE", help="image (name or file) for a new instance; default: the "
+         arg("--image", metavar="IMAGE", names="images", help="image (name or file) for a new instance; default: the "
                                               "image named like the instance, else base"),
          arg("--ram", help="e.g. 8G, or 2G-8G: dynamic memory between the two; kept for this instance"),
          arg("--cpus", type=int, help="kept for this instance"),
@@ -141,7 +142,7 @@ def cmd_up(a):
         log(f"{n} is up - winvm{'' if n == 'main' else f' -i {n}'} sh")
 
 
-@command(arg("names", nargs="*", metavar="INSTANCE"),
+@command(arg("names", nargs="*", metavar="INSTANCE", names="instances"),
          arg("--all", action="store_true", help="every running instance"), aliases=("down",))
 def cmd_stop(a):
     """graceful shutdown (ACPI), hard kill after 120 s"""
@@ -363,7 +364,7 @@ def cmd_umount(a):
 
 # ------------------------------------------------------------------ images
 
-@command(arg("images", nargs="*", metavar="IMAGE", help="name or image file; default: every image winvm knows"),
+@command(arg("images", nargs="*", metavar="IMAGE", names="images", help="name or image file; default: every image winvm knows"),
          arg("--force", action="store_true", help="rebuild even if up to date (refused while in use)"),
          arg("--gui", action="store_true", help="show the build VM in a window"))
 def cmd_build(a):
@@ -430,7 +431,7 @@ def cmd_prune(a):
     log("pruned")
 
 
-@command(arg("name"))
+@command(arg("name", names="images"))
 def cmd_rmi(a):
     """delete all versions of an image (refused while anything builds on them)"""
     store = Store(a.cfg)
@@ -462,7 +463,7 @@ def cmd_save(a):
     log(f"saved {label(f)} ({du(f)}); {vm.name} continues on it")
 
 
-@command(arg("image", nargs="?", help="default: the instance's image (its current version)"))
+@command(arg("image", nargs="?", names="images", help="default: the instance's image (its current version)"))
 def cmd_reset(a):
     """discard the instance's changes: fresh disk on the current version of its image"""
     cfg, vm = a.cfg, inst(a)
@@ -485,7 +486,7 @@ def cmd_rm(a):
     log(f"removed instance {vm.name}")
 
 
-@command(arg("image", nargs="?", default="base"))
+@command(arg("image", nargs="?", default="base", names="images"))
 def cmd_editions(a):
     """list the editions inside an image's Windows ISO"""
     root = a.cfg.chain(a.cfg.ref(a.image))[0]                 # the ISO image a `from` image is built on
@@ -493,7 +494,7 @@ def cmd_editions(a):
         print(f"  {idx}: {name}")
 
 
-@command(arg("images", nargs="*", metavar="IMAGE", help="default: every image winvm knows"))
+@command(arg("images", nargs="*", metavar="IMAGE", names="images", help="default: every image winvm knows"))
 def cmd_fetch(a):
     """download now what building the images needs (ISO, drivers, firmware, download steps)"""
     cfg = a.cfg
@@ -571,7 +572,7 @@ def du_free(n: int) -> str:
 # ------------------------------------------------------------------ config
 
 @command(arg("what", choices=["dump", "show", "path"], nargs="?", default="path"),
-         arg("image", nargs="?", help="an image (name or file) instead of the machine settings"))
+         arg("image", nargs="?", names="images", help="an image (name or file) instead of the machine settings"))
 def cmd_config(a):
     """machine settings and image definitions
 
@@ -619,12 +620,27 @@ def cmd_completion(a):
     p, subs = parser()
     glob = [o for act in p._actions for o in act.option_strings]
     vals = [o for act in p._actions if act.nargs != 0 and act.option_strings for o in act.option_strings]
+    # options and positionals taking instance or image names: `winvm __names KIND` lists them
+    opt_kind = {o: act.names for _, sp_ in [(None, p), *subs] for act in sp_._actions
+                if getattr(act, "names", None) for o in act.option_strings}
+    pos_kind = {n: act.names for names, sp_ in subs for act in sp_._actions
+                if getattr(act, "names", None) and not act.option_strings for n in names}
     if a.shell == "bash":
         cases = "".join(f"    {'|'.join(names)}) opts=\"{' '.join(o for act in sp_._actions for o in act.option_strings)}\";;\n"
                         for names, sp_ in subs)
+        kinds = {k: [o for o, v in opt_kind.items() if v == k] for k in set(opt_kind.values())}
+        prev = "".join(f"    {'|'.join(os_)}) kind={k};;\n" for k, os_ in kinds.items())
+        pos = "".join(f"    {'|'.join(n for n, v in pos_kind.items() if v == k)}) kind={k};;\n"
+                      for k in set(pos_kind.values()))
         sys.stdout.write(f"""# winvm {__version__} bash completion (winvm completion bash)
 _winvm() {{
-  local cur=${{COMP_WORDS[COMP_CWORD]}} cmd="" opts="" i
+  local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} cmd="" opts="" kind="" i
+  case $prev in
+{prev}  esac
+  if [[ -n $kind ]]; then
+    COMPREPLY=($(compgen -W "$(winvm __names $kind 2>/dev/null)" -- "$cur"))
+    return
+  fi
   for ((i = 1; i < COMP_CWORD; i++)); do
     case ${{COMP_WORDS[i]}} in
       {'|'.join(vals)}) ((i++));;
@@ -640,23 +656,42 @@ _winvm() {{
 {cases}  esac
   if [[ $cur == -* ]]; then
     COMPREPLY=($(compgen -W "$opts" -- "$cur"))
-  else
-    case $cmd in {'|'.join(n for names, _ in subs if names[0] in FILE_ARGS for n in names)}) COMPREPLY=($(compgen -f -- "$cur"));; esac
+    return
   fi
+  case $cmd in
+{pos}  esac
+  [[ -n $kind ]] && COMPREPLY=($(compgen -W "$(winvm __names $kind 2>/dev/null)" -- "$cur"))
+  case $cmd in {'|'.join(n for names, _ in subs if names[0] in FILE_ARGS for n in names)}) COMPREPLY+=($(compgen -f -- "$cur"));; esac
 }}
 complete -o default -o bashdefault -F _winvm winvm
 """)
         return
     q = desc
-    out = [f"# winvm {__version__} fish completion (winvm completion fish)", "complete -c winvm -f"]
+    # the command word: the first one that is neither an option nor an option's value
+    out = [f"# winvm {__version__} fish completion (winvm completion fish)", f"""function __winvm_cmd
+    set -l toks (commandline -opc)[2..]
+    while set -q toks[1]
+        switch $toks[1]
+            case {' '.join(vals)}
+                set -e toks[1]
+            case '-*'
+            case '*'
+                echo $toks[1]
+                return 0
+        end
+        set -e toks[1]
+    end
+    return 1
+end""", "complete -c winvm -f"]
+    top = "'not __winvm_cmd >/dev/null'"
     for act in p._actions:
         if act.option_strings and act.help != argparse.SUPPRESS:
-            out.append(fish_opt("__fish_use_subcommand", act, q))
+            out.append(fish_opt(top, act, q))
     for names, sp_ in subs:
-        out.append(f"complete -c winvm -n __fish_use_subcommand -a {names[0]} -d '{q(sp_.description)}'")
+        out.append(f"complete -c winvm -n {top} -a {names[0]} -d '{q(sp_.description)}'")
         for alias in names[1:]:
-            out.append(f"complete -c winvm -n __fish_use_subcommand -a {alias} -d 'same as {names[0]}'")
-        seen = f"'__fish_seen_subcommand_from {' '.join(names)}'"
+            out.append(f"complete -c winvm -n {top} -a {alias} -d 'same as {names[0]}'")
+        seen = f"'contains -- (__winvm_cmd) {' '.join(names)}'"
         if names[0] in FILE_ARGS:
             out.append(f"complete -c winvm -n {seen} -F")
         for act in sp_._actions:
@@ -664,6 +699,8 @@ complete -o default -o bashdefault -F _winvm winvm
                 out.append(fish_opt(seen, act, q))
             elif not act.option_strings and act.choices:
                 out.append(f"complete -c winvm -n {seen} -a '{' '.join(act.choices)}'")
+            elif not act.option_strings and getattr(act, "names", None):
+                out.append(f"complete -c winvm -n {seen} -a '(winvm __names {act.names})'")
     print("\n".join(out))
 
 
@@ -676,7 +713,24 @@ def fish_opt(cond: str, act, q) -> str:
     longs = [o[2:] for o in act.option_strings if o.startswith("--")]
     shorts = [o[1:] for o in act.option_strings if not o.startswith("--")]
     flags = " ".join([*(f"-l {x}" for x in longs), *(f"-s {x}" for x in shorts)])
-    return f"complete -c winvm -n {cond} {flags}{' -r' if act.nargs != 0 else ''} -d '{q(act.help)}'"
+    names = f" -a '(winvm __names {act.names})'" if getattr(act, "names", None) else ""
+    takes = "" if act.nargs == 0 else " -x" if getattr(act, "names", None) == "instances" else " -r"  # -x: no files
+    return f"complete -c winvm -n {cond} {flags}{takes}{names} -d '{q(act.help)}'"
+
+
+def complete_names(kind: str) -> int:
+    """`winvm __names instances|images`: for shell completion - quiet, never fails."""
+    try:
+        cfg = Config()
+        store = Store(cfg)
+        if kind == "instances":
+            names = [d.parent.name for d in store.disks()]
+        else:
+            names = sorted(set(cfg.images) | {f.stem.split("@")[0] for f in store.all()})
+        print("\n".join(names))
+    except Exception:                                          # noqa: BLE001 - a broken config: no names
+        pass
+    return 0
 
 
 cmd_completion.no_config = True
@@ -692,7 +746,7 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
         epilog="quick start:  winvm up   then   winvm sh      (winvm check: what the host has)")
     p.add_argument("-f", "--file", metavar="YAML",
                    help="machine settings (default: $WINVM_CONFIG, ~/.config/winvm/winvm.yaml)")
-    p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: main)")
+    p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: main)").names = "instances"
     p.add_argument("--data-dir", metavar="DIR",
                    help="images and instances (default: $WINVM_DATA_DIR, settings.data_dir)")
     p.add_argument("--cache-dir", metavar="DIR",
@@ -706,7 +760,9 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
         sp_ = sub.add_parser(name, aliases=aliases, help=doc.splitlines()[0], description=doc,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
         for flags, kw in args:
-            sp_.add_argument(*flags, **kw)
+            kw = dict(kw)
+            names = kw.pop("names", None)
+            sp_.add_argument(*flags, **kw).names = names
         sp_.set_defaults(fn=fn)
         subs.append(([name, *aliases], sp_))
     return p, subs
@@ -714,6 +770,8 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["__names"]:                                # (hidden) for shell completion
+        return complete_names(argv[1] if len(argv) > 1 else "")
     p, _ = parser()
 
     # raw commands get everything after their name untouched (PowerShell, ssh, scp arguments)

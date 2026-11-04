@@ -50,7 +50,9 @@ uv tool install .            # or: pipx install .   or: pip install --user .
 winvm check                  # what the host has, what will be downloaded
 ```
 
-Shell completion (generated from winvm's own commands; rerun after updates):
+Shell completion: commands and options come from winvm's own definitions (rerun after
+updates); instance and image names (`-i`, `stop`, `--image`, `rmi`, `reset`, ...) are looked
+up live when you press Tab:
 
 ```sh
 winvm completion bash > ~/.local/share/bash-completion/completions/winvm
