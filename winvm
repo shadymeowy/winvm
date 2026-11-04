@@ -364,13 +364,13 @@ class VM:
 
     # --- lifecycle
     def start(self, gui=False, on: str | None = None) -> None:
+        if on and self.disk.exists() and parent(self.disk) != on:
+            die(f"{self.name} is built on '{parent(self.disk)}' - ./winvm -i {self.name} reset {on} to switch")
         if self.alive:
             return log(f"{self.name} already running (pid {self.pid})")
         need(C.QEMU)
         if not self.disk.exists():
             self.reset(on or "base")
-        elif on and parent(self.disk) != on:
-            die(f"{self.name} is built on '{parent(self.disk)}' - ./winvm -i {self.name} reset {on} to switch")
         if not (self.dir / "OVMF_VARS.fd").exists():
             self.fresh_vars()
         ram = mib(C.RAM)
@@ -388,6 +388,7 @@ class VM:
             time.sleep(0.1)
         else:
             die(f"QEMU failed to start (see {self.dir}/qemu.log)")
+        self.ssh_config()                                      # for `Include run/*/ssh_config`
         st = self.state
         log(f"started {self.name} (pid {self.pid}) ssh=127.0.0.1:{st['ssh']}"
             + (f" rdp=127.0.0.1:{st['rdp']}" if st.get("rdp") else "")
@@ -1007,8 +1008,7 @@ def cmd_gui(a):
 @command(arg("args", nargs="*", metavar="FREERDP_ARG"), raw=True)
 def cmd_rdp(a):
     """RDP session with FreeRDP: dynamic resolution, clipboard, share as a drive"""
-    vm = current(a)
-    vm.start()
+    vm = current(a).up()                                       # booted = SSH answers
     port = vm.state.get("rdp") or die("RDP_PORT is empty")
     for x in ("xfreerdp3", "xfreerdp", "sdl-freerdp3"):
         if shutil.which(x):
