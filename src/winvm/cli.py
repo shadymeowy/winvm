@@ -494,7 +494,7 @@ def cmd_check(a):
     row("UEFI (OVMF)", True if fw else None, fw[0] if fw else "downloaded from Debian when needed (6 MB)")
     print("optional")
     smbd = vm_smbd()
-    row("Samba", True if smbd else None, smbd or "for mounts (C:\\mnt) - " + host.install_hint())
+    row("Samba", True if smbd else None, smbd or "only for mounts (C:\\mnt): install the samba package")
     print("downloads")
     isos, win = cfg.linked_isos(), cfg.s.get("windows")
     row("Windows ISO", True if isos else None,
