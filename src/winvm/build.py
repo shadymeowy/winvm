@@ -10,7 +10,7 @@ ISO images (offline, unattended), from Microsoft's own, unmodified ISO:
      OpenSSH, your setup steps, cleanup; one more boot, power off
   3. the disk becomes a compressed read-only layer
   With `slim: true` the debloated image is captured once onto a disk kept in
-  cache/slim; later builds apply it directly, in about half the time.
+  cache/slim; later builds apply it directly and skip the debloat.
 
 Images `from` another image: boot a scratch VM on the image below (with network), run
 the steps over SSH, shut it down and keep its changes as a compressed layer.
@@ -356,7 +356,9 @@ def build_overlay(cfg: Config, name: str, gui=False) -> None:
             elif kind == "copy":
                 src = Path(arg[0])
                 dst = arg[1] if len(arg) > 1 else f"{WORK}\\{src.name}"
-                call(inst, f"New-Item -ItemType Directory -Force (Split-Path {guest.quote(dst)}) | Out-Null")
+                # the parent must exist for scp (a drive root like C:\ always does)
+                call(inst, f"$p = Split-Path {guest.quote(dst)}; if ($p -and -not (Test-Path -LiteralPath $p)) "
+                           "{ New-Item -ItemType Directory -Force -Path $p | Out-Null }")
                 scp(inst, src, dst)
             elif kind == "restart":
                 stop_clean(inst)

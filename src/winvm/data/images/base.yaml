@@ -17,8 +17,8 @@ timezone: W. Europe Standard Time
 locale: en-US
 keyboard: "0409:00000409"        # e.g. "041f:0000041f" = Turkish Q
 disk_size: 64G                   # virtual; qcow2 only stores what is used
-slim: false                      # true: keep the debloated image in the cache: rebuilds take
-                                 # about half the time (the first build takes a bit longer)
+slim: false                      # true: keep the debloated image in the cache (~6 GB): rebuilds
+                                 # take a fraction of the time (the first build a bit longer)
 debloat:
   strip_payloads: true           # drop payloads of disabled features (re-enabling needs media)
   compact_os: false              # CompactOS in the guest; false = raw, qcow2's zstd compresses better

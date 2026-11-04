@@ -301,13 +301,13 @@ host, so only the relations are worth remembering:
 
 * **First build** of `base`: up to about an hour, plus downloading about 8.6 GB.
   A `slim` image's first build captures the debloated image too and takes a bit
-  longer; after that, rebuilds of it take roughly half the time.
+  longer; after that, rebuilds of it skip the debloat and take a fraction of the time.
 * **An image `from` another**: about a minute plus whatever its steps do.
 * **Daily use**: an instance boots to SSH in seconds; `winvm sh` commands return in
   well under a second.
 * **Disk**: the base layer is about 5.5 GB (Microsoft's ISO: 7-9 GB); a fresh
   instance disk is under 1 MB and grows with what you change; a cached slim image is
-  about 5 GB.
+  about 6 GB.
 * **RAM**: an idle headless guest uses about 1 GB inside, but Windows touches all of
   its RAM at boot, so the host gives it the full `ram`; `winvm balloon 2G` hands the
   rest back while it runs.
