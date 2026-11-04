@@ -9,28 +9,30 @@ import socket
 import subprocess as sp
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 NAME_RX = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _COLOR = sys.stderr.isatty()
 
 
-def _paint(code: str, s: str) -> str:
+def paint(code: str, s: str) -> str:
+    """ANSI color for stderr, if it is a terminal."""
     return f"\033[{code}m{s}\033[0m" if _COLOR else s
 
 
 def log(msg: str) -> None:
-    print(_paint("1;32", "==>"), msg, file=sys.stderr, flush=True)
+    print(paint("1;32", "==>"), msg, file=sys.stderr, flush=True)
 
 
 def warn(msg: str) -> None:
-    print(_paint("1;33", "warn:"), msg, file=sys.stderr, flush=True)
+    print(paint("1;33", "warn:"), msg, file=sys.stderr, flush=True)
 
 
 class Fatal(Exception):
     """A user-facing error; the CLI prints it and exits 1."""
 
 
-def die(msg: str):
+def die(msg: str) -> NoReturn:
     raise Fatal(msg)
 
 
@@ -39,7 +41,10 @@ def run(*cmd, check=True, quiet=False, **kw) -> sp.CompletedProcess:
     cmd = [str(c) for c in cmd]
     if quiet:
         kw.setdefault("stdout", sp.DEVNULL)
-    r = sp.run(cmd, **kw)
+    try:
+        r = sp.run(cmd, **kw)
+    except FileNotFoundError:
+        die(f"{cmd[0]} not found (see README: host packages)")
     if check and r.returncode:
         die(f"{Path(cmd[0]).name} failed (exit {r.returncode}): {' '.join(cmd[1:])[:300]}")
     return r
@@ -55,8 +60,10 @@ def need(*tools: str) -> None:
         die(f"missing tools: {' '.join(missing)} (see README: host packages)")
 
 
-def valid(name: str) -> str:
-    return name if NAME_RX.fullmatch(name or "") else die(f"bad name '{name}' (letters, digits, . _ -)")
+def valid(name) -> str:
+    """An image / instance / mount name, safe in file names (YAML keys may be numbers)."""
+    name = "" if name is None else str(name)
+    return name if NAME_RX.fullmatch(name) else die(f"bad name '{name}' (letters, digits, . _ -)")
 
 
 # ------------------------------------------------------------------ sizes
@@ -64,9 +71,12 @@ def valid(name: str) -> str:
 def mib(size) -> int:
     """4G / 4096M / 4096 (MiB) -> MiB"""
     s = str(size).strip().upper().removesuffix("B").removesuffix("I")
-    if s.endswith("G"):
-        return int(float(s[:-1]) * 1024)
-    return int(float(s.removesuffix("M")))
+    try:
+        if s.endswith("G"):
+            return int(float(s[:-1]) * 1024)
+        return int(float(s.removesuffix("M")))
+    except ValueError:
+        die(f"bad size '{size}' (e.g. 4G, 512M)")
 
 
 def human(n: float) -> str:
@@ -144,18 +154,27 @@ class Chan:
             die(f"{path.name} missing - is the instance running?")
         self.sock = socket.socket(socket.AF_UNIX)
         self.sock.settimeout(30)
-        self.sock.connect(str(path))
+        try:
+            self.sock.connect(str(path))
+        except OSError as e:                                   # a socket left by a QEMU that died
+            die(f"{path.name}: {e} - is the instance running?")
         self.f = self.sock.makefile("rw", encoding="utf-8")
         if qmp:
-            self.f.readline()                                  # greeting
+            self._read("greeting")
             self("qmp_capabilities")
+
+    def _read(self, cmd: str) -> dict:
+        try:
+            line = self.f.readline()
+        except OSError as e:                                   # e.g. no guest agent: timeout
+            die(f"{cmd}: {e}")
+        return json.loads(line) if line else die(f"{cmd}: connection closed")
 
     def __call__(self, cmd: str, args: dict | None = None):
         self.f.write(json.dumps({"execute": cmd, **({"arguments": args} if args else {})}) + "\n")
         self.f.flush()
         while True:                                            # skip async events
-            line = self.f.readline() or die(f"{cmd}: connection closed")
-            msg = json.loads(line)
+            msg = self._read(cmd)
             if "error" in msg:
                 die(f"{cmd}: {msg['error'].get('desc', msg['error'])}")
             if "return" in msg:

@@ -23,6 +23,7 @@ class Store:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.dir = cfg.data / "images"
+        self._parents: dict[Path, tuple[int, Path | None]] = {}   # qemu-img info is slow-ish
 
     def file(self, name: str, h: str) -> Path:
         return self.dir / f"{name}@{h[:12]}.qcow2"
@@ -50,21 +51,19 @@ class Store:
         return next(iter(self.versions(name)), None)
 
     def require(self, name: str) -> Path:
+        if name not in self.cfg.images:
+            return self.current(name) or die(f"no image '{name}' in the config or built (winvm images)")
         return self.current(name) or die(f"image '{name}' is not built - winvm build {name}")
 
     # --- backing chains
     def parent(self, img: Path) -> Path | None:
-        info = json.loads(output(self.cfg.s["qemu_img"], "info", "-U", "--output=json", img))
-        b = info.get("backing-filename")
-        return (img.parent / b).resolve() if b else None
-
-    def chain(self, img: Path) -> list[Path]:
-        """Layers below an image file, nearest first."""
-        out = []
-        while p := self.parent(img):
-            out.append(p)
-            img = p
-        return out
+        """The layer below an image or disk (None for a bottom layer)."""
+        mtime = img.stat().st_mtime_ns if img.exists() else die(f"missing: {img}")
+        if self._parents.get(img, (None,))[0] != mtime:
+            info = json.loads(output(self.cfg.s["qemu_img"], "info", "-U", "--output=json", img))
+            b = info.get("backing-filename")
+            self._parents[img] = (mtime, (img.parent / b).resolve() if b else None)
+        return self._parents[img][1]
 
     def disks(self) -> list[Path]:
         """Instance disks (not builders)."""
@@ -91,8 +90,11 @@ class Store:
         self.dir.mkdir(parents=True, exist_ok=True)
         zstd = ["-c", "-o", "compression_type=zstd"] if self.cfg.s.get("compress", True) else []
         back = ["-B", below.name, "-F", "qcow2"] if below else []   # relative: same folder
-        run(self.cfg.s["qemu_img"], "convert", "-p", "-O", "qcow2", *zstd, *back, src, tmp)
-        tmp.replace(dst)
+        try:
+            run(self.cfg.s["qemu_img"], "convert", "-p", "-O", "qcow2", *zstd, *back, src, tmp)
+            tmp.replace(dst)
+        finally:
+            tmp.unlink(missing_ok=True)                        # left only by a failed convert
         dst.chmod(0o444)
         dst.with_suffix(".json").write_text(json.dumps(
             {"name": name, "hash": h, "from": below and label(below),

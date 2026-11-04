@@ -29,11 +29,11 @@ def encoded(script: str) -> str:
 
 
 def command_line(words: list[str]) -> str:
-    """`winvm sh` words -> one PowerShell line: a single word is code as is; otherwise words
-    containing whitespace are quoted so they stay one argument."""
+    """`winvm sh` words -> one PowerShell line: a single word is code as is; otherwise empty
+    words and words containing whitespace are quoted so they stay one argument."""
     if len(words) == 1:
         return words[0]
-    return " ".join(quote(w) if any(c.isspace() for c in w) else w for w in words)
+    return " ".join(quote(w) if not w or any(c.isspace() for c in w) else w for w in words)
 
 
 def script(line: str, cwd: str | None = None, strict=False) -> str:

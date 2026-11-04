@@ -15,6 +15,7 @@ the steps over SSH, shut it down and keep its changes as a compressed layer.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import shutil
@@ -27,7 +28,7 @@ from . import __version__, guest
 from .config import GUEST, Config
 from .store import Store, label
 from .util import die, dos, download, log, mib, need, run, warn
-from .vm import Instance, need_mem, running
+from .vm import Instance, need_mem, ovmf, running
 
 # virtio driver folders injected into Windows (w11/amd64 flavour)
 VIRTIO_DRIVERS = "vioscsi viostor NetKVM Balloon vioserial viorng vioinput pvpanic fwcfg viogpudo".split()
@@ -77,7 +78,6 @@ def build_iso(cfg: Config, name: str, gui=False) -> None:
         esd = slim_image(cfg, name, inst, tools)
         stage(cfg, name, tree, tools, "install")
         log(f"applying the cached slim image {esd.name}")
-        (tree / "sources").mkdir(exist_ok=True)
         link_or_copy(esd, tree / "sources/install.esd")
         write_config_cmd(cfg, name, tree, "install", preserviced=True)
         cdroms = [make_iso(tree, inst.home / "install.iso", "WINSLIM_FULL")]
@@ -98,9 +98,10 @@ def build_iso(cfg: Config, name: str, gui=False) -> None:
         # firstlogon deletes WebView2, but the shell keeps a few files locked; finish offline
         log("removing WebView2 leftovers offline (libguestfs)")
         r = run("guestfish", "--rw", "-a", inst.disk, "-i", check=False, text=True, stdout=sp.DEVNULL,
-                stderr=sp.DEVNULL, input='-rm-rf "/Program Files (x86)/Microsoft/EdgeWebView"\n-fstrim /\n')
-        if r.returncode:
-            warn("guestfish failed - leftovers kept")
+                stderr=sp.PIPE, input='-rm-rf "/Program Files (x86)/Microsoft/EdgeWebView"\n-fstrim /\n')
+        if r.returncode:   # e.g. too little RAM for libguestfs' helper VM: the image is just bigger
+            first = (r.stderr.strip().splitlines() or ["?"])[0]
+            warn(f"guestfish failed, WebView2 leftovers kept (~1 GB): {first}")
     log(f"writing image layer {name}@{h[:12]}")
     store.add(name, h, inst.disk, None, user=img["user"], password=img["password"])
     shutil.rmtree(inst.home)
@@ -110,11 +111,14 @@ def build_iso(cfg: Config, name: str, gui=False) -> None:
 def slim_image(cfg: Config, name: str, inst: Instance, tools: dict) -> Path:
     """The captured, debloated install image for this ISO/edition/debloat set, built once:
     capture VM (~30 min) -> install.wim -> solid LZMS install.esd (~30 min, low RAM)."""
-    key = cfg.slim_key(name)[:16]
-    esd = cfg.cache / "slim" / f"{key}.esd"
-    if esd.exists():
-        return esd
+    esd = cfg.cache / "slim" / f"{cfg.slim_key(name)[:16]}.esd"
     esd.parent.mkdir(parents=True, exist_ok=True)
+    with open(esd.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)                       # data dirs share it: one maker at a time
+        return esd if esd.exists() else make_slim(cfg, name, inst, tools, esd)
+
+
+def make_slim(cfg: Config, name: str, inst: Instance, tools: dict, esd: Path) -> Path:
     wim = esd.with_suffix(".wim")
     if not wim.exists():                                       # kept if only the export was interrupted
         need("guestfish")
@@ -129,22 +133,26 @@ def slim_image(cfg: Config, name: str, inst: Instance, tools: dict) -> Path:
         cap_inst.disk = cap
         run_installer(cap_inst, [iso, cfg.iso(name)])
         log("pulling the captured image off the capture disk")
+        part = wim.with_name(wim.name + ".part")
         r = run("guestfish", "--ro", "-a", cap, "run", ":", "mount", "/dev/sda4", "/", ":",
                 "download", "/WINSLIM-CAPTURE-DONE", "/dev/null", ":",
-                "download", "/install.wim", wim.with_suffix(".part"), check=False, stderr=sp.DEVNULL)
+                "download", "/install.wim", part, check=False, stderr=sp.DEVNULL)
         if r.returncode:
+            part.unlink(missing_ok=True)
             die(f"capture failed - see {cap_inst.dir}/serial.log; disk kept at {cap}")
-        wim.with_suffix(".part").replace(wim)
+        part.replace(wim)
         cap.unlink()
         iso.unlink()
-    if running(cfg):
-        die("a VM is running - stop it before the slim export (both need lots of RAM)")
+    if vms := running(cfg):
+        die(f"stop {', '.join(vm.name for vm in vms)} before the slim export (both need lots of RAM)")
     threads = int(cfg.s.get("wimlib_threads") or 2)
     need_mem(cfg, threads * 1024, f"solid LZMS export with {threads} threads")
     log(f"compressing the slim image (wimlib, solid LZMS, {threads} threads; slow but light)")
-    tmp = esd.with_suffix(".part")
+    tmp = esd.with_name(esd.name + ".part")
+    tmp.unlink(missing_ok=True)                                # export would add to an existing file
     run("wimlib-imagex", "export", wim, "1", tmp, "--solid", f"--threads={threads}")
     if tmp.stat().st_size >= 4 << 30:
+        tmp.unlink()
         die("the slim image is over 4 GiB (ISO9660 limit) - debloat more")
     tmp.replace(esd)
     wim.unlink()
@@ -154,6 +162,8 @@ def slim_image(cfg: Config, name: str, inst: Instance, tools: dict) -> Path:
 def export_iso(cfg: Config, name: str, out: Path) -> None:
     """A standalone installer ISO of an ISO image: its slim image + payload. Booting it wipes
     disk 0 without asking (it refuses to run outside QEMU)."""
+    if "from" in cfg.image(name):
+        die(f"'{name}' is built from another image; `winvm iso` takes an image with `iso`")
     need("7z", "wimlib-imagex", "xorriso")
     inst = Instance(cfg, f"_install-{name}", builder=True)
     inst.require_stopped()
@@ -186,13 +196,13 @@ def list_file(name: str) -> str:
 def write_config_cmd(cfg: Config, name: str, tree: Path, mode: str, preserviced=False) -> None:
     """winslim/config.cmd: the knobs pe.cmd reads."""
     img = cfg.image(name)
-    flag = lambda v: int(bool(v))
+    debloat = img.get("debloat") or {}
     knobs = {"WIN_EDITION": img.get("edition") or "",
              "WIN_INDEX": 1 if preserviced else img.get("index") or "",
-             "WIN_STRIP_PAYLOADS": flag(img["debloat"].get("strip_payloads")),
-             "WIN_COMPACT": flag(img["debloat"].get("compact_os")),
-             "WINSLIM_MODE": mode, "WIN_PRESERVICED": flag(preserviced),
-             "WINSLIM_DEBUG": flag(os.environ.get("WINVM_DEBUG") == "1"),
+             "WIN_STRIP_PAYLOADS": int(bool(debloat.get("strip_payloads"))),
+             "WIN_COMPACT": int(bool(debloat.get("compact_os"))),
+             "WINSLIM_MODE": mode, "WIN_PRESERVICED": int(preserviced),
+             "WINSLIM_DEBUG": int(os.environ.get("WINVM_DEBUG") == "1"),
              "WINSLIM_BUILD": f"winvm-{__version__}-{name}-{time.strftime('%Y%m%d')}"}
     (tree / "winslim/config.cmd").write_bytes(dos("".join(f'set "{k}={v}"\n' for k, v in knobs.items())))
 
@@ -254,32 +264,40 @@ def stage(cfg: Config, name: str, tree: Path, tools: dict, mode: str) -> None:
         (pl / f).write_bytes(dos((GUEST / "payload" / f).read_text()))
     for f in ("appx-keep", "services-disable"):
         (pl / f"{f}.txt").write_bytes(dos(list_file(f)))
-    ps_bool = lambda v: "$true" if v else "$false"
+    debloat = img.get("debloat") or {}
     (pl / "settings.ps1").write_bytes(dos(
-        f"$WinUser = {guest.quote(img['user'])}\n$WinCompact = {ps_bool(img['debloat'].get('compact_os'))}\n"
-        f"$RemoveWebView = {ps_bool(img['debloat'].get('remove_webview'))}\n"))
+        f"$WinUser = {guest.quote(img['user'])}\n$WinCompact = {ps_bool(debloat.get('compact_os'))}\n"
+        f"$RemoveWebView = {ps_bool(debloat.get('remove_webview'))}\n"))
     shutil.copy(vio / "virtio-win-guest-tools.exe", pl)
     shutil.copy(vio / "cert/Virtio_Win_Red_Hat_CA.cer", pl / "virtio-ca.cer")
     shutil.copy(tools["openssh"], pl / "OpenSSH.msi")
     (pl / "authorized_keys").write_bytes(dos(cfg.authorized_keys()))
     shutil.rmtree(scratch)
-    stage_setup(cfg, name, pl / "extra")
+    if mode == "install":                                      # a capture stops before the payload
+        stage_setup(cfg, name, pl / "extra")
+
+
+def ps_bool(v) -> str:
+    return "$true" if v else "$false"
 
 
 def stage_setup(cfg: Config, name: str, extra: Path) -> None:
-    """`setup` steps -> payload/extra: their files plus setup.ps1, which setupcomplete.ps1 runs
-    as SYSTEM after the debloat (a failing step fails the build)."""
+    """`setup` steps -> payload/extra: setup.ps1, which setupcomplete.ps1 runs as SYSTEM after
+    the debloat (a failing step fails the build), and the files the steps use in extra/files,
+    where the steps run."""
     steps = cfg.steps(name)
     if not steps:
         return
-    extra.mkdir(parents=True)
-    ps = ["$ErrorActionPreference = 'Stop'"]
+    files = extra / "files"
+    files.mkdir(parents=True)
+    ps = ["$ErrorActionPreference = 'Stop'", "Set-Location -LiteralPath (Join-Path $PSScriptRoot files)"]
     for i, st in enumerate(steps, 1):
-        if "download" in st:
-            shutil.copy(fetch_step(cfg, st), extra / st["download"]["name"])
-        elif "copy" in st:
-            src = Path(st["copy"][0])
-            (shutil.copytree if src.is_dir() else shutil.copy)(src, extra / src.name)
+        if "run" not in st:
+            src = fetch_step(cfg, st) if "download" in st else Path(st["copy"][0])
+            dst = files / (st["download"]["name"] if "download" in st else src.name)
+            if dst.exists():
+                die(f"image '{name}' setup step {i}: a file named {dst.name} is already staged")
+            (shutil.copytree if src.is_dir() else shutil.copy)(src, dst)
         else:
             ps += [f"# step {i}", "$global:LASTEXITCODE = 0", st["run"],
                    f"if ($LASTEXITCODE) {{ throw \"setup step {i} exited with $LASTEXITCODE\" }}"]
@@ -301,7 +319,6 @@ def make_iso(tree: Path, out: Path, vol: str) -> Path:
 def run_installer(inst: Instance, cdroms: list[Path], gui=False) -> str:
     """Boot an offline installer VM, stream its [PE]/[SC]/[FL]/[WIN] progress lines from the
     serial log until QEMU exits, and return the whole log."""
-    from .vm import ovmf
     shutil.copyfile(ovmf(inst.cfg)[1], inst.vars)
     inst.claim(mib(inst.settings["ram"]))
     serial = inst.dir / "serial.log"
@@ -309,7 +326,7 @@ def run_installer(inst: Instance, cdroms: list[Path], gui=False) -> str:
     if not gui and inst.state.get("vnc"):
         log(f"watch it: vncviewer 127.0.0.1:{inst.state['vnc']}  (serial log: {serial})")
     t0 = time.time()
-    qemu = sp.Popen(inst.qemu_argv(install=True, gui=gui, cdroms=cdroms) + ["-pidfile", str(inst.pidfile)])
+    qemu = sp.Popen([*inst.qemu_argv(install=True, gui=gui, cdroms=cdroms), "-pidfile", str(inst.pidfile)])
     buf = b""
     try:
         with serial.open("rb") as f:
@@ -364,12 +381,12 @@ def build_overlay(cfg: Config, name: str, gui=False) -> None:
                 call(inst, f"New-Item -ItemType Directory -Force (Split-Path {guest.quote(dst)}) | Out-Null")
                 scp(inst, src, dst)
             elif kind == "restart":
-                inst.stop()
+                stop_clean(inst)
                 inst.start(gui=gui)
         # leave nothing behind, and hand freed blocks back so the layer stays small
         call(inst, f"Remove-Item -LiteralPath {guest.quote(WORK)} -Recurse -Force; "
                    "Optimize-Volume -DriveLetter C -ReTrim -ErrorAction SilentlyContinue | Out-Null")
-        inst.stop()
+        stop_clean(inst)
         log(f"writing image layer {name}@{h[:12]}")
         meta = store.meta(below)
         store.add(name, h, inst.disk, below, user=meta.get("user"), password=meta.get("password"))
@@ -378,6 +395,12 @@ def build_overlay(cfg: Config, name: str, gui=False) -> None:
             inst.kill()
         shutil.rmtree(inst.home, ignore_errors=True)
         shutil.rmtree(inst.dir, ignore_errors=True)
+
+
+def stop_clean(inst: Instance) -> None:
+    """Shut the build VM down; a disk it had to be killed on is not worth keeping."""
+    if not inst.stop():
+        die(f"{inst.name} did not shut down by itself - build aborted")
 
 
 def describe(st: dict) -> str:

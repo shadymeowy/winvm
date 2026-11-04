@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +9,6 @@ description = "Build and run slim, unattended Windows VMs on QEMU/KVM from one Y
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6"]
-license = "MIT"
 keywords = ["windows", "qemu", "kvm", "vm", "unattended", "debloat"]
 classifiers = [
     "Environment :: Console",

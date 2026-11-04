@@ -12,11 +12,13 @@ import sys
 import time
 from pathlib import Path
 
+import yaml
+
 from . import __version__, guest
 from .build import build, export_iso, fetch_step, fetch_tools
 from .config import DEFAULT_FILE, Config, sha
 from .store import Store, label
-from .util import Chan, Fatal, die, du, log, mib, need, output, run, valid, warn
+from .util import Chan, Fatal, die, du, log, mib, need, output, paint, run, valid, warn
 from .vm import Instance, ports, running
 
 COMMANDS: dict[str, tuple] = {}
@@ -41,7 +43,7 @@ def command(*args, raw=False, aliases=()):
 def inst(a) -> Instance:
     """The -i instance; build VMs (_install-X, _build-X) can be named for debugging."""
     name = a.instance
-    builder = name.startswith("_") and (a.cfg.cache / "build" / name).is_dir()
+    builder = name.startswith("_") and (a.cfg.build / name).is_dir()
     return Instance(a.cfg, name if builder else valid(name), builder=builder)
 
 
@@ -55,6 +57,8 @@ def link_iso(cfg: Config, iso: str) -> None:
     dst = cfg.data / "iso" / src.name
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.resolve() != src:
+        if dst.exists() and not dst.is_symlink():
+            die(f"{dst} is another file with that name - move it away or rename the ISO")
         dst.unlink(missing_ok=True)
         dst.symlink_to(src)
         log(f"using {src} (linked as {dst})")
@@ -67,12 +71,11 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None) -> None:
     if vm.disk.exists():
         if image and image != vm.image:
             warn(f"{vm.name} runs on '{vm.image}' - winvm -i {vm.name} reset {image} to switch")
-        cur = store.current(vm.image) if vm.image in cfg.images else None
-        if vm.image in cfg.images and cur != store.parent(vm.disk):
+        if outdated(cfg, store, vm, store.parent(vm.disk)):
             warn(f"{vm.name} runs on an older version of '{vm.image}' - "
                  f"winvm -i {vm.name} reset to update it (discards its changes)")
         return
-    image = image or vm.settings["image"]
+    image = valid(image or vm.settings["image"])
     if image in cfg.images:
         build(cfg, [image])
     vm.create(image, store.require(image))
@@ -89,7 +92,7 @@ def cmd_up(a):
     cfg = a.cfg
     if a.iso:
         link_iso(cfg, a.iso)
-    names = list(cfg.instances) if a.all else [valid(n) for n in a.names] or [a.instance]
+    names = list(cfg.instances) if a.all else [valid(n) for n in a.names or [a.instance]]
     for n in names:
         vm = Instance(cfg, n)
         ensure_disk(cfg, vm, a.image)
@@ -110,8 +113,8 @@ def cmd_stop(a):
 @command()
 def cmd_kill(a):
     """hard power-off"""
-    inst(a).kill()
-    log("killed")
+    vm = inst(a)
+    log(f"killed {vm.name}" if vm.kill() else f"{vm.name} not running")
 
 
 @command(aliases=("status",))
@@ -123,18 +126,21 @@ def cmd_ps(a):
     for n in names:
         vm = Instance(cfg, n, builder=n.startswith("_"))
         st = vm.state if vm.alive else {}
-        col = lambda k: str(st[k]) if st.get(k) else "-"
+        ssh, rdp, vnc = (str(st.get(k) or "-") for k in ("ssh", "rdp", "vnc"))
         on = store.parent(vm.disk) if vm.disk.exists() else None
         image = (label(on) if on else "-") + ("  (outdated)" if on and outdated(cfg, store, vm, on) else "")
         mounts = ", ".join(vm.mounts) if st else ""
-        print(f"{n:<14} {'running' if st else 'stopped':<8} {col('ssh'):>5} {col('rdp'):>5} {col('vnc'):>5} "
+        print(f"{n:<14} {'running' if st else 'stopped':<8} {ssh:>5} {rdp:>5} {vnc:>5} "
               f"{du(vm.disk):>6}  {image}" + (f"   mounts: {mounts}" if mounts else ""))
 
 
-def outdated(cfg: Config, store: Store, vm: Instance, on: Path) -> bool:
+def outdated(cfg: Config, store: Store, vm: Instance, on: Path | None) -> bool:
+    """Is the instance's disk on an older version of its (config) image than the current one?"""
+    if vm.builder or vm.image not in cfg.images:
+        return False
     try:
-        return vm.image in cfg.images and store.current(vm.image) != on
-    except Fatal:
+        return store.current(vm.image) != on
+    except Fatal:                                              # e.g. a `copy` source is gone
         return False
 
 
@@ -171,11 +177,19 @@ def cmd_sh(a):
     return guest.tty(vm.ssh, script) if tty else guest.pipe(vm.ssh, script)
 
 
-@command(arg("args", nargs="*", metavar="SSH_ARG", help="extra ssh options, e.g. -L 8080:localhost:80"), raw=True)
+@command(arg("args", nargs="*", metavar="ARG", help="ssh options, then an optional remote command"), raw=True)
 def cmd_ssh(a):
-    """plain ssh to the instance (for port forwards and other ssh options)"""
+    """plain ssh to the instance, e.g. ssh -L 8080:localhost:80 -N  |  ssh hostname"""
     vm = inst(a).up()
-    os.execvp("ssh", ["ssh", "-F", str(vm.dir / "ssh_config"), *a.rest, vm.name])
+    opts, rest = [], list(a.rest)
+    while rest and rest[0].startswith("-"):                    # options go before the host name
+        o = rest.pop(0)
+        if o == "--":
+            break
+        opts.append(o)
+        if len(o) == 2 and o[1] in "BbcDEeFIiJLlmOoPpRSWw" and rest:   # ssh options taking a value
+            opts.append(rest.pop(0))
+    os.execvp("ssh", ["ssh", "-F", str(vm.dir / "ssh_config"), *opts, vm.name, *rest])
 
 
 @command(arg("paths", nargs="*", metavar="PATH", help="':' prefix = guest path"), raw=True)
@@ -226,8 +240,13 @@ def cmd_ga(a):
     agent = Chan(inst(a).dir / "qga.sock", qmp=False)
     cmd, *rest = a.rest or ["guest-ping"]
     if cmd != "exec":
-        return print(json.dumps(agent(cmd, json.loads(rest[0]) if rest else None), indent=1))
-    rest or die("usage: winvm ga exec PROGRAM [ARGS...]")
+        try:
+            args = json.loads(rest[0]) if rest else None
+        except ValueError as e:
+            die(f"arguments must be JSON, e.g. '{{\"path\": \"C:/x.txt\"}}': {e}")
+        return print(json.dumps(agent(cmd, args), indent=1))
+    if not rest:
+        die("usage: winvm ga exec PROGRAM [ARGS...]")
     pid = agent("guest-exec", {"path": rest[0], "arg": rest[1:], "capture-output": True})["pid"]
     while not (st := agent("guest-exec-status", {"pid": pid})).get("exited"):
         time.sleep(0.2)
@@ -271,12 +290,13 @@ def cmd_cmdline(a):
 def cmd_mount(a):
     """mount a host folder into the running instance, at C:\\mnt\\NAME"""
     vm = inst(a)
-    if not a.path:
-        for n, m in vm.mounts.items():
+    if not a.path:                                             # stopped: what the next start sets up
+        for n, m in (vm.mounts if vm.alive else a.cfg.mounts(vm.name)).items():
             print(f"C:\\mnt\\{n:<14} {m['path']}{'  (read-only)' if m['readonly'] else ''}")
         return
     path = Path(a.path).expanduser().resolve()
-    path.is_dir() or die(f"not a folder: {path}")
+    if not path.is_dir():
+        die(f"not a folder: {path}")
     name = valid(a.name or re.sub(r"[^A-Za-z0-9._-]", "_", path.name))
     vm.mount(name, path, a.ro)
     log(f"{path} -> {vm.name}:C:\\mnt\\{name}")
@@ -306,11 +326,11 @@ def cmd_images(a):
     """list images: config + built versions, size, what each builds on, who uses it"""
     cfg, store = a.cfg, Store(a.cfg)
     print(f"{'IMAGE':<22} {'STATUS':<10} {'SIZE':>6}  {'ON':<22} USED BY")
-    shown = set()
     for name in list(cfg.images) + sorted({store.meta(f)["name"] for f in store.all()} - set(cfg.images)):
         try:
             cur = store.current(name)
-        except Fatal:
+        except Fatal as e:                                     # no ISO, a `copy` source gone, ...
+            warn(str(e))
             cur = None
         versions = store.versions(name)
         if name in cfg.images and not cur:
@@ -321,7 +341,6 @@ def cmd_images(a):
             status = "saved" if meta.get("saved") else "current" if f == cur else "old"
             print(f"{label(f):<22} {status:<10} {du(f):>6}  {meta.get('from') or 'iso':<22} "
                   f"{' '.join(store.users(f))}")
-            shown.add(f)
 
 
 @command(arg("--cache", action="store_true", help="also the download and slim-image cache"))
@@ -331,10 +350,11 @@ def cmd_prune(a):
     keep = set()
     for name in cfg.images:
         try:
-            if f := store.current(name):
-                keep.add(f)
-        except Fatal:
-            pass
+            keep.add(store.current(name))
+        except Fatal as e:                                     # can't tell which version is current
+            if newest := store.versions(name)[:1]:
+                warn(f"{e} - keeping {label(newest[0])}")
+                keep.update(newest)
     keep |= {f for f in store.all() if store.meta(f).get("saved")}
     removed = True
     while removed:                                             # removing a layer may free the one below
@@ -345,8 +365,8 @@ def cmd_prune(a):
                 store.remove(f)
                 removed = True
     live = {vm.name for vm in running(cfg)}
-    for d in (cfg.cache / "build").glob("*/"):
-        if d.name not in live:
+    for d in cfg.build.glob("*"):
+        if d.is_dir() and d.name not in live:
             shutil.rmtree(d)
     if a.cache:
         for d in ("downloads", "slim"):
@@ -402,6 +422,8 @@ def cmd_rm(a):
     """delete the instance: its disk (unsaved changes!) and run folder"""
     vm = inst(a)
     vm.require_stopped()
+    if not (vm.home.exists() or vm.dir.exists()):
+        die(f"no instance '{vm.name}' (winvm ps)")
     shutil.rmtree(vm.home, ignore_errors=True)
     shutil.rmtree(vm.dir, ignore_errors=True)
     log(f"removed instance {vm.name}")
@@ -419,7 +441,8 @@ def cmd_iso(a):
 def cmd_editions(a):
     """list the editions inside an image's Windows ISO"""
     need("7z", "wimlib-imagex")
-    iso, tmp = a.cfg.iso(valid(a.image)), a.cfg.cache / "build/editions"
+    root = a.cfg.chain(valid(a.image))[0]                     # the ISO image a `from` image is built on
+    iso, tmp = a.cfg.iso(root), a.cfg.cache / "build/editions"
     shutil.rmtree(tmp, ignore_errors=True)
     image = "sources/install.wim" if "install.wim" in output("7z", "l", iso, "sources/install.*") \
         else "sources/install.esd"
@@ -451,7 +474,6 @@ def cmd_config(a):
     if a.what == "dump":
         sys.stdout.write(DEFAULT_FILE.read_text())
     elif a.what == "show":
-        import yaml
         print(yaml.safe_dump(cfg.raw, sort_keys=False, width=120), end="")
     else:
         print(f"config:  {cfg.file or '(none - built-in defaults: winvm config dump)'}")
@@ -466,10 +488,13 @@ def main(argv: list[str] | None = None) -> int:
         prog="winvm", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Build and run slim, unattended Windows VMs on QEMU/KVM, from one YAML file.",
         epilog="quick start:  winvm up --iso ~/Downloads/Win11_*.iso   then   winvm sh")
-    p.add_argument("-f", "--file", metavar="YAML", help="config file (default: ./winvm.yaml, ~/.config/winvm/winvm.yaml)")
+    p.add_argument("-f", "--file", metavar="YAML",
+                   help="config file (default: $WINVM_CONFIG, ./winvm.yaml, ~/.config/winvm/winvm.yaml)")
     p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: the first configured)")
-    p.add_argument("--data-dir", metavar="DIR", help="images and instances (default: ~/.local/share/winvm)")
-    p.add_argument("--cache-dir", metavar="DIR", help="downloads and build scratch (default: ~/.cache/winvm)")
+    p.add_argument("--data-dir", metavar="DIR",
+                   help="images and instances (default: $WINVM_DATA_DIR, settings.data_dir)")
+    p.add_argument("--cache-dir", metavar="DIR",
+                   help="downloads and build scratch (default: $WINVM_CACHE_DIR, settings.cache_dir)")
     p.add_argument("-V", "--version", action="version", version=f"winvm {__version__}")
     sub = p.add_subparsers(title="commands", metavar="<command>")
     for name, (fn, args, aliases) in COMMANDS.items():
@@ -484,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
     i = 0
     while i < len(argv) and argv[i].startswith("-"):
         i += 2 if argv[i] in ("-i", "--instance", "-f", "--file", "--data-dir", "--cache-dir") else 1
-    if i < len(argv) and argv[i] in RAW:
+    if i < len(argv) and argv[i] in RAW and argv[i + 1:] not in (["-h"], ["--help"]):
         a = p.parse_args(argv[: i + 1])
         a.rest = argv[i + 1:]
     else:
@@ -497,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
         a.instance = a.instance or default_instance(a.cfg)
         return a.fn(a) or 0
     except Fatal as e:
-        print(f"\033[1;31merror:\033[0m {e}" if sys.stderr.isatty() else f"error: {e}", file=sys.stderr)
+        print(paint("1;31", "error:"), e, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

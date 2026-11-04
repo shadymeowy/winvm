@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import signal
 import socket
@@ -33,12 +34,21 @@ SMB_HOST = "10.0.2.4"           # where the guest reaches the instance's Samba s
 
 
 def ovmf(cfg: Config) -> tuple[str, str]:
-    if cfg.s.get("ovmf_code") and cfg.s.get("ovmf_vars"):
-        return str(cfg.path(cfg.s["ovmf_code"])), str(cfg.path(cfg.s["ovmf_vars"]))
+    """UEFI firmware: (code, empty variable store)."""
+    code, vars_ = cfg.s.get("ovmf_code"), cfg.s.get("ovmf_vars")
+    if code or vars_:
+        if not (code and vars_):
+            die("set both settings.ovmf_code and settings.ovmf_vars (or neither: autodetect)")
+        return str(cfg.path(code)), str(cfg.path(vars_))
     for pair in OVMF_PAIRS:
         if all(Path(p).exists() for p in pair):
             return pair
     die("OVMF firmware not found (install edk2-ovmf, or set settings.ovmf_code/ovmf_vars)")
+
+
+def qfile(path) -> str:
+    """A path inside a QEMU option string (',' separates options there)."""
+    return str(path).replace(",", ",,")
 
 
 def smbd() -> str | None:
@@ -49,21 +59,23 @@ class Instance:
     def __init__(self, cfg: Config, name: str, builder=False):
         self.cfg, self.name, self.builder = cfg, name, builder
         # builders (image builds) are scratch VMs: their disk lives in the cache
-        self.home = (cfg.cache / "build" if builder else cfg.data / "instances") / name
+        self.home = (cfg.build if builder else cfg.data / "instances") / name
         self.disk = self.home / "disk.qcow2"
         self.vars = self.home / "OVMF_VARS.fd"
         self.dir = cfg.runtime / name
         self.pidfile = self.dir / "qemu.pid"
+        self.qemu_name = f"winvm-{name},process=winvm-{name}"  # QEMU's -name: identifies its process
 
     # --- state: pid from QEMU's pidfile; ports/RAM chosen at start in vm.json
     @property
     def pid(self) -> int | None:
         try:
             pid = int(self.pidfile.read_text())
-            os.kill(pid, 0)
-            return pid
+            # still this QEMU? (the pidfile of a killed QEMU may name another process by now)
+            cmdline = Path(f"/proc/{pid}/cmdline").read_text().split("\0")
         except (OSError, ValueError):
             return None
+        return pid if self.qemu_name in cmdline else None
 
     @property
     def alive(self) -> bool:
@@ -122,7 +134,7 @@ class Instance:
     # --- QEMU command line
     def qemu_argv(self, *, install=False, gui=False, cdroms=(), st: dict | None = None) -> list[str]:
         st, cfg = st or self.state, self.cfg
-        a = [cfg.s["qemu"], "-name", f"winvm-{self.name},process=winvm-{self.name}", "-enable-kvm",
+        a = [cfg.s["qemu"], "-name", self.qemu_name, "-enable-kvm",
              "-uuid", cfg.s["uuid"],
              # q35 + host CPU with Hyper-V enlightenments: what Windows runs fastest on
              "-machine", "q35,hpet=off,vmport=off", "-cpu", f"host,{HYPERV}",
@@ -130,12 +142,12 @@ class Instance:
              "-rtc", "base=utc,driftfix=slew", "-global", "kvm-pit.lost_tick_policy=delay",
              "-global", "ICH9-LPC.disable_s3=1", "-global", "ICH9-LPC.disable_s4=1",
              # UEFI: shared read-only firmware + this instance's variable store
-             "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf(cfg)[0]}",
-             "-drive", f"if=pflash,format=raw,file={self.vars}",
+             "-drive", f"if=pflash,format=raw,readonly=on,file={qfile(ovmf(cfg)[0])}",
+             "-drive", f"if=pflash,format=raw,file={qfile(self.vars)}",
              # disk on virtio-scsi; discard passes guest TRIM down so qcow2 files shrink.
              # cache=unsafe while installing: a host crash means reinstalling anyway
              "-device", "virtio-scsi-pci,id=scsi0",
-             "-drive", f"if=none,id=disk0,file={self.disk},format=qcow2,discard=unmap,detect-zeroes=unmap,"
+             "-drive", f"if=none,id=disk0,file={qfile(self.disk)},format=qcow2,discard=unmap,detect-zeroes=unmap,"
                        f"cache={'unsafe' if install else 'writeback'}",
              "-device", "scsi-hd,drive=disk0,bus=scsi0.0,rotation_rate=1,bootindex=0",
              # paravirtual devices: balloon (give RAM back), rng, absolute mouse, keyboard
@@ -161,7 +173,7 @@ class Instance:
                 net += f",guestfwd=tcp:{SMB_HOST}:445-cmd:{cmd}"
             a += ["-netdev", net, "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:57:53:4c"]
         for i, iso in enumerate(cdroms):                       # the first CD boots (disk is still empty)
-            a += ["-drive", f"if=none,id=cd{i},media=cdrom,readonly=on,file={iso}",
+            a += ["-drive", f"if=none,id=cd{i},media=cdrom,readonly=on,file={qfile(iso)}",
                   "-device", f"ide-cd,drive=cd{i},bus=ide.{i}" + (",bootindex=1" if i == 0 else "")]
         if gui:
             a += ["-display", "gtk,zoom-to-fit=on",           # + clipboard sharing via spice-vdagent
@@ -180,18 +192,18 @@ class Instance:
 
     def launch(self, argv: list[str], gui=False) -> None:
         """Start QEMU in the background and wait for its pidfile."""
-        argv = argv + ["-pidfile", str(self.pidfile)]
+        argv = [*argv, "-pidfile", str(self.pidfile)]
         if gui:
             with open(self.dir / "qemu.log", "w") as logf:
                 sp.Popen(argv, stdout=logf, stderr=sp.STDOUT, start_new_session=True)
         else:
-            run(*argv, "-daemonize")
+            run(*argv, "-daemonize")                            # its errors go to the terminal
         for _ in range(50):
             if self.alive:
                 break
             time.sleep(0.1)
         else:
-            die(f"QEMU failed to start (see {self.dir}/qemu.log)")
+            die("QEMU failed to start" + (f" (see {self.dir}/qemu.log)" if gui else ""))
 
     def start(self, gui=False, wait=True) -> None:
         """Boot the instance (its disk must exist); wait for SSH and set up the mounts."""
@@ -212,38 +224,50 @@ class Instance:
             if not self.builder:
                 self.sync_mounts()
 
-    def stop(self, timeout=120) -> None:
+    def stop(self, timeout=120) -> bool:
+        """ACPI shutdown, a hard kill after `timeout` s. False if it had to be killed."""
         if not self.alive:
-            return log(f"{self.name} not running")
+            log(f"{self.name} not running")
+            return True
         self.close_ssh()
         Chan(self.dir / "qmp.sock", qmp=True)("system_powerdown")      # ACPI power button
         for _ in range(timeout):
             if not self.alive:
-                return log(f"stopped {self.name}")
+                log(f"stopped {self.name}")
+                return True
             time.sleep(1)
         warn(f"{self.name} did not power off in time - killing")
         self.kill()
+        return False
 
-    def kill(self) -> None:
+    def kill(self) -> bool:
+        """Power off at once; False if it was not running."""
         self.close_ssh()
-        if pid := self.pid:
+        if not (pid := self.pid):
+            return False
+        try:
             os.kill(pid, signal.SIGTERM)
             for _ in range(50):
                 if not self.alive:
                     break
                 time.sleep(0.1)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:                             # gone in the meantime
+            pass
         self.pidfile.unlink(missing_ok=True)
+        return True
 
     # --- SSH
     def ssh_config(self) -> Path:
         st = self.state or die(f"{self.name} has never been started")
-        user = self.layer_meta().get("user") or self.cfg.raw["defaults"]["image"]["user"]
+        user = self.layer_meta().get("user") or self.cfg.image_defaults.get("user") or "user"
         cfg = self.dir / "ssh_config"
         cfg.write_text(f"""Host {self.name}
   HostName 127.0.0.1
   Port {st['ssh']}
   User {user}
-  IdentityFile {self.cfg.key}
+  IdentityFile "{self.cfg.key}"
   IdentitiesOnly yes
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
@@ -251,7 +275,7 @@ class Instance:
   ConnectTimeout 5
   ServerAliveInterval 10
   ControlMaster auto
-  ControlPath {self.dir}/mux
+  ControlPath "{self.dir}/mux"
   ControlPersist 120
 """)
         return cfg
@@ -309,6 +333,7 @@ class Instance:
             if mounts:
                 warn("smbd not found (install samba) - no mounts")
             shutil.rmtree(d, ignore_errors=True)
+            (self.dir / "mounts.json").unlink(missing_ok=True)
             return
         d.mkdir(parents=True, exist_ok=True)
         for m in mounts.values():
@@ -319,9 +344,10 @@ class Instance:
             "ncalrpc dir": f"{d}/ncalrpc", "log file": f"{d}/log.smbd", "smb passwd file": f"{d}/smbpasswd",
             "security": "user", "map to guest": "Bad User", "load printers": "no", "printing": "bsd",
             "disable spoolss": "yes", "usershare max shares": "0"}.items())
+        user = pwd.getpwuid(os.getuid()).pw_name            # the guest acts as you on the host
         for name, m in mounts.items():
             conf += (f"\n[{name}]\npath={m['path']}\nread only={'yes' if m['readonly'] else 'no'}\n"
-                     f"guest ok=yes\nforce user={os.environ.get('USER') or os.getlogin()}\n")
+                     f"guest ok=yes\nforce user={user}\n")
         (d / "smb.conf").write_text("[global]\n" + conf)
         (self.dir / "mounts.json").write_text(json.dumps(mounts, indent=1) + "\n")
 
@@ -354,10 +380,13 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
         if r.returncode:
             warn(f"could not set up C:\\mnt in {self.name}: {r.stdout.strip()[:300]}")
 
-    def mount(self, name: str, path: Path, readonly=False) -> None:
+    def require_running(self) -> None:
         if not self.alive:
-            die(f"{self.name} is not running - start it, or list the mount in the config "
+            die(f"{self.name} is not running - start it, or change the mounts in the config "
                 f"(instances.{self.name}.mounts)")
+
+    def mount(self, name: str, path: Path, readonly=False) -> None:
+        self.require_running()
         if not (self.dir / "smb").is_dir():
             die("no Samba on this instance (install samba, then restart it)")
         mounts = self.mounts
@@ -369,9 +398,10 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
         self.up().sync_mounts()
 
     def umount(self, name: str) -> None:
+        self.require_running()
         mounts = self.mounts
         if name not in mounts:
-            die(f"{self.name} has no mount '{name}' (winvm mounts)")
+            die(f"{self.name} has no mount '{name}' (`winvm -i {self.name} mount` lists them)")
         del mounts[name]
         self.write_smb(mounts)
         self.restart_smb()
@@ -379,14 +409,12 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
 
     def guest_path(self, host: Path) -> str | None:
         """Guest path of a host path inside one of the mounts (longest match wins)."""
-        best = None
+        best, host = None, host.resolve()
         for name, m in self.mounts.items():
-            try:
-                rel = host.resolve().relative_to(Path(m["path"]).resolve())
-            except ValueError:
-                continue
-            if best is None or len(Path(m["path"]).parts) > best[0]:
-                best = (len(Path(m["path"]).parts), f"C:\\mnt\\{name}" + "".join(f"\\{p}" for p in rel.parts))
+            root = Path(m["path"]).resolve()
+            if host.is_relative_to(root) and (best is None or len(root.parts) > best[0]):
+                rel = host.relative_to(root).parts
+                best = (len(root.parts), f"C:\\mnt\\{name}" + "".join(f"\\{p}" for p in rel))
         return best and best[1]
 
 
@@ -394,8 +422,8 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
 
 def instances(cfg: Config) -> list[Instance]:
     """Every instance with a run folder (running or not), builders included."""
-    return [Instance(cfg, d.name, builder=(cfg.cache / "build" / d.name).is_dir())
-            for d in sorted(cfg.runtime.glob("*/"))]
+    return [Instance(cfg, d.name, builder=(cfg.build / d.name).is_dir())
+            for d in sorted(cfg.runtime.glob("*")) if d.is_dir()]
 
 
 def running(cfg: Config) -> list[Instance]:
@@ -416,6 +444,10 @@ def need_mem(cfg: Config, want: int, what: str) -> None:
 def ports(cfg: Config, slot: int) -> dict:
     """Host ports of port slot n: the configured ports + n (None = forward off)."""
     p = cfg.s.get("ports") or {}
+    if not p.get("ssh"):
+        die("settings.ports.ssh must be set: winvm talks to the guest over SSH")
+    if p.get("vnc") and int(p["vnc"]) < 5900:
+        die("settings.ports.vnc must be 5900 or higher (VNC display = port - 5900)")
     return {"slot": slot, **{k: int(p[k]) + slot if p.get(k) else None for k in ("ssh", "rdp", "vnc")}}
 
 
@@ -433,7 +465,7 @@ def free_slot(cfg: Config, prefer: int | None = None) -> int:
     taken = {vm.state.get("slot") for vm in running(cfg)}
 
     def ok(n: int) -> bool:
-        return n not in taken and all(port_free(x) for x in list(ports(cfg, n).values())[1:] if x)
+        return n not in taken and all(port_free(v) for k, v in ports(cfg, n).items() if k != "slot" and v)
 
     if prefer is not None and ok(prefer):
         return prefer

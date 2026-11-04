@@ -91,20 +91,18 @@ foreach ($tp in $taskPaths) {
 Log "  disabled $n scheduled tasks" 'SC'
 
 # ------------------------------------------------------------------ the image's `setup` steps
-# winvm stages them as extra\setup.ps1 plus the files they use. Runs as SYSTEM from inside
-# extra\, after the debloat sweep (which would remove apps it adds) and before the shrink
-# (which cleans up after it). A failure fails the build. The folder is deleted afterwards.
-$extra = "$ScriptDir\extra"
-foreach ($ps in Get-ChildItem -LiteralPath $extra -Filter *.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name) {
-    Log "extra: $($ps.Name)" 'SC'
-    Push-Location -LiteralPath $extra
-    $global:LASTEXITCODE = 0
-    try { & $ps.FullName *>&1 | ForEach-Object { Log "  $_" 'SC' } }
-    catch { Log "WINSLIM-FAIL $($ps.Name): $_" 'SC' }
-    if ($LASTEXITCODE) { Log "WINSLIM-FAIL $($ps.Name) exited with $LASTEXITCODE" 'SC' }
-    Pop-Location
+# winvm stages them as extra\setup.ps1, with the files they use in extra\files (where they
+# run). As SYSTEM, after the debloat sweep (which would remove apps they add) and before the
+# shrink (which cleans up after them). A failure fails the build; extra\ is deleted after.
+$setup = "$ScriptDir\extra\setup.ps1"
+if (Test-Path -LiteralPath $setup) {
+    Log 'running the setup steps' 'SC'
+    Push-Location -LiteralPath $ScriptDir     # setup.ps1 moves into extra\files; come back out
+    try { & $setup *>&1 | ForEach-Object { Log "  $_" 'SC' } }   # setup.ps1 throws on any failure
+    catch { Log "WINSLIM-FAIL setup: $_" 'SC' }
+    finally { Pop-Location }
 }
-Remove-Item -LiteralPath $extra -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath "$ScriptDir\extra" -Recurse -Force -ErrorAction SilentlyContinue
 
 # ------------------------------------------------------------------ shrink
 Log 'component cleanup' 'SC'

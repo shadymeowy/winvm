@@ -38,7 +38,8 @@ remembered (linked into `~/.local/share/winvm/iso`).
 ## winvm.yaml
 
 `winvm config dump > winvm.yaml` writes the built-in config with all its comments.
-Your file is merged over it, so it only needs what it changes or adds. winvm uses
+Your file is merged over it, so it only needs what it changes or adds (`null` drops a
+built-in image, instance or mount, e.g. `instances: {main: null}`). winvm uses
 the first of `-f FILE`, `$WINVM_CONFIG`, `./winvm.yaml`, `~/.config/winvm/winvm.yaml`.
 
 ```yaml
@@ -105,7 +106,8 @@ cd ~/Projects/x && winvm -i work sh dir   # inside a mount: runs in C:\mnt\proje
 
 The command travels base64-encoded, so no quoting is lost between your shell, ssh,
 sshd and Windows; all commands to an instance share one SSH connection. `winvm ssh`
-is plain ssh (port forwards etc.), `winvm cp a.txt :C:/Users/user/` is scp, and
+is plain ssh (`winvm ssh -L 8080:localhost:80`, `winvm ssh hostname`),
+`winvm cp a.txt :C:/Users/user/` is scp, and
 `winvm ga exec PROG [ARGS]` goes through the guest agent without network.
 
 ## Mounts
@@ -214,12 +216,14 @@ Windows 11 Pro 25H2 (build 26300), 4 vCPU / 4 GB, KVM:
 | `base` from Microsoft's ISO | ~22 min |
 | first `slim` build (capture + export + install) | ~70 min |
 | later `slim` builds | **~10 min** |
+| an image `from` another, a few steps | ~1 min + the steps |
 | boot to SSH | ~12 s |
-| `winvm sh hostname` | **~0.6 s** |
-| base layer | **5.4 GB** (Microsoft's ISO is 9.0 GB) |
+| `winvm sh hostname` | **~0.6–0.7 s** |
+| base layer | **5.5 GB** (Microsoft's ISO is 9.0 GB) |
 | slim image in the cache | 3.6 GB |
 | fresh instance disk | < 1 MB |
 | idle guest RAM (headless) | ~950 MB, 86 processes |
+| host RAM of a 4 GB instance | 4.1 GB (Windows zeroes all its RAM at boot); `winvm balloon 2G` → 2.1 GB |
 
 CompactOS (`debloat.compact_os`) reaches only ~1.8:1 and its output doesn't
 compress further, so raw guest data plus qcow2 zstd is smaller and the default.
