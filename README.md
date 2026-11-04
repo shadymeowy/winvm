@@ -10,8 +10,8 @@ and is not activated (you activate it yourself).
 * The component store is reset (ResetBase), payloads of disabled optional
   features are stripped, and Smart App Control is off (in evaluation mode it makes
   every signed installer wait 2 minutes once Defender is gone). The golden image
-  is a zstd-compressed qcow2, and you run on a thin overlay, so a reset is
-  instant. Numbers are in [Results](#results).
+  is a zstd-compressed qcow2, and you run on a thin working disk, so a reset is
+  instant. Installed software can be kept as named [layers](#layers-installing-software-keeping-it-rolling-back). Numbers are in [Results](#results).
 * Guest tools are installed: virtio drivers (storage, net, balloon, serial, rng,
   input, gpu), **qemu-guest-agent** and spice-vdagent (clipboard in the GTK window).
 * **Pure CLI mode.** Headless VM, OpenSSH server with key auth, PowerShell as the
@@ -59,14 +59,17 @@ sudo dnf install qemu-kvm edk2-ovmf xorriso p7zip p7zip-plugins wimlib-utils sam
 | `build` | build `winslim-boot.iso` (~650 MB): patched WinPE, scripts, drivers |
 | `iso` | **iso→iso**: standalone installer `winslim-standalone.iso` holding the *already debloated* image |
 | `iso-resume` | finish an interrupted `iso` from its kept capture disk |
-| `install [--gui] [--standalone]` | unattended install, then golden `winslim-base.qcow2` and an overlay |
+| `install [--gui] [--standalone]` | unattended install, then golden `winslim-base.qcow2` and an empty working disk on it |
 | `start [--gui]` | start headless (daemonized), or with a GTK window plus clipboard |
 | `ssh`, `run`, `cp`, `wait` | CLI access over SSH (key auth, PowerShell) |
 | `ga <cmd>` / `ga exec <prog> [args]` | qemu-guest-agent via socket, e.g. `./winvm ga exec ipconfig` |
 | `rdp` | FreeRDP session (dynamic resolution, clipboard, host drive) |
 | `gui` | GTK window, or a VNC viewer if already running headless |
 | `stop` / `kill` / `status` | ACPI shutdown, hard off, overview |
-| `reset` | discard all changes (new empty overlay on the base image) |
+| `reset [layer]` | discard the working disk: fresh empty one on the layer it was on, or on `[layer]` |
+| `save <name>` | freeze the working disk as read-only layer `<name>`, continue on top of it |
+| `layers` | list layers, sizes and what each is built on |
+| `drop <name>` | delete a layer (refused while anything is built on it) |
 | `balloon [size]` | show or change guest RAM live, returning memory to the host |
 | `screenshot` | PNG of the guest screen, handy when headless |
 | `cmdline` | print the exact QEMU command line used by `start` |
@@ -109,7 +112,7 @@ Win11.iso ─┬─ boot.wim (WinPE, index 2) ─ wimlib: winpeshl.ini → winsl
    OOBE, which may still need it), clears the autologon secrets and powers off.
 5. Host: libguestfs, if installed, deletes the few WebView2 files the logged-in
    shell kept locked, then fstrims. `qemu-img convert -c` (zstd) gives the
-   read-only **base**, plus a thin **overlay** that you actually run.
+   read-only **base**, plus a thin read-write **working disk** that you actually run.
 
 Progress streams over the serial port (`~/Others/vm/run/winslim/install-serial.log`).
 Logs inside the guest are in `C:\Windows\Setup\winslim*.log`.
@@ -121,8 +124,9 @@ instead produces one self-contained installer that holds the already-slimmed
 image. It boots the boot ISO in capture mode, where WinPE applies and services
 the image exactly as above. Then, before the first boot, it runs
 `dism /Capture-Image`, writing the serviced `C:` to a spare partition, and
-`/Export-Image /Compress:recovery` turns that into an LZMS ESD. The host pulls
-`install.esd` out with libguestfs and wraps it with the WinPE tree. The installer
+powers off. The host pulls `install.wim` out with libguestfs, re-exports it with
+wimlib as a solid LZMS `install.esd` (WinPE runs out of memory doing that), and
+wraps it with the WinPE tree. The installer
 on that ISO skips servicing (it's already done) and only applies, stages the
 first-boot scripts and boots. `./winvm install --standalone` uses it.
 
@@ -172,7 +176,7 @@ virt-manager -c qemu:///session     # GUI, if you like
 ```
 
 Don't run the libvirt domain and `./winvm start` at the same time. They share the
-overlay, and QEMU's image locking will refuse.
+working disk, and QEMU's image locking will refuse.
 
 **SMB share under libvirt:** libvirt starts QEMU with a seccomp sandbox that
 forbids spawning processes, so QEMU can't launch its private `smbd`, and the
@@ -203,18 +207,73 @@ Measured on this repo's defaults (Windows 11 Pro, build 26300, 4 vCPU/4 GB, KVM)
 | golden base image, from the slim ISO | **5.4 GB** |
 | golden base image, from Microsoft's ISO (`WIN_COMPACT=0`, zstd qcow2) | 6.2 GB |
 | same with CompactOS in the guest (`WIN_COMPACT=1`) | 7.5 GB |
-| fresh overlay | < 1 MB |
+| fresh working disk | < 1 MB |
 | idle RAM in the guest (headless, nobody logged in) | ~950 MB, 86 processes |
 | host RSS of a 4 GB VM after `./winvm balloon 2G` | 4.2 GB → 2.1 GB |
 
 XPRESS4K (CompactOS) only reaches about 1.8:1, and its output is incompressible
 for qcow2. Leaving the guest data raw and letting qcow2's zstd compress it gives
 the smaller host footprint, so that's the default. Blocks you write later land
-uncompressed in the overlay; `./winvm reset` gets you back to the base.
+uncompressed in the working disk (and the layers you `save`); `./winvm reset` gets
+you back to the layer below.
+
+## Layers (installing software, keeping it, rolling back)
+
+Disks are plain qcow2 files in `~/Others/vm/images`. Nothing else holds state:
+
+```
+winslim-base.qcow2     read-only   golden image from `install`          (layer "base")
+winslim-office.qcow2   read-only   a layer you saved, backed by base
+winslim-dev.qcow2      read-only   another one, backed by office
+winslim.qcow2          read-write  the working disk the VM boots, backed by one layer
+```
+
+Each file only stores the blocks that differ from the file under it. Backing files
+are referenced by bare name, so `qemu-img info --backing-chain winslim.qcow2`
+shows exactly the same thing as `./winvm layers`.
+
+```sh
+./winvm ssh                # install things; everything lands in winslim.qcow2
+./winvm stop
+./winvm save office        # winslim.qcow2 -> winslim-office.qcow2 (read-only), new empty working disk on it
+./winvm reset              # throw away what you did since: back to "office"
+./winvm reset base         # clean Windows again (office is kept)
+./winvm reset office       # and back
+./winvm layers             # base 5.4G | office 3.1G <- base | working 2M <- office
+./winvm drop office        # delete it (refused while something is built on it)
+```
+
+Saved layers are never written again, so whatever is built on them stays valid.
+Only one working disk exists at a time. Activate Windows/Office in a layer you then
+`save`, otherwise `reset` throws the activation away. The VM has a fixed SMBIOS UUID
+(`VM_UUID`, same in the libvirt domain) so every layer looks like the same machine.
+
+### Office
+
+Office installs fine into a layer. Use the [Office Deployment Tool][odt]. It
+downloads from Microsoft's Office CDN, not Windows Update.
+
+```powershell
+winget install Microsoft.EdgeWebView2Runtime   # Microsoft 365 Apps need it (sign-in, add-ins); removed by winslim
+winget install Microsoft.OfficeDeploymentTool  # or download setup.exe by hand
+# config.xml: pick a product (O365ProPlusRetail, ProPlus2024Volume, ...), one language,
+# exclude what you don't want and freeze updates like the rest of the VM:
+#   <Add OfficeClientEdition="64" Channel="Current"><Product ID="O365ProPlusRetail">
+#     <Language ID="en-us"/><ExcludeApp ID="Teams"/><ExcludeApp ID="OneDrive"/>
+#     <ExcludeApp ID="Outlook"/><ExcludeApp ID="Groove"/><ExcludeApp ID="Lync"/></Product></Add>
+#   <Updates Enabled="FALSE"/><Display Level="None" AcceptEULA="TRUE"/>
+& "C:\Program Files\OfficeDeploymentTool\setup.exe" /configure config.xml
+```
+
+Then `./winvm stop && ./winvm save office`, activate, stop, `./winvm save office-activated`.
+Expect 3–4 GB. Office wants more than 4 GB RAM with no pagefile, so start it with
+`RAM=6G ./winvm start` (config.local.env to make it stick).
+
+[odt]: https://learn.microsoft.com/microsoft-365-apps/deploy/overview-office-deployment-tool
 
 ## Activation and re-enabling things
 
-The VM is unactivated. Run `slmgr /ipk <your-key>` then `slmgr /ato`, or use
+The VM is unactivated (do it in a layer you `save`, see above). Run `slmgr /ipk <your-key>` then `slmgr /ato`, or use
 Settings › Activation. Updates are blocked by policy (a WSUS pointing to
 127.0.0.1) plus disabled services. To undo: delete
 `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`, and set `wuauserv`,

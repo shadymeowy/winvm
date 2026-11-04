@@ -3,6 +3,7 @@
      localhost port forwards and the built-in SMB share (\\10.0.2.4\qemu) as ./winvm start. -->
 <domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
   <name>@VM_NAME@</name>
+  <uuid>@VM_UUID@</uuid>
   <title>winslim Windows VM</title>
   <memory unit='MiB'>@RAM_MIB@</memory>
   <currentMemory unit='MiB'>@RAM_MIB@</currentMemory>

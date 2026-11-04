@@ -107,7 +107,7 @@ qemu_args() {
   local mode=$1 disk=$2 gui=${3:-}
   ovmf
   local cache=writeback; [[ $mode == install ]] && cache=unsafe
-  Q=("$QEMU" -name "$VM_NAME,process=$VM_NAME" -enable-kvm
+  Q=("$QEMU" -name "$VM_NAME,process=$VM_NAME" -enable-kvm -uuid "$VM_UUID"
      -machine q35,hpet=off,vmport=off
      -cpu "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-frequencies,hv-tlbflush,hv-ipi,hv-reset"
      -smp "$CPUS" -m "$RAM"
@@ -379,19 +379,79 @@ finalize() {
   "$QEMU_IMG" convert -p "${opts[@]}" "$INSTALL_DISK" "$BASE.tmp"
   mv -f "$BASE.tmp" "$BASE"; chmod a-w "$BASE"
   rm -f "$INSTALL_DISK"
-  cmd_reset
+  cmd_reset base
   log "base image: $BASE ($(du -h "$BASE" | cut -f1) on disk)"
   log "done - ./winvm start && ./winvm ssh"
 }
 
-cmd_reset() { ## throw away all changes: new empty overlay on top of the base image
+# ---------------------------------------------------------------- layers
+# Plain qcow2 files in $IMG_DIR, nothing else:
+#   winslim-base.qcow2     read-only   the golden image (layer "base")
+#   winslim-<name>.qcow2   read-only   a saved layer, backed by another layer
+#   winslim.qcow2          read-write  the working disk the VM boots, backed by a layer
+# Backing references are stored as bare file names, so the folder can be moved.
+layer_file() { echo "$IMG_DIR/$VM_NAME-$1.qcow2"; }
+layer_name() { local b; b=$(basename "$1" .qcow2); echo "${b#"$VM_NAME"-}"; }
+parent_of() { # layer name a qcow2 is backed by ('' for none)
+  local b; b=$("$QEMU_IMG" info -U --output=json "$1" |
+    python3 -Ic 'import json,sys; print(json.load(sys.stdin).get("backing-filename",""))')
+  [[ -n $b ]] && layer_name "$b"; return 0
+}
+all_layers() { local f; for f in "$IMG_DIR/$VM_NAME"-*.qcow2; do [[ -f $f && $f != "$INSTALL_DISK" ]] && echo "$f"; done; return 0; }
+valid_layer() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "layer name must be letters, digits, . _ - (got '${1}')"
+  [[ $1 != install ]] || die "'install' is reserved"
+}
+chain() { # working -> office -> base
+  local f=$DISK out=working p
+  while p=$(parent_of "$f"); [[ -n $p ]]; do out+=" -> $p"; f=$(layer_file "$p"); done
+  echo "$out"
+}
+
+cmd_reset() { ## discard the working disk: fresh empty one on top of [layer] (default: the layer it was on)
   vm_alive && die "VM is running - ./winvm stop first"
-  [[ -f $BASE ]] || die "no base image - run ./winvm install"
+  local on=${1:-}
+  [[ -z $on && -f $DISK ]] && on=$(parent_of "$DISK")
+  on=${on:-base}; valid_layer "$on"
+  [[ -f $(layer_file "$on") ]] || { [[ $on == base ]] && die "no base image - run ./winvm install"; die "no layer '$on' (see ./winvm layers)"; }
   mkdir -p "$RUN"; ovmf
   rm -f "$DISK"
-  "$QEMU_IMG" create -q -f qcow2 -F qcow2 -b "$BASE" "$DISK"
+  "$QEMU_IMG" create -q -f qcow2 -F qcow2 -b "$(basename "$(layer_file "$on")")" "$DISK"
   cp -f "$OVMF_VARS" "$RUN/OVMF_VARS.fd"; chmod u+w "$RUN/OVMF_VARS.fd"
-  log "fresh overlay: $DISK"
+  log "fresh working disk: $(chain)"
+}
+
+cmd_save() { ## freeze the working disk as read-only layer <name>, continue on a fresh disk on top of it
+  local name=${1:-}; [[ -n $name ]] || die "usage: winvm save <name>"
+  valid_layer "$name"; [[ $name != base ]] || die "'base' is the golden image"
+  vm_alive && die "VM is running - ./winvm stop first"
+  [[ -f $DISK ]] || die "no working disk - nothing to save"
+  local f; f=$(layer_file "$name")
+  [[ -e $f ]] && die "layer '$name' already exists"
+  mv "$DISK" "$f"; chmod a-w "$f"
+  "$QEMU_IMG" create -q -f qcow2 -F qcow2 -b "$(basename "$f")" "$DISK"
+  log "saved layer '$name' ($(du -h "$f" | cut -f1)): $(chain)"
+}
+
+cmd_layers() { ## list layers, their size and what each one is built on
+  local f
+  printf '%-14s %7s  %s\n' LAYER SIZE 'BUILT ON'
+  while read -r f; do
+    printf '%-14s %7s  %s\n' "$(layer_name "$f")" "$(du -h "$f" | cut -f1)" "$(parent_of "$f")"
+  done < <(all_layers)
+  [[ -f $DISK ]] && printf '%-14s %7s  %s   <- read-write, what the VM boots\n' working "$(du -h "$DISK" | cut -f1)" "$(parent_of "$DISK")"
+  return 0
+}
+
+cmd_drop() { ## delete layer <name> (refused while another layer or the working disk is built on it)
+  local name=${1:-}; [[ -n $name ]] || die "usage: winvm drop <name>"
+  valid_layer "$name"; [[ $name != base ]] || die "use ./winvm clean --base for the golden image"
+  local f g; f=$(layer_file "$name")
+  [[ -f $f ]] || die "no layer '$name'"
+  for g in "$DISK" $(all_layers); do
+    [[ -f $g && $(parent_of "$g") == "$name" ]] && die "'$(layer_name "$g")' is built on '$name' - drop it first (or ./winvm reset <other-layer>)"
+  done
+  rm -f "$f"; log "dropped layer '$name'"
 }
 
 cmd_start() { ## start the VM headless (daemonized) [--gui for a GTK window with clipboard]
@@ -495,8 +555,9 @@ cmd_status() { ## show VM state, ports, disk usage
   [[ -n $RDP_PORT ]] && echo "rdp      127.0.0.1:$RDP_PORT  user=$WIN_USER"
   [[ -n $VNC_DISPLAY ]] && echo "vnc      127.0.0.1:$((5900+VNC_DISPLAY))"
   echo "share    $SHARE_DIR  ->  guest C:\\host (\\\\10.0.2.4\\qemu)"
-  local f; for f in "$BASE" "$DISK" "$BOOT_ISO" "$SLIM_ISO"; do
-    [[ -f $f ]] && printf '%-8s %6s on disk  %s\n' "$(basename "${f%.*}" | sed "s/^$VM_NAME-\?//;s/^$/overlay/")" "$(du -h "$f" | cut -f1)" "$f"
+  [[ -f $DISK ]] && echo "disk     $(chain)   (./winvm layers)"
+  local f; for f in "$BOOT_ISO" "$SLIM_ISO"; do
+    [[ -f $f ]] && printf '%-8s %6s  %s\n' iso "$(du -h "$f" | cut -f1)" "$f"
   done
   return 0
 }
@@ -528,7 +589,7 @@ cmd_virt_define() { ## define the libvirt domain (qemu:///session) from libvirt/
   [[ -f $DISK ]] || cmd_reset
   mkdir -p "$RUN"
   local net qemu_bin; net=$(netdev_user wsnet0); qemu_bin=$(command -v "$QEMU")
-  sed -e "s|@VM_NAME@|$VM_NAME|g" -e "s|@RAM_MIB@|$(mib "$RAM")|g" -e "s|@CPUS@|$CPUS|g" \
+  sed -e "s|@VM_NAME@|$VM_NAME|g" -e "s|@VM_UUID@|$VM_UUID|g" -e "s|@RAM_MIB@|$(mib "$RAM")|g" -e "s|@CPUS@|$CPUS|g" \
       -e "s|@DISK@|$DISK|g" -e "s|@RUN_DIR@|$RUN|g" -e "s|@QEMU_BIN@|$qemu_bin|g" -e "s|@NETDEV@|$net|g" \
       "$REPO/libvirt/winslim.xml.in" > "$RUN/$VM_NAME.xml"
   virt define "$RUN/$VM_NAME.xml"
@@ -550,6 +611,10 @@ cmd_virsh() { ## virsh passthrough with the right URI, e.g. ./winvm virsh start 
 # ---------------------------------------------------------------- housekeeping
 cmd_clean() { ## remove build leftovers [--base also deletes base image+overlay] [--all also ISOs+cache]
   vm_alive && die "VM is running - ./winvm stop first"
+  if [[ -n ${1:-} ]]; then
+    local l; l=$(all_layers | grep -vFx "$BASE" | while read -r f; do layer_name "$f"; done | xargs)
+    [[ -z $l ]] || die "layers built on the base would break: $l - ./winvm drop them first"
+  fi
   rm -rf "$BUILD" "$INSTALL_DISK" "$IMG_DIR"/*.tmp
   case ${1:-} in
     --base) rm -f "$BASE" "$DISK" "$RUN/OVMF_VARS.fd";;
