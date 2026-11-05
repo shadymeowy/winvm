@@ -427,7 +427,21 @@ UUID (`settings.uuid`), so all images and instances look like one machine to
 activation: activate in an instance and `winvm save` it, and rebuilding or resetting
 keeps it. That is meant for one licensed machine: running several activated copies
 at the same time needs a license for each: give each its own settings file (`-f` or
-`$WINVM_CONFIG`) with its own `uuid` and `data_dir`. `slmgr /ipk <key>` then `slmgr /ato`, or Settings › Activation.
+`$WINVM_CONFIG`) with its own `uuid` and `data_dir`.
+
+To activate, run this in the guest (`winvm sh`) with your own key. `slmgr` doesn't work
+here: the debloat removes VBScript, so `.vbs` scripts don't run.
+
+```powershell
+$svc = Get-CimInstance SoftwareLicensingService
+Invoke-CimMethod -InputObject $svc -MethodName InstallProductKey -Arguments @{ProductKey='XXXXX-XXXXX-XXXXX-XXXXX-XXXXX'}
+Invoke-CimMethod -InputObject $svc -MethodName RefreshLicenseStatus | Out-Null
+$win = "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' and PartialProductKey is not null"
+Get-CimInstance SoftwareLicensingProduct -Filter $win | Invoke-CimMethod -MethodName Activate
+(Get-CimInstance SoftwareLicensingProduct -Filter $win).LicenseStatus    # 1 = activated
+```
+
+The key must match the image's edition: `edition:` in its file, Windows 11 Pro by default.
 
 Office installs fine as an image step or by hand with the [Office Deployment Tool][odt],
 which downloads from Microsoft's CDN, not Windows Update. Microsoft 365 Apps need
