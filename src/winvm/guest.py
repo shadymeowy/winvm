@@ -37,14 +37,18 @@ def command_line(words: list[str]) -> str:
     return " ".join(quote(w) if not w or any(c.isspace() for c in w) else w for w in words)
 
 
-def script(line: str, cwd: str | None = None, strict=False) -> str:
-    """Full guest script for one command line; strict: a cmdlet error stops it (build steps)."""
+def script(line: str, cwd: str | None = None, strict=False, console=False) -> str:
+    """Full guest script for one command line; strict: a cmdlet error stops it (build steps).
+    PowerShell holds objects without a table view (`select`) back for a moment to size the
+    table, and `exit` would lose them: the command gets its own output pipeline, which ends
+    first. Not with console=True (a terminal), where programs need the real console."""
     head = PROLOGUE + ("$ErrorActionPreference = 'Stop'\n" if strict else "")
     cd = f"Set-Location -LiteralPath {quote(cwd)}\n" if cwd else ""
     if strict:   # a thrown error: print just its message and exit 1
         line = ("$global:LASTEXITCODE = 0\ntry {\n" + line +
                 "\n} catch { [Console]::Error.WriteLine(\"error: $($_.Exception.Message)\"); exit 1 }")
-    return head + cd + line + EPILOGUE + "exit $rc\n"
+    body = line + EPILOGUE
+    return head + cd + (body if console else ". {\n" + body + "} | Out-Default\n") + "exit $rc\n"
 
 
 # `ssh` below is a function: ssh(*options) -> ssh argv up to and including the host name

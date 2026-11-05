@@ -387,10 +387,9 @@ class Instance:
 
     # --- mounts: each instance has its own Samba server, reached by the guest at
     # \\10.0.2.4 through QEMU (guestfwd starts smbd per connection, as QEMU's smb= does).
-    # Its config can change while the guest runs: a new share works at once. A removed or
-    # changed one stays served by the running smbd (a reload signal does not drop it), so
-    # that smbd is ended: Windows reconnects by itself and the new smbd reads the new
-    # config. The guest sees each mount as a folder link, C:\mnt\<name> or where its `at`
+    # Its config can change while the guest runs, but the running smbd keeps serving the
+    # shares it started with (new ones aren't found, removed ones stay), so it is ended:
+    # Windows reconnects by itself and the new smbd reads the new config. The guest sees each mount as a folder link, C:\mnt\<name> or where its `at`
     # says - drive letters would exist only in the logon session that mapped them. The
     # guest keeps a list of the links winvm made (LINKS), so it can remove them later;
     # anything else at a mount point is never touched.
@@ -465,6 +464,7 @@ $end = (Get-Date).AddSeconds(15)                 # until the shares answer
 while (@($want.Values | Where-Object {{ -not (Test-Path -LiteralPath $_) }}).Count -and (Get-Date) -lt $end) {{
     Start-Sleep -Milliseconds 500
 }}
+foreach ($p in $want.Keys) {{ if (-not (Test-Path -LiteralPath $want[$p])) {{ "SILENT $p" }} }}
 # images from before winvm 2 link C:\\host to QEMU's old fixed share
 $h = Get-Item -LiteralPath C:\\host -Force -ErrorAction SilentlyContinue
 if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
@@ -474,6 +474,9 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
             if ln.startswith("TAKEN "):
                 missing.append(ln[6:])
                 warn(f"{ln[6:]} already exists in {self.name} and is not a winvm mount - left alone, not mounted there")
+            elif ln.startswith("SILENT "):
+                missing.append(ln[7:])
+                warn(f"{ln[7:]} in {self.name} doesn't reach its host folder (`winvm -i {self.name} logs smb`)")
             elif ln.startswith("FAILED "):
                 missing.append(ln[7:].split(" - ", 1)[0])
                 warn(f"could not link {ln[7:]}")
@@ -517,8 +520,7 @@ if ($i -and -not ($i.LinkType -and "$($i.Target)" -like '*{SMB_HOST}\\*')) {{ ex
         if r.returncode == 3:
             die(f"{spot} already exists in {self.name} and is not a winvm mount - pick another place")
         self.write_smb(new)
-        if name in mounts:
-            self.restart_smb()
+        self.restart_smb()
         if spot in self.sync_mounts():                         # undo: no half-made mount
             self.write_smb(mounts)
             self.restart_smb()
