@@ -251,17 +251,35 @@ class Config:
         isos = [p for p in (self.data / "iso").glob("*.iso") if p.exists()]
         return sorted(isos, key=lambda q: q.lstat().st_mtime, reverse=True)
 
+    def iso_hashes(self) -> dict[str, str]:
+        """The sha256 of each ISO seen so far, by iso_key."""
+        try:
+            return json.loads((self.data / "iso" / ".sha256.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def iso_key(iso: Path) -> str:
+        st = iso.stat()
+        return f"{iso.resolve()}|{st.st_size}|{int(st.st_mtime)}"
+
+    def iso_is_pinned(self, iso: Path) -> bool:
+        """Is this the ISO winvm can download again (settings.windows)? By its known sha256,
+        else (never checksummed: 8 GB take a while) by name and size."""
+        pin = self.s.get("windows") or {}
+        if not pin or not iso.exists():
+            return False
+        if sha := self.iso_hashes().get(self.iso_key(iso)):
+            return sha == pin.get("sha256")
+        return iso.name == unquote(pin["url"].split("?")[0].rsplit("/", 1)[-1]) and iso.stat().st_size == pin.get("size")
+
     def iso_id(self, name: str) -> str:
         """The image's ISO by content: sha256, computed once per file (cached by path,
         size and mtime) - the same ISO under another name or path is the same input."""
         iso = self.iso(name)
         cache = self.data / "iso" / ".sha256.json"
-        try:
-            known = json.loads(cache.read_text())
-        except (OSError, ValueError):
-            known = {}
-        st = iso.stat()
-        key = f"{iso.resolve()}|{st.st_size}|{int(st.st_mtime)}"
+        known = self.iso_hashes()
+        key = self.iso_key(iso)
         if key not in known:
             log(f"checksumming {iso.name} (once)")
             known[key] = sha256_file(iso)

@@ -293,7 +293,7 @@ before downloads).
 | `images [--json]` | images: built versions, status, size, base, users, defining file |
 | `save NAME` | freeze the instance's disk as image NAME; the instance continues on it |
 | `reset [IMAGE]` | discard the instance's changes: fresh disk on the current version (of IMAGE) |
-| `rm [NAME...]` / `rmi IMAGE` / `prune [-n] [--cache]` | delete instances / an image / unused versions, stale slim images, leftovers |
+| `rm [NAME...]` / `rmi IMAGE` / `prune [-n] [--cache] [--iso]` | delete instances / an image / unused versions, stale slim images, leftovers (`--cache`: downloads and slim images, `--iso`: ISOs) |
 | `df` | disk space used by images, instances, ISOs, cache; free space |
 | `check` | what the host has and lacks, what will be downloaded |
 | `fetch [IMAGE...]` | download now what building needs (asks; `-y`) |
@@ -321,6 +321,13 @@ $XDG_RUNTIME_DIR/winvm-*/<name>/    while running: pid, ports, sockets, logs, ss
 
 `winvm config path` prints the folders in use (the run folder's name is a hash of the
 data folder, so two data folders never mix).
+
+**Saving space.** Once an image is built it stands on its own: `winvm prune --cache
+--iso` removes the slim images, downloads and ISOs, and images and instances keep
+working, frozen as they are. Only building an ISO image again needs an ISO (winvm can
+download its pinned one; `prune --iso` says which ISOs those are), and without the slim
+cache that build takes longer. Don't delete `images/` or `keys/`: `images/` holds the
+images themselves (`winvm rmi` asks first), `keys/` the key winvm reaches the guests with.
 
 Backing files are relative paths, so `qemu-img info --backing-chain` shows the
 same chain as `winvm images` and the data folder can be moved.
@@ -352,8 +359,8 @@ doesn't fit: stop another instance, or give this one less (`winvm up --ram 3G`, 
 * **`no access to /dev/kvm`**: `sudo usermod -aG kvm $USER`, then log out and in again.
 * **A command fails because of an image file**: `winvm images` lists broken files with
   the reason; other images and instances keep working.
-* **Disk full**: `winvm df` shows what takes the space; `winvm prune` (then
-  `--cache`) frees it. winvm checks free space before a download or build.
+* **Disk full**: `winvm df` shows what takes the space; `winvm prune` (then `--cache`,
+  `--iso`) frees it. winvm checks free space before a download or build.
 
 ## How an ISO image is built
 

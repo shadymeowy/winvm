@@ -52,6 +52,9 @@ def build(cfg: Config, names: list[str], force=False, gui=False, stale=False) ->
     order: list[str] = []
     for n in names:
         order += [x for x in cfg.chain(n) if x not in order]
+    if force:                                                  # as defined now, whatever is built
+        cfg.fresh.update(n for n in names if n in cfg.images and "from" not in cfg.images[n])
+        cfg.forget()
     for n in order:
         try:
             cfg.hash(n)                                        # finds out which are stale

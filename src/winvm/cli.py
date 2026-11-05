@@ -523,11 +523,33 @@ def cmd_build(a):
             a.cfg.hash(n)                                      # finds the stale ISO images
         except Fatal:
             pass
-    if stale := sorted(chain & set(a.cfg.stale)):
+    if a.force:
+        for n in names:
+            confirm(a, f"build '{n}' again? The built version stays until the new one is done. "
+                       f"{rebuild_note(a.cfg, n)}")
+    if stale := sorted(chain & set(a.cfg.stale) - (set(names) if a.force else set())):
         confirm(a, f"{', '.join(stale)} changed since built (its file or winvm): install Windows again "
                    f"(up to an hour; instances keep the version they run on)?")
     build(a.cfg, names, force=a.force, gui=a.gui, stale=True)
     log("images up to date")
+
+
+def rebuild_note(cfg: Config, name: str) -> str:
+    """What building image `name` takes: said before deleting or replacing a built one."""
+    img = cfg.images.get(name)
+    if not img:
+        return "It has no file, so it can't be built again."
+    if "from" in img:
+        return f"It builds from {tilde(cfg.sources[name])}."
+    try:
+        return f"Building it installs Windows from {cfg.iso(name).name} (up to an hour)."
+    except Fatal:
+        pin = cfg.s.get("windows")
+        if img.get("iso") or not pin:
+            return "NO ISO IS LEFT for it: you need one first (winvm up --iso PATH), then up to an hour."
+        return (f"NO ISO IS LEFT for it: building it downloads {pin.get('title', 'Windows')} "
+                f"({pin.get('size', 0) / (1 << 30):.1f} GB), maybe not the Windows you built it from, "
+                f"then installs it (up to an hour).")
 
 
 @command(arg("--json", action="store_true", help="machine-readable"))
@@ -571,10 +593,14 @@ def cmd_images(a):
 
 
 @command(arg("--cache", action="store_true", help="also the downloads and all slim images (re-fetched when needed)"),
+         arg("--iso", action="store_true", help="also the ISOs in the data folder: built images keep working, "
+                                                "building one again needs an ISO (links: only the link goes)"),
          arg("-n", "--dry-run", action="store_true", help="only show what would go"))
 def cmd_prune(a):
     """delete image versions nothing uses, stale slim images, build leftovers"""
     cfg, store = a.cfg, Store(a.cfg)
+    if a.iso and not a.dry_run and any(vm.builder for vm in running(cfg)):
+        die("a build is running and may be using an ISO - run this when it is done")
     keep = set()
     for name in {store.meta(f)["name"] for f in store.all()} | set(cfg.images):
         try:
@@ -603,26 +629,40 @@ def cmd_prune(a):
             extra += [f for f in (cfg.cache / "slim").glob("*.qcow2") if f.stem not in want]
         except Fatal:                                          # no ISO to tell: keep them
             pass
-    sizes = {p: du_bytes(p) for p in [*gone, *extra]}
+    isos = sorted(p for p in (cfg.data / "iso").glob("*.iso")) if a.iso else []
+    sizes = {p: du_bytes(p) for p in [*gone, *extra, *isos]}
     if not sizes:
         return log("nothing to prune")
     for p in gone:
         print(f"  image {label(p):<28} {human_size(sizes[p]):>7}")
     for p in extra:
         print(f"  {tilde(p):<34} {human_size(sizes[p]):>7}")
+    for p in isos:
+        print(f"  {tilde(p):<34} {human_size(sizes[p]):>7}  {iso_note(cfg, p)}", flush=True)
     total = human_size(sum(sizes.values()))
     if a.dry_run:
         return log(f"would free {total}")
     confirm(a, f"delete these ({total})?")
     for f in gone:
         store.remove(f)
-    for p in extra:
-        shutil.rmtree(p) if p.is_dir() else p.unlink()
+    for p in [*extra, *isos]:
+        shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
     log(f"pruned: {total} freed")
 
 
+def iso_note(cfg: Config, iso: Path) -> str:
+    """What deleting an ISO from the data folder costs."""
+    if iso.is_symlink():
+        return f"a link: your file stays ({tilde(iso.resolve())})"
+    if cfg.iso_is_pinned(iso):
+        return "winvm can download it again"
+    return "your only copy here: winvm can't download this one"
+
+
 def du_bytes(p: Path) -> int:
-    """Disk space used by a file or folder."""
+    """Disk space used by a file or folder (a link: the link's own)."""
+    if p.is_symlink():
+        return p.lstat().st_blocks * 512
     if p.is_file():
         return p.stat().st_blocks * 512
     return sum(f.stat().st_blocks * 512 for f in p.rglob("*") if f.is_file() and not f.is_symlink())
@@ -653,7 +693,8 @@ def cmd_df(a):
         if os.stat(p).st_dev not in seen:
             seen.add(os.stat(p).st_dev)
             print(f"\n  {human_size(shutil.disk_usage(p).free)} free on the file system of {tilde(d)}")
-    print("\n  winvm prune frees unused versions and stale slim images; --cache also the downloads")
+    print("\n  winvm prune frees unused versions and stale slim images; --cache also the downloads "
+          "and slim images, --iso the ISOs\n  (built images and instances keep working without them)")
 
 
 @command(arg("name", names="images"))
@@ -664,8 +705,8 @@ def cmd_rmi(a):
     for f in versions:
         if users := store.users(f):
             die(f"{label(f)} is used by {', '.join(users)} - rm/reset those first")
-    if a.name not in a.cfg.images:
-        confirm(a, f"delete image '{a.name}'? It has no file, so it can't be built again")
+    confirm(a, f"delete image '{a.name}' ({human_size(sum(du_bytes(f) for f in versions))})? "
+               f"{rebuild_note(a.cfg, a.name)}")
     for f in versions:
         store.remove(f)
     log(f"removed image '{a.name}'" + (" (its file is still there: rebuilt when needed)" if a.name in a.cfg.images else ""))
