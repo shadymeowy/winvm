@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pwd
@@ -228,22 +229,33 @@ class Instance:
         if wait:
             self.wait_ssh()
             if not self.builder:
+                self.sync_keys()
                 self.sync_mounts()
                 self.auto_memory()
 
     def stop(self, timeout=120) -> bool:
         """ACPI shutdown, a hard kill after `timeout` s. False if it had to be killed."""
+        return self.wait_stopped(timeout) if self.power_button() else True
+
+    def power_button(self) -> bool:
+        """Press the ACPI power button; False if it was not running."""
         if not self.alive:
             log(f"{self.name} not running")
-            return True
+            return False
         self.close_ssh()
-        Chan(self.dir / "qmp.sock", qmp=True)("system_powerdown")      # ACPI power button
-        for _ in range(timeout):
+        Chan(self.dir / "qmp.sock", qmp=True)("system_powerdown")
+        return True
+
+    def wait_stopped(self, timeout=120, since: float | None = None) -> bool:
+        """After power_button: wait until it is off, kill it after `timeout` s (counted
+        from `since`). False if it had to be killed."""
+        end = (since or time.time()) + timeout
+        while time.time() < end:
             if not self.alive:
                 log(f"stopped {self.name}")
                 return True
-            time.sleep(1)
-        warn(f"{self.name} did not power off in time - killing")
+            time.sleep(0.5)
+        warn(f"{self.name} did not power off in {timeout} s - killing it")
         self.kill()
         return False
 
@@ -441,7 +453,8 @@ foreach ($p in $want.Keys) {{
     $i = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
     if ($i) {{ if (-not (ours $i)) {{ "TAKEN $p" }}; continue }}
     try {{
-        New-Item -ItemType Directory -Force (Split-Path $p) -ErrorAction Stop | Out-Null
+        $d = Split-Path $p                         # (C:\\ for C:\\x: there already)
+        if (-not (Test-Path -LiteralPath $d)) {{ New-Item -ItemType Directory -Force $d -ErrorAction Stop | Out-Null }}
         # mklink, not New-Item: a share just added may take a moment to be seen
         $out = cmd /c mklink /D "$p" "$($want[$p])" 2>&1
         if ($LASTEXITCODE) {{ "FAILED $p - $out" }}
@@ -467,6 +480,16 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
         if r.returncode:
             warn(f"could not set up the mounts in {self.name}: {r.stdout.strip()[:300]}")
         return missing
+
+    def sync_keys(self) -> None:
+        """Bring the guest's authorized keys up to date: winvm's own key and settings
+        ssh_pubkeys as they are now (not as they were when the image was built)."""
+        keys = base64.b64encode(self.cfg.authorized_keys().replace("\n", "\r\n").encode()).decode()
+        r = guest.capture(self.ssh, f"""$ak = 'C:\\ProgramData\\ssh\\administrators_authorized_keys'
+$want = [Text.Encoding]::ASCII.GetString([Convert]::FromBase64String('{keys}'))
+if ((Test-Path $ak) -and [IO.File]::ReadAllText($ak) -ne $want) {{ [IO.File]::WriteAllText($ak, $want) }}""")
+        if r.returncode:
+            warn(f"could not update the SSH keys in {self.name}: {r.stdout.strip()[:200]}")
 
     def require_running(self) -> None:
         if not self.alive:

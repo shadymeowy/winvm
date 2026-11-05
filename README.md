@@ -39,8 +39,8 @@ Everything else winvm needs comes with it or is downloaded once, each file pinne
 its sha256: the Windows ISO (from Microsoft, into `~/.local/share/winvm/iso`) and, into
 `~/.cache/winvm`, virtio-win drivers, Win32-OpenSSH and, if the host has none, UEFI
 firmware (Debian's OVMF package). winvm asks before downloading (`-y`: don't ask).
-`winvm check` shows what is there and what is missing. winvm runs as your user, never
-as root.
+`winvm check` shows what is there and what is missing. winvm runs as your user and
+refuses to run as root.
 
 ## Install
 
@@ -52,19 +52,26 @@ winvm check                  # what the host has, what will be downloaded
 ```
 
 Upgrade with `pipx upgrade winvm` (or `uv tool upgrade winvm`); built images and
-instances stay. A version that changes how `base` is built marks it outdated
-(`winvm images`): instances keep the version they run on, and the next build of `base`
-(e.g. for a new instance) installs Windows again. From a checkout of this repository: `uv tool install .` (or `pipx
+instances stay. A version that builds `base` differently marks it *outdated* in
+`winvm images`, but it stays in use: Windows is installed again only when you run
+`winvm build base` (which asks first). The source is at
+<https://github.com/shadymeowy/winvm>; from a checkout: `uv tool install .` (or `pipx
 install .`).
 
-Shell completion: commands and options come from winvm's own definitions (rerun after
-updates); instance and image names (`-i`, `stop`, `--image`, `rmi`, `reset`, ...) are looked
-up live when you press Tab:
+Shell completion: commands and options come from winvm's own definitions (generate it
+again after an upgrade); instance, image and mount names are looked up live when you
+press Tab:
 
 ```sh
 winvm completion bash > ~/.local/share/bash-completion/completions/winvm
 winvm completion fish > ~/.config/fish/completions/winvm.fish
+# zsh: autoload -U bashcompinit && bashcompinit && source <(winvm completion bash)
 ```
+
+**Uninstall:** `winvm stop --all`, then `pipx uninstall winvm` (or `uv tool uninstall
+winvm`) and delete what it made: `~/.local/share/winvm` (images, instances, ISO),
+`~/.cache/winvm`, `~/.config/winvm` and the completion file. `winvm df` shows what
+takes the space.
 
 ## Quick start
 
@@ -72,8 +79,12 @@ winvm completion fish > ~/.config/fish/completions/winvm.fish
 winvm up                     # first time: asks to download, then builds image `base`
 winvm sh                     # PowerShell in the guest (exit with `exit`)
 winvm sh Get-ComputerInfo -Property OsName,OsBuildNumber
+winvm rdp                    # a desktop (FreeRDP); or winvm gui (VNC viewer / QEMU window)
 winvm stop
 ```
+
+The guest's user is `user` with password `winslim` (the image's `user:` and
+`password:`; SSH uses keys).
 
 No config file is needed: `winvm` uses its built-in one, builds image `base` from the
 Windows ISO and starts instance `main` on it. `winvm sh` (or `ssh`, `cp`, `rdp`) also
@@ -104,10 +115,10 @@ to or start other instances from:
 
 ```sh
 winvm stop                          # save needs the instance stopped
-winvm save office                   # main's disk becomes image "office" (compressed, read-only)
-winvm up work --image office        # a second instance, "work", starting from it
-winvm -i work sh                    # -i picks the instance (default: main)
-winvm reset                         # later: main back to "office", dropping what came after
+winvm save golden                   # main's disk becomes image "golden" (compressed, read-only)
+winvm up work --image golden        # a second instance, "work", starting from it
+winvm sh -i work                    # -i picks the instance (default: main)
+winvm reset                         # later: main back to "golden", dropping what came after
 ```
 
 `main` continues on the saved image, so the image itself never changes. A saved image
@@ -125,7 +136,7 @@ steps with network, keep the changes):
 # ~/.config/winvm/images/base.yaml - replaces the built-in base (`winvm config dump base`);
 # an ISO image's file only needs what differs from the built-in base
 edition: Windows 11 Pro N            # `winvm editions` lists them
-keyboard: "041f:0000041f"            # Turkish Q
+timezone: Pacific Standard Time      # Windows time zone name (`tzutil /l` lists them)
 slim: true                           # cache the debloated image: much faster rebuilds
 setup:                               # during the install, as SYSTEM, without network
   - download: {url: "https://www.7-zip.org/a/7z2409-x64.msi", sha256: <sha256>}
@@ -151,8 +162,8 @@ run:                                 # how instances of dev run (images on dev i
 
 ```sh
 winvm up dev                         # builds base and dev as needed, runs instance "dev"
-winvm -i work up --image dev --ram 6G    # another instance of dev, with its own RAM
-winvm up ./team/office.yaml          # an image file anywhere: instance "office"
+winvm up dev2 --image dev --ram 6G   # another instance of dev, with its own RAM
+winvm up ./team/accounting.yaml      # an image file anywhere: instance "accounting"
 ```
 
 **Where image files come from.** A name like `dev` means `dev.yaml` in
@@ -160,8 +171,10 @@ winvm up ./team/office.yaml          # an image file anywhere: instance "office"
 other file is given by its path once; winvm remembers it, so later commands (and
 `from: NAME` in other files) work by name from any folder. Like a Docker image, a
 built image stays usable by name even when its file is gone (or for images you
-`save`): it just can't be rebuilt without the file. Your `base.yaml` replaces the built-in `base` (`winvm images` says so); two
-files with the same name are an error, never a silent pick. A file's folder is its
+`save`): it just can't be rebuilt without the file (`prune` keeps its newest version,
+`rmi` deletes it). Your `base.yaml` replaces the built-in `base` (`winvm images` says
+so); two files with the same name are an error, never a silent pick. A file with a
+mistake fails only the commands that use it (`winvm images` lists it as broken). A file's folder is its
 context: `copy: [./dotfiles]` and mount paths are relative to the file. For files
 you share, leave `iso:` out: everyone links their own ISO once with `--iso`.
 
@@ -174,16 +187,20 @@ the work folder, which is deleted when the build ends. Files that `setup` steps 
 travel on a CD: their names must be valid on Windows and at most 64 characters long.
 
 **Instances.** `winvm up NAME` runs the instance NAME, on the image of the same name
-if there is one, else on `base` (or `--image`). Its settings come from the machine's
-`run` defaults, then the `run:` of its image and the images below, then its own
-`--ram/--cpus` (kept in its folder).
+if there is one (a saved one too), else on `base` (or `--image`). Its settings come
+from the machine's `run` defaults, then the `run:` of its image and the images below,
+then its own: `--ram/--cpus` and `mount --save` (kept in its folder; `winvm info`
+shows them, `--ram default` drops one).
 
 **Rebuilds work like Docker layers.** Every image has a content hash over its
 definition, the files it copies and the image below it (not over where its file is).
-Change any of it and the image (and everything built on it) gets a new version on the
-next `build`, `reset`, or `up` of a new instance. Existing instances keep running on
-the version they were created on; `winvm ps` marks them outdated and `winvm reset`
-moves them over (discarding their changes). `winvm prune` deletes versions nothing uses.
+Change a `from` image and it (and everything built on it) gets a new version on the
+next `build`, `reset`, or `up` of a new instance. An ISO image is different, because
+installing Windows again takes up to an hour: when its file (or a winvm upgrade)
+changes it, `winvm images` marks it *outdated*, and it stays in use until you run
+`winvm build NAME`. Existing instances keep running on the version they were created
+on; `winvm ps` marks them outdated and `winvm reset` moves them over (discarding their
+changes). `winvm prune` deletes versions nothing uses.
 
 **Machine settings** (folders, ports, UUID, RAM reserve, default `run`) are in
 `~/.config/winvm/winvm.yaml`, merged over the built-in ones (`winvm config dump`).
@@ -201,8 +218,8 @@ winvm sh -t python                # -t: a terminal, for interactive programs
 cat x | winvm sh findstr foo      # stdin reaches native programs ...
 cat x | winvm sh 'stdin | sort'   # ... and PowerShell code reads it with `stdin`
 winvm sh ipconfig | grep IPv4     # output has Unix line endings
-winvm sh cmd /c exit 3; echo $?   # 3: the exit code is the command's (1 for a failed cmdlet)
-cd ~/Projects/x && winvm -i work sh dir   # inside a mount: runs in C:\mnt\projects\x
+winvm sh cmd /c exit 3; echo $?   # 3: the exit code is the command's (fish: $status)
+cd ~/Projects/x && winvm sh -i dev dir    # inside a mount: runs in C:\mnt\projects\x
 ```
 
 The command travels base64-encoded, so no quoting is lost between your shell, ssh,
@@ -240,12 +257,14 @@ kernel's KSM (off by default; `winvm check` shows the command to turn it on).
 winvm mount ~/data                # running instance: guest C:\mnt\data, at once
 winvm mount ~/data d2 --ro        # another name (C:\mnt\d2), read-only
 winvm mount ~/src 'C:\src'        # a Windows path instead of a name: the link goes there
+winvm mount ~/data --save         # also at every later start of this instance
 winvm mount                       # list
 winvm umount d2                   # by name, or where it is: winvm umount 'C:\src'
 ```
 
 Mounts from `run:` settings are set up at every start; `mount`/`umount` change a
-running instance until it stops. Each instance runs its own unprivileged Samba server
+running instance until it stops, or for good with `--save` (which also works on a
+stopped instance; `umount --save` drops even a mount the image's `run:` adds). Each instance runs its own unprivileged Samba server
 (QEMU forwards `\\10.0.2.4` to it), whose config winvm rewrites on the fly. The guest
 gets folder links (in `C:\mnt`, or where `at:` / a Windows path puts them) rather than
 drive letters, because a drive letter exists only in the logon session that mapped it.
@@ -254,27 +273,31 @@ mount point taken by a real folder or file is refused, never replaced.
 
 ## Commands
 
-Instance commands act on `-i NAME`, default `main`. Wherever an IMAGE is asked for,
-a name or the path of an image file works. `-y` (before the command) allows downloads
-without asking.
+Instance commands act on `-i NAME` (default `main`), given before or after the command
+(`winvm sh -i dev`, `winvm -i dev sh`; for `ssh` and `cp` only before, since ssh and scp
+have their own `-i`). Wherever an IMAGE is asked for, a name or the path of an image
+file works. Deleting something asks first in a terminal; `-y` doesn't ask (neither
+before downloads).
 
 | command | |
 |---|---|
-| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX] [--cpus N] [--iso ISO] [--all] [--gui]` | create (building images as needed) and start; ready when SSH answers |
-| `stop [NAME...] [--all]` / `kill` | ACPI shutdown (hard kill after 120 s) / power off |
-| `ps` | instances: state, ports, disk, RAM, image version, mounts |
-| `sh [-t] [CMD]`, `ssh`, `cp`, `wait` | see above |
-| `mount [PATH [NAME\|WINPATH]] [--ro]` / `umount NAME\|WINPATH` | host folders in the running guest |
+| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX\|default] [--cpus N\|default] [--iso ISO] [--all] [--gui]` (`start`) | create (building images as needed) and start; ready when SSH answers |
+| `stop [NAME...] [--all] [--timeout S]` (`down`) / `restart [NAME...]` / `kill [NAME...]` | ACPI shutdown, all at once, hard power-off after 120 s / stop + start / power off |
+| `ps [-q] [--json]` (`status`), `info` | instances: state, ports, disk, RAM, image version, mounts / one instance in detail |
+| `sh [-t] [CMD]` (`shell`), `ssh`, `cp`, `wait [SECONDS]` | see above; `wait`: until SSH answers (default 600 s) |
+| `mount [PATH [NAME\|WINPATH]] [--ro] [--save]` / `umount NAME\|WINPATH [--save]` | host folders in the guest |
 | `gui` / `rdp` | VNC viewer (or start with a GTK window) / FreeRDP session |
+| `logs [serial\|balloon\|smb\|qemu] [-f]` | an instance's logs (without a name: where they are) |
 | `ga`, `balloon [SIZE]`, `screenshot`, `cmdline` | guest agent, live RAM, PNG of the screen, QEMU argv |
-| `build [IMAGE...] [--force]` | build missing or changed images (default: all known) |
-| `images` | images: built versions, status, size, base, users, defining file |
+| `build [IMAGE...] [--force] [--gui]` | build missing or changed images (default: all known) |
+| `images [--json]` | images: built versions, status, size, base, users, defining file |
 | `save NAME` | freeze the instance's disk as image NAME; the instance continues on it |
-| `reset [IMAGE]` | discard the instance's changes: fresh disk on the current version |
-| `rm` / `rmi IMAGE` / `prune [--cache]` | delete an instance / an image / unused versions and leftovers |
+| `reset [IMAGE]` | discard the instance's changes: fresh disk on the current version (of IMAGE) |
+| `rm [NAME...]` / `rmi IMAGE` / `prune [-n] [--cache]` | delete instances / an image / unused versions, stale slim images, leftovers |
+| `df` | disk space used by images, instances, ISOs, cache; free space |
 | `check` | what the host has and lacks, what will be downloaded |
 | `fetch [IMAGE...]` | download now what building needs (asks; `-y`) |
-| `editions [IMAGE]` | editions in an image's Windows ISO |
+| `editions [IMAGE\|ISO]` | editions in an image's (or an ISO file's) Windows ISO |
 | `completion bash\|fish` | print a shell completion script |
 | `config dump [base]`, `config show [IMAGE]`, `config path` | built-in settings or base / what is in effect / files and folders |
 
@@ -293,21 +316,44 @@ instance's disk keeps its changes across stop/start anyway.
 ~/.cache/winvm/                     --cache-dir / $WINVM_CACHE_DIR / settings.cache_dir
   downloads/  slim/  firmware/      pinned downloads, cached slim images, OVMF if downloaded
   build/                            build scratch
-$XDG_RUNTIME_DIR/winvm-*/<name>/    while running: pid, ports, sockets, serial.log, ssh_config, smb/
+$XDG_RUNTIME_DIR/winvm-*/<name>/    while running: pid, ports, sockets, logs, ssh_config, smb/
 ```
+
+`winvm config path` prints the folders in use (the run folder's name is a hash of the
+data folder, so two data folders never mix).
 
 Backing files are relative paths, so `qemu-img info --backing-chain` shows the
 same chain as `winvm images` and the data folder can be moved.
 
-**Access.** SSH `127.0.0.1:2222` (+*n*), user `user`, key `~/.local/share/winvm/keys/id_ed25519`
-(`~/.ssh/id_ed25519.pub` is authorized too). For plain `ssh main` or VS Code
-Remote-SSH, add `Include /run/user/*/winvm-*/*/ssh_config` to `~/.ssh/config`.
-RDP `127.0.0.1:3390`, user `user`, password `winslim`. VNC `127.0.0.1:5930`.
-All forwards bind to 127.0.0.1; the guest firewall is off on purpose.
+**Access.** SSH `127.0.0.1:2222` (+*n*), user `user`, key `~/.local/share/winvm/keys/id_ed25519`;
+your own keys in `settings.ssh_pubkeys` (default `~/.ssh/id_ed25519.pub`) are
+authorized too, brought up to date at every start. For plain `ssh main` or VS Code
+Remote-SSH, put `Include /run/user/*/winvm-*/*/ssh_config` at the **top** of
+`~/.ssh/config` (before any `Host` line; an instance's entry exists while it runs).
+RDP `127.0.0.1:3390`, user `user`, password `winslim` (the image's `password:`). VNC
+`127.0.0.1:5930`. All forwards bind to 127.0.0.1; the guest firewall is off on purpose.
 
 **Host RAM guard.** Before starting a VM, winvm checks `MemAvailable` minus what
 running VMs may still grow into, and refuses when the VM plus `settings.mem_reserve`
-doesn't fit.
+doesn't fit: stop another instance, or give this one less (`winvm up --ram 3G`, or
+`--ram 2G-6G` for dynamic memory).
+
+## Troubleshooting
+
+* **Logs**: `winvm logs` lists an instance's logs (`serial`, `balloon` for dynamic
+  memory, `smb` for mounts, `qemu` with `--gui`); `winvm logs serial -f` follows one.
+  A build VM is an instance too: `winvm -i _install-base logs serial -f`.
+* **A build seems stuck**: Windows Setup prints nothing of its own; winvm prints a line
+  every minute with the time and how much was written, and says so when nothing new
+  was written for 15 minutes. Look at the screen: `winvm -i _install-base screenshot`,
+  or the VNC address it printed. `WINVM_DEBUG=1 winvm build` keeps a WinPE failure on
+  screen instead of powering off.
+* **An interrupted first build** starts the Windows install over (downloads resume).
+* **`no access to /dev/kvm`**: `sudo usermod -aG kvm $USER`, then log out and in again.
+* **A command fails because of an image file**: `winvm images` lists broken files with
+  the reason; other images and instances keep working.
+* **Disk full**: `winvm df` shows what takes the space; `winvm prune` (then
+  `--cache`) frees it. winvm checks free space before a download or build.
 
 ## How an ISO image is built
 
@@ -339,8 +385,9 @@ attach it and apply it directly, skipping the servicing. Its cache key is the IS
 (by sha256), the edition, the debloat lists, pe.cmd and the virtio drivers, so it is
 shared by every image using them.
 
-Progress (from step 3 on) streams from the build VM's serial port; inside the guest
-the logs are in `C:\Windows\Setup\winslim*.log`. `WINVM_DEBUG=1 winvm build` makes a
+Progress lines stream from the build VM's serial port from step 3 on; before that
+(step 1 can take tens of minutes) winvm prints a line a minute with the time and the
+data written. Inside the guest the logs are in `C:\Windows\Setup\winslim*.log`. `WINVM_DEBUG=1 winvm build` makes a
 WinPE failure stay on screen (`winvm -i _install-NAME screenshot`) instead of
 powering off.
 
@@ -372,8 +419,8 @@ terms, and activating it needs a license of your own. Every VM has the same SMBI
 UUID (`settings.uuid`), so all images and instances look like one machine to
 activation: activate in an instance and `winvm save` it, and rebuilding or resetting
 keeps it. That is meant for one licensed machine: running several activated copies
-at the same time needs a license for each (give them different `uuid`s via
-separate data dirs). `slmgr /ipk <key>` then `slmgr /ato`, or Settings › Activation.
+at the same time needs a license for each: give each its own settings file (`-f` or
+`$WINVM_CONFIG`) with its own `uuid` and `data_dir`. `slmgr /ipk <key>` then `slmgr /ato`, or Settings › Activation.
 
 Office installs fine as an image step or by hand with the [Office Deployment Tool][odt],
 which downloads from Microsoft's CDN, not Windows Update. Microsoft 365 Apps need
@@ -397,5 +444,6 @@ delete `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` and set `wuauser
 * **pe.cmd wipes disk 0** of the VM it runs in. It refuses to run unless the SMBIOS
   vendor is QEMU, and a slim capture only writes to a disk of exactly the capture size.
 * The debloat lists (what gets removed) ship inside the package. To change them,
-  edit `src/winvm/data/guest/lists/*.txt` in a checkout and install it with
-  `uv tool install -e .` (editable); images rebuild because their hash changes.
+  edit `src/winvm/data/guest/lists/*.txt` in a checkout of
+  <https://github.com/shadymeowy/winvm> and install it with `uv tool install -e .`
+  (editable); `winvm build base` then installs with the new lists.

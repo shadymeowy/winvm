@@ -18,6 +18,11 @@ classifiers = [
     "Topic :: System :: Emulators",
 ]
 
+[project.urls]
+Homepage = "https://github.com/shadymeowy/winvm"
+Source = "https://github.com/shadymeowy/winvm"
+Issues = "https://github.com/shadymeowy/winvm/issues"
+
 [project.scripts]
 winvm = "winvm.cli:main"
 

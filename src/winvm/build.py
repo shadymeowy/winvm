@@ -43,13 +43,28 @@ WORK = r"C:\winvm-build"        # work folder of `from` builds: downloads, copie
 BOM = b"\xef\xbb\xbf"             # Windows PowerShell reads .ps1 files without it as ANSI, not UTF-8
 
 
-def build(cfg: Config, names: list[str], force=False, gui=False) -> None:
+def build(cfg: Config, names: list[str], force=False, gui=False, stale=False) -> None:
     """Build whatever `names` need, bottom-up; up-to-date images are skipped. Asks once
-    for the downloads that takes (cfg.yes: don't ask)."""
+    for the downloads that takes (cfg.yes: don't ask). An ISO image whose definition
+    changed after it was built is rebuilt only with `stale` (`winvm build`): otherwise
+    its built version is used (reinstalling Windows takes up to an hour)."""
     store = Store(cfg)
     order: list[str] = []
     for n in names:
         order += [x for x in cfg.chain(n) if x not in order]
+    for n in order:
+        try:
+            cfg.hash(n)                                        # finds out which are stale
+        except Fatal:
+            pass
+    if stale and (redo := [n for n in order if n in cfg.stale]):
+        log(f"{', '.join(redo)} changed since built (its file or winvm): installing Windows again")
+        cfg.fresh.update(redo)
+        cfg.forget()
+    for n in order:
+        if n in cfg.stale:
+            warn(f"'{n}' changed since it was built (its file or winvm) - using the built version; "
+                 f"`winvm build {n}` installs it again")
 
     def pending(n: str) -> bool:
         try:
@@ -63,6 +78,7 @@ def build(cfg: Config, names: list[str], force=False, gui=False) -> None:
     host.require(cfg, gui)                                     # the host can run it at all?
                                                                # (before downloading gigabytes)
     items = host.downloads_for(cfg, todo)
+    host.check_space(cfg, items, [n for n in todo if "from" not in cfg.image(n)])
     host.consent(items, cfg.yes)
     host.fetch_all(cfg, items)
     cfg.forget()                                               # an ISO may have arrived
@@ -74,6 +90,7 @@ def build(cfg: Config, names: list[str], force=False, gui=False) -> None:
             die(f"{label(cur)} is in use by {', '.join(users)} - rm/reset those to rebuild it")
         t0 = time.time()
         (build_overlay if "from" in cfg.image(n) else build_iso)(cfg, n, gui)
+        cfg.forget()                                           # images on it: their hashes change
         log(f"built {label(store.require(n))} in {(time.time() - t0) / 60:.0f} min")
 
 
@@ -265,6 +282,9 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     watcher = threading.Thread(target=watch_qmp, args=(inst.dir / "qmp-build.sock", qemu, reason), daemon=True)
     watcher.start()
     buf = b""
+    written = [inst.disk, *(d for d, ro in disks if not ro)]  # disks the installer writes to
+    said = grew = time.time()
+    size = 0
     try:
         with serial.open("rb") as f:
             while True:
@@ -274,8 +294,21 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
                 for ln in lines:
                     if ln[:4] in (b"[SC]", b"[FL]", b"[WIN"):
                         print(ln.decode(errors="replace").rstrip("\r"), flush=True)
+                        said = time.time()
                 if done:
                     break
+                now = time.time()
+                if now - said >= 60:                           # quiet phases (Windows Setup) last long
+                    new = sum(d.stat().st_blocks * 512 for d in written if d.exists())
+                    if new > size + (64 << 20):
+                        size, grew = new, now
+                    stuck = now - grew >= 15 * 60
+                    log(f"... {(now - t0) / 60:.0f} min, {size / (1 << 30):.1f} GB written"
+                        + (f" - nothing new for {(now - grew) / 60:.0f} min: have a look with "
+                           f"`winvm -i {inst.name} screenshot`" + (f" or vncviewer 127.0.0.1:{inst.state['vnc']}"
+                                                                   if inst.state.get("vnc") else "")
+                           if stuck else ""))
+                    said = now
                 time.sleep(0.5)
     finally:
         if qemu.poll() is None:

@@ -119,20 +119,23 @@ class Config:
         self.images: dict[str, dict] = {}
         self.sources: dict[str, Path] = {}
         self.replaced: set[str] = set()                         # built-ins your files replace
+        self.broken: dict[str, str] = {}                        # name -> why its file can't be used
+        self.stale: dict[str, str] = {}                         # ISO image -> the hash its file asks for
+        self.fresh: set[str] = set()                            # ISO images to build as defined (build)
         self._hash: dict[str, str] = {}
         for f in sorted(BUILTIN.glob("*.yaml")):
             self.load(f)
         d = self.s.get("images_dir")
         self.images_dir = self.path(d) if d else config_home() / "images"
         for f in sorted(self.images_dir.glob("*.yaml")) + sorted(self.images_dir.glob("*.yml")):
-            self.load(f)
+            self.load_quietly(f)
         for meta in [*(self.data / "instances").glob("*/instance.json"), *(self.data / "images").glob("*.json")]:
             try:
                 src = json.loads(meta.read_text()).get("source")
             except (OSError, ValueError):
                 continue
             if src and Path(src).is_file() and Path(src).stem not in self.sources:
-                self.load(Path(src))
+                self.load_quietly(Path(src))
 
     # --- paths
     def folder(self, cli: str | None, env: str, key: str) -> Path:
@@ -180,13 +183,27 @@ class Config:
             img["from"] = self.load(self.path(img["from"], f.parent))
         return name
 
+    def load_quietly(self, f: Path) -> None:
+        """Load an image file found by looking around; a broken one fails only the commands
+        that use it (a typo in one file shouldn't stop `winvm ps`)."""
+        try:
+            self.load(f)
+        except Fatal as e:
+            self.broken.setdefault(f.stem, str(e))
+
     def ref(self, ref: str) -> str:
         """An image named on the command line: a name, or a path to an image file."""
-        return self.load(Path(ref).expanduser()) if is_path(ref) else valid(ref)
+        if is_path(ref):
+            return self.load(Path(ref).expanduser())
+        if ref in self.broken:
+            die(self.broken[ref])
+        return valid(ref)
 
     def image(self, name: str) -> dict:
         if name in self.images:
             return self.images[name]
+        if name in self.broken:
+            die(self.broken[name])
         if self.prebuilt(name):
             die(f"image '{name}' is built, but its file is gone (or it was `save`d): it can be "
                 f"used, not rebuilt - give its file's path to rebuild it")
@@ -297,6 +314,11 @@ class Config:
             log(f"created SSH key {self.key}")
         return self.key
 
+    def own_key(self) -> str:
+        """winvm's own public key: what an image must trust for winvm to reach it (your
+        `ssh_pubkeys` are brought up to date at every start instead)."""
+        return self.ensure_key().with_suffix(".pub").read_text().strip()
+
     def authorized_keys(self) -> str:
         keys = [self.ensure_key().with_suffix(".pub"), *(self.path(p) for p in self.s.get("ssh_pubkeys") or [])]
         return "".join(k.read_text().strip() + "\n" for k in keys if k.exists())   # one per line
@@ -332,14 +354,22 @@ class Config:
                         return built[0]
                     raise
                 d = {**{k: img.get(k) for k in BASE_KEYS}, "iso": iso,
-                     "setup": steps, "guest": content_hash(GUEST), "keys": self.authorized_keys(),
+                     "setup": steps, "guest": content_hash(GUEST), "key": self.own_key(),
                      "tools": [self.s["virtio"]["sha256"], self.s["openssh"]["sha256"]]}
-            self._hash[name] = sha(d)
+            h = sha(d)
+            # an ISO image whose file (or winvm) changed since it was built: reinstalling Windows
+            # takes up to an hour, so the built version stays in use until it is built on purpose
+            if "from" not in img and name not in self.fresh and (built := self.built_hashes(name)) \
+                    and h not in built:
+                self.stale[name] = h
+                h = built[0]
+            self._hash[name] = h
         return self._hash[name]
 
     def forget(self) -> None:
-        """Drop cached hashes (after an ISO arrived, for instance)."""
+        """Drop cached hashes (after an ISO arrived, or an image was built)."""
         self._hash.clear()
+        self.stale.clear()
 
     def built_hashes(self, name: str) -> list[str]:
         """Hashes of the built versions of an image, newest first (from images/*.json)."""

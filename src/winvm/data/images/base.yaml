@@ -15,7 +15,7 @@ user: user                       # local administrator; SSH logs in with keys
 password: winslim                # console / RDP
 timezone: W. Europe Standard Time
 locale: en-US
-keyboard: "0409:00000409"        # e.g. "041f:0000041f" = Turkish Q
+keyboard: "0409:00000409"        # input locale "language:layout" (0409:00000409 = US)
 disk_size: 64G                   # virtual; qcow2 only stores what is used
 slim: false                      # true: keep the debloated image in the cache (~6 GB): rebuilds
                                  # take a fraction of the time (the first build a bit longer)

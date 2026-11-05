@@ -315,6 +315,30 @@ def downloads_for(cfg: Config, names: list[str]) -> list[dict]:
     return items
 
 
+def check_space(cfg: Config, items: list[dict], iso_images: list[str]) -> None:
+    """Enough free disk for the downloads and builds ahead? (Per file system: data and
+    cache dirs may be on different ones.) Rough: an ISO build needs ~10 GB of scratch in
+    the cache and ~6 GB for the image; a slim one ~8 GB more for its cache."""
+    need: dict[int, list] = {}
+
+    def add(path: Path, n: int) -> None:
+        p = path
+        while not p.exists():
+            p = p.parent
+        need.setdefault(os.stat(p).st_dev, [p, 0])[1] += n
+
+    for i in items:
+        add(i["dest"], i.get("size") or 0)
+    for n in iso_images:
+        add(cfg.data, 6 << 30)
+        add(cfg.cache, (10 + (8 if cfg.image(n).get("slim") else 0)) << 30)
+    for p, n in need.values():
+        free = shutil.disk_usage(p).free
+        if free < n:
+            die(f"not enough disk space: this needs about {human(n)} on the file system of {p}, "
+                f"which has {human(free)} free (settings data_dir / cache_dir can point elsewhere)")
+
+
 TITLES = {"virtio": "virtio-win drivers + guest tools (Fedora)",
           "openssh": "Win32-OpenSSH server (Microsoft, GitHub)",
           "ovmf": "OVMF UEFI firmware (Debian package)"}
