@@ -29,7 +29,7 @@ GUEST = DATA / "guest"
 BASE_KEYS = ("edition", "index", "hostname", "user", "password", "timezone", "locale", "keyboard",
              "disk_size", "debloat")
 FROM_KEYS = {"from", "steps", "run", "desktop", "password"}
-RUN_KEYS = {"ram", "cpus", "mounts"}
+RUN_KEYS = {"ram", "cpus", "mounts", "desktop", "password"}
 
 
 def merge(a, b):
@@ -415,7 +415,7 @@ class Config:
 
     # --- how instances run
     def run_settings(self, image: str | None, overrides: dict | None = None) -> dict:
-        """ram/cpus/mounts of an instance: the machine's `run`, then the `run:` of its image and
+        """ram/cpus/mounts/desktop/password of an instance: the machine's `run`, then the `run:` of its image and
         the images below it (bottom first), then the instance's own overrides. Mount paths are
         relative to the file that names them; `name: null` drops a mount."""
         layers = [(self.run_defaults, self.base, str(self.file or DEFAULT_FILE))]
@@ -430,6 +430,8 @@ class Config:
             for k, v in settings.items():
                 if k == "ram" and isinstance(v, dict):         # dynamic memory: {min, max}
                     check_keys(v, {"min", "max"}, f"{where}: run.ram")
+                if k == "desktop" and not isinstance(v, bool):
+                    die(f"{where}: run.desktop is true or false")
                 if k != "mounts":
                     out[k] = v
                     continue

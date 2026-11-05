@@ -7,19 +7,22 @@ import json
 import os
 import re
 import shlex
+import select
 import shutil
+import signal
+import stat
 import sys
 import time
 from pathlib import Path
 
 import yaml
 
-from . import __version__, guest, host
+from . import __version__, desktop, guest, host
 from .build import build, fetch_step
 from .config import BUILTIN, DEFAULT_FILE, Config, is_path, sha
 from .media import editions
 from .store import Store, label
-from .util import Chan, Fatal, die, du, log, mib, mount_point, paint, valid, warn, win_path
+from .util import Chan, Fatal, die, du, log, mib, mount_point, paint, seconds, valid, warn, win_path
 from .vm import Instance, ports, running, smbd as vm_smbd
 
 COMMANDS: dict[str, tuple] = {}
@@ -71,6 +74,22 @@ def confirm(a, question: str) -> None:
         return
     try:
         ok = input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        ok = False
+    if not ok:
+        die("nothing changed")
+
+
+def allow_reboot(a, vm: Instance) -> None:
+    """Rebooting a running VM to log on could interrupt what it is doing: only when asked,
+    so never unnoticed from a script."""
+    if a.yes:
+        return
+    if not sys.stdin.isatty():
+        die(f"{vm.name} is running and not logged on, and logging on reboots it. Allow that with -y, "
+            f"or `winvm -i {vm.name} up --desktop` while it is stopped")
+    try:
+        ok = input(f"{vm.name} is running and not logged on. Reboot it to log on? [y/N] ").strip().lower() in ("y", "yes")
     except EOFError:
         ok = False
     if not ok:
@@ -137,6 +156,8 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
          arg("--all", action="store_true", help="every existing instance"),
          arg("--iso", help="Windows ISO for images without `iso:` (remembered in ${data_dir}/iso)"),
          arg("--gui", action="store_true", help="GTK window with clipboard instead of headless"),
+         arg("--desktop", nargs="?", const="on", metavar="off|default", help="log on by itself at every boot, without a window; "
+                                                     "kept for this instance (`default`: back to the image's)"),
          aliases=("start",))
 def cmd_up(a):
     """create (building images as needed) and start instances; ready when SSH answers"""
@@ -153,16 +174,33 @@ def cmd_up(a):
         die(f"--cpus: a number, or `default` (got {cpus!r})")
     run = {k: None if v == "default" else int(v) if k == "cpus" else v
            for k, v in (("ram", ram), ("cpus", cpus)) if v}
+    desk = a.desktop
+    if desk not in (None, "on", "off", "default"):             # `up --desktop work`: an instance
+        a.names, desk = [desk, *a.names], "on"
+    if desk:
+        run["desktop"] = {"on": True, "off": False, "default": None}[desk]
     image = cfg.ref(a.image) if a.image else None
     names = [d.parent.name for d in store.disks()] if a.all else \
         [cfg.ref(n) if is_path(n) else valid(n) for n in a.names or [a.instance]]
     host.require(cfg, a.gui)                                   # before building or creating
     for n in names:
         vm = Instance(cfg, n)
-        if run and vm.alive:
+        if run.keys() - {"desktop"} and vm.alive:
             warn(f"{n} is running: the new settings apply from its next start (winvm -i {n} restart)")
+        reboot = False
+        if desk == "on" and vm.alive:                          # before the setting is kept
+            vm.wait_ssh()
+            if not any(desktop.status(vm)):
+                allow_reboot(a, vm)
+            reboot = True
+        before = vm.meta
         ensure_disk(cfg, vm, image, run)
-        vm.start(gui=a.gui)
+        try:
+            vm.start(gui=a.gui, reboot=reboot)
+        except Fatal:
+            if desk == "on" and before:                        # it couldn't log on: nothing changes
+                vm.meta = before
+            raise
         log(f"{n} is up - winvm{'' if n == 'main' else f' -i {n}'} sh")
 
 
@@ -249,6 +287,9 @@ def cmd_info(a):
     own = vm.meta.get("run") or {}
     print(f"ram       {ram_text(vm, st)}" + ("  (own setting; `winvm up --ram default` drops it)" if "ram" in own else ""))
     print(f"cpus      {eff.get('cpus')}" + ("  (own setting; `winvm up --cpus default` drops it)" if "cpus" in own else ""))
+    if eff.get("desktop") or "desktop" in own:
+        print(f"desktop   {'logs on at every boot' if eff.get('desktop') else 'off'}"
+              + ("  (own setting; `winvm up --desktop default` drops it)" if "desktop" in own else ""))
     mounts = vm.mounts if st else eff["mounts"]
     for i, (n, m) in enumerate(mounts.items()):
         saved = "  (saved with this instance)" if n in (own.get("mounts") or {}) else ""
@@ -283,7 +324,10 @@ def outdated(cfg: Config, store: Store, vm: Instance, on: Path | None) -> bool:
 
 # ------------------------------------------------------------------ guest access
 
-@command(arg("cmd", nargs="*", metavar="CMD", help="PowerShell command line (as typed at the prompt)"),
+@command(arg("-t", action="store_true", help="a terminal, for interactive programs"),
+         arg("--desktop", action="store_true", help="run CMD in the logged-on desktop session"),
+         arg("--timeout", metavar="TIME", help="give up on CMD after this long (90s, 30m, 2h): exit 124"),
+         arg("cmd", nargs="*", metavar="CMD", help="PowerShell command line (as typed at the prompt)"),
          raw=True, aliases=("shell",))
 def cmd_sh(a):
     """PowerShell in the guest: interactive, or run CMD and return its exit code
@@ -295,22 +339,124 @@ def cmd_sh(a):
     winvm sh -t python                -t: a terminal, for interactive programs
     cat x | winvm sh findstr foo      stdin reaches native programs; PowerShell code reads `stdin`
     winvm sh ipconfig | grep IPv4     output has Unix line endings
+    winvm sh --desktop CMD            in the logged-on desktop session (COM, winget, DPAPI)
+    winvm sh --timeout 5m CMD         give up on it after 5 minutes: exit 124
 
     The exit code is the command's. Run from inside a mounted host folder, the guest
     command runs in the matching C:\\mnt\\... folder.
+
+    --desktop reboots a VM that isn't logged on, which it asks about in a terminal and refuses
+    from a script, unless -y or the VM was stopped. Output is text, with stderr mixed in;
+    stdin is not passed on. --timeout ends the command and what it started, but not what
+    Windows started for it (Store apps, COM servers).
     """
-    vm = ready(a)
-    tty = a.rest[:1] == ["-t"]
-    words = a.rest[tty:]
+    rest, tty, on_desktop, limit = list(a.rest), False, False, None
+    while rest:                                                # (only before the command)
+        w = rest[0]
+        if w == "-t":
+            tty = True
+        elif w == "--desktop":
+            on_desktop = True
+        elif w in ("-y", "--yes"):
+            a.yes = a.cfg.yes = True
+        elif w in ("-i", "--instance", "--timeout") and len(rest) == 1:
+            die(f"{w} needs a value")
+        elif w in ("-i", "--instance"):
+            a.instance = rest.pop(1)
+        elif w == "--timeout" or w.startswith("--timeout="):
+            value = rest.pop(1) if w == "--timeout" else w.partition("=")[2]
+            try:
+                limit = seconds(value)
+            except ValueError as e:
+                die(f"--timeout: {e}")
+        elif w == "--":
+            rest.pop(0)
+            break
+        else:
+            break
+        rest.pop(0)
+    words = rest
+    if not words and (on_desktop or limit):
+        die(f"{'--desktop' if on_desktop else '--timeout'} needs a command: winvm sh {'--desktop' if on_desktop else '--timeout 5m'} CMD"
+            + (" (to work on the desktop yourself: winvm gui, or winvm rdp)" if on_desktop else ""))
+    if tty and (on_desktop or limit):
+        die(f"-t doesn't go with {'--desktop' if on_desktop else '--timeout'}")
+    if on_desktop:
+        check_no_stdin()
+    vm = existing(a)
+    fresh = not vm.alive
+    vm.up()
     cwd = vm.guest_path(Path.cwd())
+    if on_desktop:
+        return sh_desktop(a, vm, guest.command_line(words), cwd, limit, fresh)
     if not words:                                              # interactive shell
         # still a shell if the folder can't be entered: to find out why, for one
         cd = (f"try {{ Set-Location -LiteralPath {guest.quote(cwd)} -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine("
               f"\"warn: can't enter {cwd.replace(chr(34), '').replace('$', '`$')}, starting in $((Get-Location).Path)\") }}\n"
               "powershell -NoLogo") if cwd else None
         return guest.terminal(vm.ssh("-t") + ([guest.encoded(cd)] if cd else []))
-    script = guest.script(guest.command_line(words), cwd, console=tty)
-    return guest.tty(vm.ssh, script) if tty else guest.pipe(vm.ssh, script)
+    pid_file = rf"C:\ProgramData\winvm\sh-{os.getpid()}.pid" if limit else None
+    script = guest.script(guest.command_line(words), cwd, console=tty, pid_file=pid_file)
+    if tty:
+        return guest.tty(vm.ssh, script)
+    rc = guest.pipe(vm.ssh, script, timeout=limit)
+    if rc == guest.TIMED_OUT:
+        guest.end(vm.ssh, pid_file)
+        print(paint("1;31", "error:"), f"gave up on the command after {limit} s and ended it", file=sys.stderr)
+        return guest.EXIT_TIMED_OUT
+    return rc
+
+
+def check_no_stdin() -> None:
+    """--desktop has no way to pass stdin on: better an error than a command that sees nothing."""
+    try:
+        st = os.fstat(0)
+        if stat.S_ISREG(st.st_mode):
+            waiting = st.st_size > os.lseek(0, 0, os.SEEK_CUR)
+        elif stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode):   # a pipe nobody writes to is fine
+            waiting = bool(select.select([0], [], [], 0.1)[0] and os.read(0, 1))
+        else:
+            waiting = False
+    except OSError:
+        return
+    if waiting:
+        die("winvm sh --desktop can't pass stdin on to the command: copy the data in with winvm cp, "
+            "or add </dev/null if the command doesn't need it")
+
+
+def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, fresh: bool) -> int:
+    """`winvm sh --desktop`: see cmd_sh."""
+    armed, on = desktop.status(vm)
+    if not on:
+        if armed:                                              # it is still booting
+            desktop.wait_logon(vm, f"{vm.name} in desktop mode")
+        else:
+            if not fresh:
+                allow_reboot(a, vm)
+            before = vm.meta
+            ensure_disk(a.cfg, vm, run={"desktop": True})
+            try:
+                desktop.sync(vm, may_reboot=True)
+            except Fatal:                                      # it couldn't log on: nothing changes
+                vm.meta = before
+                raise
+            log(f"desktop mode is on for {vm.name} from now on (`winvm -i {vm.name} up --desktop default` drops it)")
+
+    def stopped(*_):                                           # `kill`, `timeout`: as Ctrl-C does
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stopped)
+    rc, note = desktop.run(vm, code, limit, cwd=cwd)
+    if rc == guest.TIMED_OUT:
+        print(paint("1;31", "error:"), f"gave up on the command after {limit} s and ended it{note}", file=sys.stderr)
+        return guest.EXIT_TIMED_OUT
+    if rc == desktop.VANISHED:
+        print(paint("1;31", "error:"), f"the command ended without an exit code: it probably rebooted the VM or "
+              f"logged the user off{note}", file=sys.stderr)
+        return 1
+    if rc == desktop.LOST:
+        print(paint("1;31", "error:"), "lost the connection to the VM: the command probably rebooted it", file=sys.stderr)
+        return 255
+    return rc
 
 
 @command(arg("args", nargs="*", metavar="ARG", help="ssh options, then an optional remote command"), raw=True)
@@ -361,11 +507,10 @@ def cmd_rdp(a):
     """RDP session with FreeRDP: dynamic resolution, clipboard"""
     vm = ready(a)                                          # booted = SSH answers
     port = vm.state.get("rdp") or die("RDP is off (settings.ports.rdp)")
-    meta = vm.layer_meta()
     for x in RDP_CLIENTS:
         if shutil.which(x):
-            os.execvp(x, [x, f"/v:127.0.0.1:{port}", f"/u:{meta.get('user', 'user')}",
-                          f"/p:{meta.get('password', '')}", "/cert:ignore", "/dynamic-resolution", "+clipboard",
+            os.execvp(x, [x, f"/v:127.0.0.1:{port}", f"/u:{desktop.user_of(vm)}",
+                          f"/p:{desktop.password_of(vm)}", "/cert:ignore", "/dynamic-resolution", "+clipboard",
                           *a.rest])
     die(f"no FreeRDP client found - {host.install_hint('rdp')}")
 
@@ -1014,7 +1159,7 @@ def fish_opt(cond: str, act, q) -> str:
     shorts = [o[1:] for o in act.option_strings if not o.startswith("--")]
     flags = " ".join([*(f"-l {x}" for x in longs), *(f"-s {x}" for x in shorts)])
     names = f" -a '(winvm __names {act.names})'" if getattr(act, "names", None) else ""
-    takes = "" if act.nargs == 0 else " -x" if getattr(act, "names", None) == "instances" else " -r"  # -x: no files
+    takes = "" if act.nargs in (0, "?") else " -x" if getattr(act, "names", None) == "instances" else " -r"  # -x: no files
     return f"complete -c winvm -n {cond} {flags}{takes}{names} -d '{q(act.help)}'"
 
 

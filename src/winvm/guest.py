@@ -4,18 +4,31 @@ from __future__ import annotations
 
 import base64
 import os
+import re
+import select
 import signal
 import subprocess as sp
 import sys
-import threading
+import time
 
-TIMED_OUT = 124     # pipe(): what `timeout` exits with
+TIMED_OUT = -124    # pipe(): it took too long (no exit code can look like this)
+EXIT_TIMED_OUT = 124   # what `winvm sh` exits with then, as `timeout` does
+BOM = b"\xef\xbb\xbf"  # Windows PowerShell reads .ps1 files without it as ANSI, not UTF-8
 
 PROLOGUE = r"""$ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
-function stdin { while ($null -ne ($l = [Console]::In.ReadLine())) { $l } }
+function stdin {
+    if ($null -eq $winvm_in) { while ($null -ne ($l = [Console]::In.ReadLine())) { $l }; return }
+    $e = [Console]::InputEncoding                # (it decoded our UTF-8 with the console's code page)
+    foreach ($l in $winvm_in) { [Text.Encoding]::UTF8.GetString($e.GetBytes($l)) }
+}
 """
+# PowerShell's own $input is the reliable way to read stdin: [Console]::In stalls the whole SSH
+# connection from around 16 KB. But once a command mentions it, PowerShell keeps stdin from the
+# native programs in that command. So only a command that calls `stdin` gets it; if this misses
+# one (`iex`), that call falls back to [Console]::In.
+CALLS_STDIN = re.compile(r"(?:^|[|;{(&\n])\s*stdin\b")
 # A session gets its environment when sshd starts, so what an installer just set (PATH...)
 # is missing until a reboot: take it from the registry, as a new logon would. USERNAME is
 # SYSTEM there, and PowerShell makes its own PSModulePath.
@@ -37,7 +50,8 @@ def encoded(script: str) -> str:
     """Remote command for the guest's PowerShell that runs `script` exactly as written:
     shipped as base64, so no quoting survives ssh, sshd and Windows command-line parsing."""
     b64 = base64.b64encode(script.encode()).decode()
-    return f"iex ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))"
+    grab = "$winvm_in = $input; " if CALLS_STDIN.search(script.replace(PROLOGUE, "")) else ""
+    return f"{grab}iex ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))"
 
 
 def command_line(words: list[str]) -> str:
@@ -48,12 +62,15 @@ def command_line(words: list[str]) -> str:
     return " ".join(quote(w) if not w or any(c.isspace() for c in w) else w for w in words)
 
 
-def script(line: str, cwd: str | None = None, strict=False, console=False) -> str:
-    """Full guest script for one command line; strict: a cmdlet error stops it (build steps).
+def script(line: str, cwd: str | None = None, strict=False, console=False, pid_file: str | None = None) -> str:
+    """Full guest script for one command line; strict: a cmdlet error stops it (build steps);
+    pid_file: keep the PowerShell's pid there while it runs, so that it can be ended (`end`).
     PowerShell holds objects without a table view (`select`) back for a moment to size the
     table, and `exit` would lose them: the command gets its own output pipeline, which ends
     first. Not with console=True (a terminal), where programs need the real console."""
     head = PROLOGUE + REFRESH + ("$ErrorActionPreference = 'Stop'\n" if strict else "")
+    if pid_file:
+        head += f"[IO.File]::WriteAllText({quote(pid_file)}, \"$PID\")\n"
     # a command must never run somewhere else than where it was asked to
     cd = (f"try {{ Set-Location -LiteralPath {quote(cwd)} -ErrorAction Stop }} catch {{ "
           f"[Console]::Error.WriteLine(\"error: can't run in {cwd.replace(chr(34), '').replace('$', '`$')}: $($_.Exception.Message)\"); exit 1 }}\n") if cwd else ""
@@ -61,27 +78,35 @@ def script(line: str, cwd: str | None = None, strict=False, console=False) -> st
         line = ("$global:LASTEXITCODE = 0\ntry {\n" + line +
                 "\n} catch { [Console]::Error.WriteLine(\"error: $($_.Exception.Message)\"); exit 1 }")
     body = line + EPILOGUE
-    return head + cd + (body if console else ". {\n" + body + "} | Out-Default\n") + "exit $rc\n"
+    done = f"Remove-Item -LiteralPath {quote(pid_file)} -ErrorAction SilentlyContinue\n" if pid_file else ""
+    return head + cd + (body if console else ". {\n" + body + "} | Out-Default\n") + done + "exit $rc\n"
+
+
+def end(ssh, pid_file: str) -> None:
+    """End the command that keeps its pid in pid_file, with everything it started."""
+    capture(ssh, f"""$r = (Get-Content -LiteralPath {quote(pid_file)} -ErrorAction SilentlyContinue) -as [int]
+if ($r) {{ taskkill.exe /F /T /PID $r 2>&1 | Out-Null }}
+Remove-Item -LiteralPath {quote(pid_file)} -ErrorAction SilentlyContinue""")
 
 
 # `ssh` below is a function: ssh(*options) -> ssh argv up to and including the host name
 
 def pipe(ssh, script_: str, stdin=None, timeout: int | None = None) -> int:
     """Run without a terminal: stdin passes through, stdout streams with CRLF -> LF.
-    After `timeout` s stops waiting (the command may go on in the guest): TIMED_OUT."""
+    After `timeout` s stops waiting (the command goes on in the guest): TIMED_OUT."""
     proc = sp.Popen(ssh("-o", "BatchMode=yes") + [encoded(script_)], stdin=stdin, stdout=sp.PIPE)
     out, carry = sys.stdout.buffer, b""
-    expired = threading.Event()
-
-    def expire():
-        expired.set()
-        proc.kill()
-    timer = threading.Timer(timeout, expire) if timeout else None
-    if timer:
-        timer.daemon = True
-        timer.start()
+    end = time.monotonic() + timeout if timeout else None
     try:
-        while chunk := proc.stdout.read1(1 << 16):
+        while True:
+            # (killing ssh wouldn't end the read: the shared connection holds on to its stdout)
+            if end and not select.select([proc.stdout], [], [], max(0, end - time.monotonic()))[0]:
+                proc.kill()
+                proc.wait()
+                return TIMED_OUT
+            chunk = proc.stdout.read1(1 << 16)
+            if not chunk:
+                break
             chunk = carry + chunk
             carry = b"\r" if chunk.endswith(b"\r") else b""   # a CRLF may straddle two chunks
             out.write(chunk[: len(chunk) - len(carry)].replace(b"\r\n", b"\n"))
@@ -92,11 +117,7 @@ def pipe(ssh, script_: str, stdin=None, timeout: int | None = None) -> int:
         proc.kill()
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 141
-    finally:
-        if timer:
-            timer.cancel()
-    rc = proc.wait()
-    return TIMED_OUT if expired.is_set() else rc
+    return proc.wait()
 
 
 def terminal(argv: list[str]) -> int:

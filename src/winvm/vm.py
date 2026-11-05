@@ -18,7 +18,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import guest, host
+from . import desktop, guest, host
 from .balloon import ram_range
 from .config import Config
 from .store import Store, label
@@ -213,9 +213,11 @@ class Instance:
         else:
             die("QEMU failed to start" + (f" (see {self.dir}/qemu.log)" if gui else ""))
 
-    def start(self, gui=False, wait=True) -> None:
-        """Boot the instance (its disk must exist); wait for SSH and set up the mounts."""
-        if self.alive:
+    def start(self, gui=False, wait=True, reboot=False) -> None:
+        """Boot the instance (its disk must exist); wait for SSH and set up the mounts.
+        reboot: if it was running, it may be rebooted to log on (desktop mode)."""
+        booted = not self.alive
+        if not booted:
             log(f"{self.name} already running (pid {self.pid})")
         else:
             host.require(self.cfg, gui)
@@ -232,6 +234,7 @@ class Instance:
             if not self.builder:
                 self.sync_keys()
                 self.sync_mounts()
+                desktop.sync(self, may_reboot=booted or reboot, fresh=booted)
                 self.auto_memory()
 
     def stop(self, timeout=120) -> bool:
@@ -323,6 +326,29 @@ class Instance:
                 die(f"timeout waiting for SSH on {self.name}")
             time.sleep(2)
 
+    def reboot(self) -> None:
+        """Reboot the guest (QEMU stays, with its window if it has one), until SSH answers."""
+        guest.capture(self.ssh, "shutdown.exe /r /f /t 0")
+        self.close_ssh()
+        for _ in range(60):                                    # until it is really gone
+            if sp.run(self.ssh("-o", "ConnectTimeout=2") + ["exit 0"], stdin=sp.DEVNULL,
+                      stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
+                break
+            time.sleep(1)
+        self.close_ssh()
+        self.wait_ssh()
+        if not self.builder:
+            self.sync_mounts()
+
+    def call(self, ps: str) -> None:
+        """winvm's own guest commands; fail loudly."""
+        r = guest.capture(self.ssh, "$ErrorActionPreference = 'Stop'\n" + ps)
+        if r.returncode:
+            die(f"guest command failed: {ps[:100]}\n{r.stdout.strip()[:500]}")
+
+    def scp(self, src, dst: str) -> None:
+        run("scp", "-F", self.dir / "ssh_config", "-q", "-r", src, f"{self.name}:{dst.replace(chr(92), '/')}")
+
     def up(self) -> Instance:
         """Make sure the instance runs and SSH answers (for sh/cp/ssh)."""
         if not self.alive:
@@ -366,16 +392,9 @@ class Instance:
     reg add "{mm}" /v PagingFiles /t REG_MULTI_SZ /d "C:\\pagefile.sys 1024 4096" /f | Out-Null; 'set' }}""")
         if r.stdout.strip().endswith("set"):
             log(f"dynamic memory: adding a pagefile to {self.name} (once, one reboot)")
-            guest.capture(self.ssh, "shutdown.exe /r /t 0")
-            self.close_ssh()
-            for _ in range(60):                                # until it is really gone
-                if sp.run(self.ssh("-o", "ConnectTimeout=2") + ["exit 0"], stdin=sp.DEVNULL,
-                          stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
-                    break
-                time.sleep(1)
-            self.close_ssh()
-            self.wait_ssh()
-            self.sync_mounts()
+            self.reboot()
+            if self.settings.get("desktop"):
+                desktop.wait_logon(self, f"{self.name} in desktop mode")
         if self.balloon_pid:
             return
         env = {**os.environ, "WINVM_DATA_DIR": str(self.cfg.data), "WINVM_CACHE_DIR": str(self.cfg.cache),
@@ -461,7 +480,7 @@ foreach ($p in $want.Keys) {{
     }} catch {{ "FAILED $p - $($_.Exception.Message)" }}
 }}
 Set-Content -LiteralPath $list -Value @($want.Keys)
-$end = (Get-Date).AddSeconds(15)                 # until the shares answer
+$end = (Get-Date).AddSeconds(30)                 # until the shares answer (a guest just booted is slow)
 while (@($want.Values | Where-Object {{ -not (Test-Path -LiteralPath $_) }}).Count -and (Get-Date) -lt $end) {{
     Start-Sleep -Milliseconds 500
 }}
@@ -596,7 +615,8 @@ def ports(cfg: Config, slot: int) -> dict:
 
 def port_free(port: int) -> bool:
     with socket.socket() as s:
-        try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # (as QEMU does: a stopped VM's old
+        try:                                                     # connections don't take the port)
             s.bind(("127.0.0.1", port))
             return True
         except OSError:

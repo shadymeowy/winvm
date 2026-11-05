@@ -93,11 +93,17 @@ that winvm sets up for you.
 | Run PowerShell code | `winvm sh 'gci C:\ \| select Name'` |
 | Use it in a pipeline | `winvm sh ipconfig \| grep IPv4` |
 | Open the desktop | `winvm rdp` or `winvm gui` |
+| Run something that needs a desktop | `winvm sh --desktop CMD` |
 | Copy a file in | `winvm cp a.txt :C:/Users/user/` |
 | Forward a port | `winvm ssh -L 8080:localhost:80` |
 | See what's running | `winvm ps` |
 | Stop it | `winvm stop` |
 | Go back to clean Windows | `winvm reset` |
+
+Some things need a logged-on Windows session, which `winvm sh` doesn't have: `winget`, stored
+credentials, automating Word or Excel. `winvm up --desktop` logs the VM on, without opening a
+window on your screen, and `winvm sh --desktop` runs a command there.
+[How that works](https://github.com/shadymeowy/winvm/blob/main/docs/usage.md#commands-that-need-a-desktop)
 
 ## Share a folder
 
@@ -158,7 +164,8 @@ winvm up dev                  # builds the image if needed, then starts instance
 
 Steps run as an administrator with network access, and a build on top of `base` takes
 about a minute plus whatever your steps do. Only what they change is stored, compressed. If a
-step needs a logged-on desktop, add `desktop: true`.
+step needs a logged-on desktop, add `desktop: true`; for instances that should log on by
+themselves, add `desktop: true` under `run:`.
 [Everything about images](https://github.com/shadymeowy/winvm/blob/main/docs/images.md)
 
 ## Free up disk space

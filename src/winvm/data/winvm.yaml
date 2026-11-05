@@ -51,6 +51,8 @@ run:                                 # how instances run, unless their image's `
   ram: 4G                            # `winvm up --ram/--cpus` say otherwise; dynamic memory:
                                      # `ram: {min: 2G, max: 8G}` (or `winvm up --ram 2G-8G`)
   cpus: 4
+  desktop: false                     # log on by itself at every boot (`winvm up --desktop`);
+                                     # no window on your screen. `password:` if it was changed
   mounts:                            # host folders, in the guest at C:\mnt\<name>
     share: ${data_dir}/share         # (an image or this file can drop it: `share: null`)
                                      # long form: NAME: {path: ~/x, readonly: true, at: 'C:\x'}

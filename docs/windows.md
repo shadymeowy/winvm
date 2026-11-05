@@ -63,9 +63,13 @@ which downloads from Microsoft's CDN, not Windows Update.
 
 Microsoft 365 Apps need the WebView2 runtime and more than 4 GB of RAM without a pagefile. To get
 the runtime, keep it with `debloat.remove_webview: false`, or run
-`winget install Microsoft.EdgeWebView2Runtime` on the desktop or in a
-[`desktop: true`](images.md#steps-on-a-logged-on-desktop) image. `winget` doesn't work from
+`winget install Microsoft.EdgeWebView2Runtime` with
+[`winvm sh --desktop`](usage.md#commands-that-need-a-desktop) or in a
+[`desktop: true`](images.md#steps-on-a-logged-on-desktop) image. `winget` doesn't work from plain
 `winvm sh` or a normal step.
+
+Automating Word or Excel through COM needs the logged-on session too. Run it with
+`winvm sh --desktop`, and see [the example there](usage.md#commands-that-need-a-desktop).
 
 ## Turning updates back on
 

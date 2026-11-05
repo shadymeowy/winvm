@@ -119,9 +119,10 @@ steps:
 
 The VM reboots once and logs on by itself, which adds about 30 seconds. `run` steps then
 execute in that session, as the same elevated user, and SSH only drives the build: it starts
-each step and reads back its output and exit code, so output arrives in small bursts. Auto-logon
-and winvm's task are removed again before the layer is written, so instances of the image start
-logged out, as usual.
+each step and follows its output and exit code. Auto-logon and winvm's tasks are removed again
+before the layer is written, so instances of the image start logged out, as usual. For instances
+that should log on, add `run: desktop: true`, which is a different setting:
+[Commands that need a desktop](usage.md#commands-that-need-a-desktop).
 
 Keep it off unless you need it: it needs the right password, and has more that can go wrong.
 Nothing falls back to SSH by itself, because that could give you a different image without

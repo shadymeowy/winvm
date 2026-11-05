@@ -34,5 +34,5 @@ setup: []
 
 # How instances of this image run (merged over the machine's `run` defaults; images
 # built on this one inherit it): ram (4G, or {min: 2G, max: 8G} for dynamic memory),
-# cpus, mounts.
+# cpus, mounts, desktop (true: log on by itself at every boot), password (for that).
 run: {}

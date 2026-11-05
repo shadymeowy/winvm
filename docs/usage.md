@@ -4,6 +4,7 @@
 
 - [Commands](#commands)
 - [Running commands in the guest](#running-commands-in-the-guest)
+- [Commands that need a desktop](#commands-that-need-a-desktop)
 - [Mounts](#mounts)
 - [Instances and their settings](#instances-and-their-settings)
 - [Dynamic memory](#dynamic-memory)
@@ -21,12 +22,13 @@ Wherever an IMAGE is asked for, a name or the path of an image file works.
 
 Deleting something asks first in a terminal. `-y` doesn't ask, and from a script or a
 pipe winvm goes ahead without asking. `-y` also skips the question before downloads.
+Rebooting a running VM to log on is stricter: from a script, winvm refuses without `-y`.
 
 **Run instances**
 
 | Command | What it does |
 |---|---|
-| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX\|default] [--cpus N\|default] [--iso ISO] [--all] [--gui]` (`start`) | Create (building images as needed) and start. Ready when SSH answers. |
+| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX\|default] [--cpus N\|default] [--desktop [off\|default]] [--iso ISO] [--all] [--gui]` (`start`) | Create (building images as needed) and start. Ready when SSH answers, and with `--desktop` once logged on. |
 | `stop [NAME...] [--all] [--timeout S]` (`down`) | ACPI shutdown, all at once; hard power-off after 120 s |
 | `restart [NAME...]` | Stop, then start |
 | `kill [NAME...]` | Power off at once; unsaved work in the guest is lost |
@@ -38,7 +40,7 @@ pipe winvm goes ahead without asking. `-y` also skips the question before downlo
 
 | Command | What it does |
 |---|---|
-| `sh [-t] [CMD]` (`shell`) | PowerShell, or run a command ([below](#running-commands-in-the-guest)) |
+| `sh [-t] [--desktop] [--timeout TIME] [CMD]` (`shell`) | PowerShell, or run a command ([below](#running-commands-in-the-guest)) |
 | `ssh` | Plain ssh: `winvm ssh -L 8080:localhost:80`, `winvm ssh hostname` |
 | `cp` | Plain scp: `winvm cp a.txt :C:/Users/user/` |
 | `mount [PATH [NAME\|WINPATH]] [--ro] [--save]` | Show a host folder in the guest, or list mounts ([below](#mounts)) |
@@ -93,6 +95,8 @@ cat x | winvm sh 'stdin | sort'   # ...and PowerShell code reads it with `stdin`
 winvm sh ipconfig | grep IPv4     # output has Unix line endings
 winvm sh cmd /c exit 3; echo $?   # 3: the exit code is the command's (fish: $status)
 cd ~/Projects/x && winvm sh -i dev dir    # inside a mount: runs in C:\mnt\projects\x
+winvm sh --timeout 5m .\slow.exe  # give up after 5 minutes: ends it, exit 124
+winvm sh --desktop .\needs-a-desktop.exe  # see below
 ```
 
 Only use `-t` for programs that need a terminal: tables from `select` get lost with it,
@@ -102,11 +106,123 @@ Run from inside a mount whose guest folder can't be entered, `winvm sh CMD` runs
 1, so a command never runs in the wrong place. With no command, you still get a shell, in your home
 folder, with a warning.
 
-Commands run over SSH, which has no desktop, so `winget` and programs that store credentials with
-DPAPI won't work in `winvm sh`. Use `winvm rdp` or `winvm gui` for those.
+For a lot of data on stdin, PowerShell code should read it with `stdin`, which handled 3 MB in
+testing. `[Console]::In` and `[Console]::OpenStandardInput()` can stall the whole connection from
+around 16 KB. A native program gets stdin directly, which also handled 3 MB when it only reads or
+prints a little. One that prints a lot while it reads usually stalls from about 256 KB, and then
+the connection ends with exit 255 after 40 seconds. For that, go through PowerShell with
+`winvm sh 'stdin | findstr "^"'`, or copy the data in with `winvm cp`.
+
+`--timeout` takes `90s`, `30m` or `2h`. It ends the command and what the command started, but not
+what Windows started for it, such as Store apps and COM servers.
 
 The command travels base64-encoded, so no quoting is lost between your shell, ssh, sshd
 and Windows. All commands to an instance share one SSH connection.
+
+## Commands that need a desktop
+
+What runs over SSH has no desktop (session 0) and, because SSH logs in with a key, can't use
+DPAPI, the Windows store for credentials. So `winget`, programs that store credentials and much
+COM automation, like exporting from Word, fail or hang there. For those, ask for the logged-on
+session:
+
+```sh
+winvm up work --desktop                  # returns once it is logged on
+winvm sh -i work --desktop 'winget install 7zip.7zip --accept-source-agreements'
+```
+
+**Nothing appears on your screen.** The desktop exists inside the VM, and you only see it if you
+ask to:
+
+| | Window on your screen | Logged-on session |
+|---|---|---|
+| `winvm up` | no | no |
+| `winvm up --desktop` | no | yes |
+| `winvm up --gui` | yes | no |
+| `winvm up --desktop --gui` | yes | yes |
+
+**Desktop mode** makes the VM log on by itself at every boot. The first start in that mode reboots
+once, which adds about 25 seconds. Being logged on costs about 560 MB of the guest's RAM. Set it
+for one instance, or in an image file for every instance of that image and the images on it:
+
+```sh
+winvm up work --desktop                  # keep it for this instance
+winvm up work --desktop off              # this instance: no, whatever its image says
+winvm up work --desktop default          # back to what its image says
+```
+
+```yaml
+run:
+  desktop: true
+```
+
+`winvm sh` keeps using SSH, as before, unless you add `--desktop`. Then it depends on the VM:
+
+| The VM is... | `winvm sh --desktop CMD` |
+|---|---|
+| logged on (also by hand, through `gui` or `rdp`) | runs it |
+| in desktop mode, still booting | waits for the logon, then runs it |
+| stopped | starts it, logs on (rebooting once if it wasn't in desktop mode), runs it |
+| running, not logged on, in a terminal | asks whether to reboot it |
+| running, not logged on, from a script | refuses, unless you add `-y` |
+
+winvm never reboots a running VM without asking, because that could interrupt what it's doing.
+`winvm up --desktop` follows the same rule. Once it has rebooted to log on, the instance stays in
+desktop mode.
+
+The command runs as the same elevated user, and returns its exit code. A few things differ from
+plain `winvm sh`:
+
+- It takes about 2.3 seconds to start, against 0.6.
+- Output is text, with stderr mixed into stdout.
+- Stdin isn't passed on, so piping data into it is an error. Copy the data in with `winvm cp`. If
+  the command doesn't need any but your script's stdin has some, add `</dev/null`.
+- Nobody can answer a prompt, so `Read-Host` fails instead of hanging. A window that waits for a
+  click does hang, so use `--timeout`: it fails with a picture of the screen, whose path it prints.
+- Programs that wait for their window to close, like `notepad`, keep the command waiting. Use
+  `Start-Process` to leave them open.
+- `-t` doesn't apply, and neither does a shell without a command: use `winvm gui` or `winvm rdp`.
+
+**For a script,** this runs one export from start to finish. The `trap` comes after `up`, so that
+a refused `up` doesn't stop a VM that was already running. `winvm cp` doesn't create folders, so
+`C:\work` has to exist already, from the image or an earlier step:
+
+```sh
+#!/bin/sh
+set -e
+winvm up --desktop                       # returns once logged on
+trap 'winvm stop' EXIT                   # stops the VM even if a step fails
+
+winvm cp report.docx :C:/work/report.docx
+winvm sh --desktop --timeout 5m 'powershell -File C:\work\export.ps1'
+winvm cp :C:/work/report.pdf ./report.pdf
+```
+
+For Office automation, have your script call `$word.Quit()`, because Windows starts Word for COM
+and it may outlive a command that gets ended.
+
+**The password.** Windows logs on with a password stored in the registry, in plain text, while
+desktop mode is on. winvm stores what it replaces, and when desktop mode goes off it puts that back
+and removes the password. `winvm save` copies whatever is on the disk into the image, password
+included. An instance started from that image without desktop mode logs on once and then removes it.
+
+winvm uses the password the image was built with. If you changed it, winvm stops before rebooting
+and asks for the current one, under `run:` in the image file or `~/.config/winvm/winvm.yaml`:
+
+```yaml
+run:
+  desktop: true
+  password: the-current-password
+```
+
+winvm doesn't reset the password itself, because that can make data protected by DPAPI unreadable.
+A logon notice is cleared while desktop mode is on, because it would wait for someone to press OK.
+
+**Looking at it.** `winvm gui` only watches the screen, so it can't disturb the session. `winvm rdp`
+takes the session away from the VM's own screen, which then shows the login screen, also after you
+disconnect. The session stays logged on and `--desktop` commands keep working, but `winvm gui`
+and the pictures from `--timeout` only show that login screen until the next reboot. A program
+that needs a visible screen may not work during that time either, so prefer `winvm gui` to look.
 
 ## Mounts
 
@@ -142,14 +258,16 @@ Its settings come from, in order:
 
 1. the machine's `run` defaults,
 2. the `run:` of its image and the images below it,
-3. its own: `--ram`, `--cpus` and `mount --save`, kept in its folder.
+3. its own: `--ram`, `--cpus`, `--desktop` and `mount --save`, kept in its folder.
 
-`winvm info` shows them, and `--ram default` drops an instance's own value.
+`winvm info` shows them, and `--ram default` drops an instance's own value. `reset` keeps
+them, and sets up desktop mode again on the fresh disk.
 
 **The host RAM guard.** Before starting a VM, winvm checks `MemAvailable` minus what
 running VMs may still grow into. It refuses when the VM plus `settings.mem_reserve` doesn't
 fit: stop another instance, or give this one less (`winvm up --ram 3G`, or `--ram 2G-6G`
-for dynamic memory).
+for dynamic memory). A build VM uses the machine's `ram` (4 GB unless you changed it), whatever
+the image's `run: ram` says.
 
 ## Dynamic memory
 
