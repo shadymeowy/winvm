@@ -157,7 +157,8 @@ winvm up dev                  # builds the image if needed, then starts instance
 ```
 
 Steps run as an administrator with network access, and a build on top of `base` takes
-about a minute plus whatever your steps do. Only what they change is stored, compressed.
+about a minute plus whatever your steps do. Only what they change is stored, compressed. If a
+step needs a logged-on desktop, add `desktop: true`.
 [Everything about images](https://github.com/shadymeowy/winvm/blob/main/docs/images.md)
 
 ## Free up disk space

@@ -13,10 +13,13 @@ ISO images (offline, unattended), from Microsoft's own, unmodified ISO:
   cache/slim; later builds apply it directly and skip the debloat.
 
 Images `from` another image: boot a scratch VM on the image below (with network), run
-the steps over SSH, shut it down and keep its changes as a compressed layer.
+the steps over SSH, shut it down and keep its changes as a compressed layer. With
+`desktop: true` SSH only drives the build: the VM logs on by itself (see below) and the
+run steps execute in that desktop session.
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import json
 import os
@@ -24,6 +27,7 @@ import re
 import shutil
 import socket
 import subprocess as sp
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,7 +37,7 @@ from . import __version__, guest, host
 from .config import GUEST, Config
 from .media import check_edition, write_iso
 from .store import Store, label
-from .util import Fatal, die, dos, log, run, warn
+from .util import Chan, Fatal, die, dos, log, run, warn
 from .vm import Instance, running
 
 # virtio driver folders injected into Windows (w11/amd64 flavour)
@@ -41,6 +45,15 @@ VIRTIO_DRIVERS = "vioscsi viostor NetKVM Balloon vioserial viorng vioinput pvpan
 CAPTURE_GB = 30                 # size of the slim-capture disk; pe.cmd recognizes it by this
 WORK = r"C:\winvm-build"        # work folder of `from` builds: downloads, copies, cwd of run steps
 BOM = b"\xef\xbb\xbf"             # Windows PowerShell reads .ps1 files without it as ANSI, not UTF-8
+WAIT_LOGON = 180                # s for a `desktop: true` VM to log on after it answers SSH
+STEP_DIR = r"C:\ProgramData\winvm\steps"   # desktop steps: script, runner, log, exit code
+STEP_TASK = "winvm-step"
+WINLOGON = r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+POLICIES = r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+LOGON_VALUES = [(WINLOGON, "AutoAdminLogon", "String"), (WINLOGON, "DefaultUserName", "String"),
+                (WINLOGON, "DefaultPassword", "String"), (WINLOGON, "AutoLogonCount", "DWord"),
+                (WINLOGON, "LegalNoticeCaption", "String"), (WINLOGON, "LegalNoticeText", "String"),
+                (POLICIES, "legalnoticecaption", "String"), (POLICIES, "legalnoticetext", "String")]
 
 
 def build(cfg: Config, names: list[str], force=False, gui=False, stale=False) -> None:
@@ -374,17 +387,25 @@ def build_overlay(cfg: Config, name: str, gui=False) -> None:
     shutil.rmtree(inst.home, ignore_errors=True)
     inst.home.mkdir(parents=True)
     inst.create(name, below)
+    meta = store.meta(below)
+    desktop = bool(img.get("desktop"))
+    password = img["password"] if img.get("password") is not None else meta.get("password")
     try:
         log(f"building image '{name}' on {label(below)}: {len(steps)} step(s)")
         inst.start(gui=gui)
+        logon = None
+        if desktop:
+            user = str(meta.get("user") or cfg.builtin["user"])
+            logon = enter_desktop(inst, name, user, str(password if password is not None else cfg.builtin["password"]), gui)
         call(inst, f"New-Item -ItemType Directory -Force {guest.quote(WORK)} | Out-Null")
         for i, st in enumerate(steps, 1):
             kind, arg = next(iter(st.items()))
             log(f"step {i}/{len(steps)}: {describe(st)}")
             if kind == "run":
-                rc = guest.pipe(inst.ssh, guest.script(arg, cwd=WORK, strict=True), stdin=sp.DEVNULL)
-                if rc:
-                    die(f"image '{name}' step {i} failed (exit {rc})")
+                limit = st.get("timeout")
+                rc = (run_on_desktop(inst, arg, user, limit) if desktop else
+                      guest.pipe(inst.ssh, guest.script(arg, cwd=WORK, strict=True), stdin=sp.DEVNULL, timeout=limit))
+                step_result(inst, name, i, rc, limit, desktop)
             elif kind == "download":
                 scp(inst, fetch_step(cfg, st), f"{WORK}\\{arg['name']}")
             elif kind == "copy":
@@ -397,19 +418,174 @@ def build_overlay(cfg: Config, name: str, gui=False) -> None:
             elif kind == "restart":
                 stop_clean(inst)
                 inst.start(gui=gui)
+                if desktop:
+                    wait_logon(inst, name, user)
+        if desktop:
+            leave_desktop(inst, logon)
         # leave nothing behind, and hand freed blocks back so the layer stays small
         call(inst, f"Remove-Item -LiteralPath {guest.quote(WORK)} -Recurse -Force; "
                    "Optimize-Volume -DriveLetter C -ReTrim -ErrorAction SilentlyContinue | Out-Null")
         stop_clean(inst)
         log(f"writing image layer {name}@{h[:12]}")
-        meta = store.meta(below)
-        store.add(name, h, inst.disk, below, user=meta.get("user"), password=meta.get("password"),
+        store.add(name, h, inst.disk, below, user=meta.get("user"), password=password,
                   source=str(cfg.sources[name]))
     finally:
         if inst.alive:
             inst.kill()
         shutil.rmtree(inst.home, ignore_errors=True)
         shutil.rmtree(inst.dir, ignore_errors=True)
+
+
+def step_result(inst: Instance, name: str, i: int, rc: int, limit: int | None, desktop: bool) -> None:
+    """Fail the build if a run step did not end well, saying what to do about it."""
+    where = f"image '{name}' step {i}"
+    if rc == guest.TIMED_OUT:
+        die(f"{where} still running after its timeout of {limit} s{picture(inst, name)}")
+    if rc == 255:
+        die(f"{where} lost the connection to the VM (exit 255), so it probably rebooted it. Stop the "
+            "installer from rebooting (often a /norestart option) and add `- restart: true` after it")
+    if rc == STEP_VANISHED:
+        die(f"{where} ended without an exit code: it probably rebooted the VM or logged the user off. To reboot, "
+            f"stop the installer from doing it (often a /norestart option) and add `- restart: true` after it{picture(inst, name)}")
+    if rc:
+        die(f"{where} failed (exit {rc})" + ("" if desktop else
+            ". If it needs a logged-on desktop or stored credentials, try `desktop: true` in the image file"))
+
+
+def picture(inst: Instance, name: str) -> str:
+    """The VM goes when the build fails: a picture of its screen, for the error message."""
+    out = inst.cfg.build / f"{name}-failed.png"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        Chan(inst.dir / "qmp.sock", qmp=True)("screendump", {"filename": str(out), "format": "png"})
+    except (Fatal, OSError):
+        return ""
+    return f" (its screen: {out})"
+
+
+# --- `desktop: true`. What runs through SSH has no desktop (session 0) and, logged on with
+# a key, can't use DPAPI. A real logon needs the user's password and a reboot, as the ISO
+# build's first logon does: auto-logon is on for the build, and every run step is a
+# scheduled task in that session, whose output and exit code are read back over SSH. No
+# password stays behind: the logon settings go back to what they were before the layer is written.
+
+STEP_VANISHED = -1              # run_on_desktop: the task is gone and left no exit code
+
+
+def enter_desktop(inst: Instance, name: str, user: str, password: str, gui=False) -> list:
+    """Turn auto-logon on, reboot into it. Returns what to put back (`leave_desktop`)."""
+    r = guest.capture(inst.ssh, f"""Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+try {{ $c = [DirectoryServices.AccountManagement.PrincipalContext]::new('Machine')
+    if ($c.ValidateCredentials({guest.quote(user)}, {guest.quote(password)})) {{ 'GOOD' }} else {{ 'WRONG' }} }}
+catch {{ 'UNKNOWN' }}""")                                       # (a blank password can't be checked)
+    if r.stdout.strip().endswith("WRONG"):
+        die(f"image '{name}': `desktop: true` has to log on as {user} and the password winvm knows is not "
+            "that user's: put the current one in this image's file (`password:`)")
+    read = ", ".join(f"(Get-ItemProperty -LiteralPath {guest.quote(p)} -Name {n} -ErrorAction SilentlyContinue).{n}"
+                     for p, n, _ in LOGON_VALUES)
+    r = guest.capture(inst.ssh, f"ConvertTo-Json -Compress @({read})")
+    try:
+        old = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        die(f"could not read the logon settings of {inst.name}: {r.stdout.strip()[:300]}")
+    log(f"desktop: logging on as {user}")
+    notices = "".join(f"Set-ItemProperty -LiteralPath {guest.quote(p)} -Name {n} -Value ''\n"     # would wait for OK
+                      for (p, n, _), v in zip(LOGON_VALUES, old) if "egal" in n and v)
+    call(inst, f"""$w = {guest.quote(WINLOGON)}
+Remove-ItemProperty -LiteralPath $w -Name AutoLogonCount -ErrorAction SilentlyContinue
+Set-ItemProperty -LiteralPath $w -Name AutoAdminLogon -Value '1'
+Set-ItemProperty -LiteralPath $w -Name DefaultUserName -Value {guest.quote(user)}
+Set-ItemProperty -LiteralPath $w -Name DefaultPassword -Value {guest.quote(password)}
+{notices}New-Item -ItemType Directory -Force {guest.quote(STEP_DIR)} | Out-Null""")
+    (inst.dir / "runner.ps1").write_bytes(BOM + dos(RUNNER))
+    scp(inst, inst.dir / "runner.ps1", f"{STEP_DIR}\\runner.ps1")
+    stop_clean(inst)
+    inst.start(gui=gui)
+    wait_logon(inst, name, user)
+    return old
+
+
+def wait_logon(inst: Instance, name: str, user: str) -> None:
+    probe = (f"@(Get-Process -IncludeUserName | Where-Object {{ $_.SessionId -and $_.UserName -like {guest.quote(chr(42) + chr(92) + user)} }}).Count")
+    end = time.time() + WAIT_LOGON
+    while time.time() < end:
+        r = guest.capture(inst.ssh, probe)
+        if r.returncode == 0 and r.stdout.strip().splitlines()[-1:] not in ([], ["0"]):
+            return
+        time.sleep(2)
+    die(f"image '{name}': {user} did not log on within {WAIT_LOGON} s, so the desktop steps can't run. A policy "
+        f"may stop auto-logon on this image{picture(inst, name)}")
+
+
+# Runs in the desktop session: the step, its output to a file, then its exit code (atomically)
+RUNNER = rf"""$d = '{STEP_DIR}'
+$utf8 = [Text.UTF8Encoding]::new($false)
+try {{ [Console]::OutputEncoding = $utf8 }} catch {{}}
+try {{
+    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$d\step.ps1" 2>&1 |
+        ForEach-Object {{ [IO.File]::AppendAllText("$d\log", "$_`r`n", $utf8) }}
+    $rc = $LASTEXITCODE
+}} catch {{ [IO.File]::AppendAllText("$d\log", "error: $_`r`n", $utf8); $rc = 1 }}
+[IO.File]::WriteAllText("$d\rc.tmp", "$rc")
+Move-Item -Force "$d\rc.tmp" "$d\rc"
+"""
+
+
+def run_on_desktop(inst: Instance, code: str, user: str, limit: int | None) -> int:
+    """One run step in the logged-on session; its output as it comes, its exit code."""
+    (inst.dir / "step.ps1").write_bytes(BOM + dos(guest.script(code, cwd=WORK, strict=True)))
+    d = guest.quote(STEP_DIR)
+    call(inst, f"Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path {d} log), (Join-Path {d} rc)")
+    scp(inst, inst.dir / "step.ps1", f"{STEP_DIR}\\step.ps1")
+    action = f'-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{STEP_DIR}\\runner.ps1"'
+    call(inst, f"""$a = New-ScheduledTaskAction -Execute powershell.exe -Argument {guest.quote(action)}
+$p = New-ScheduledTaskPrincipal -UserId {guest.quote(user)} -LogonType Interactive -RunLevel Highest
+$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask {STEP_TASK} -Action $a -Principal $p -Settings $s -Force | Out-Null
+Start-ScheduledTask {STEP_TASK}""")
+    out, offset, begun, idle = sys.stdout.buffer, 0, time.time(), 0
+    while True:
+        r = guest.capture(inst.ssh, f"""$d = {d}; $b = ''
+if (Test-Path "$d\\log") {{
+    $f = [IO.File]::Open("$d\\log", 'Open', 'Read', 'ReadWrite,Delete'); $f.Position = {offset}
+    $buf = New-Object byte[] 262144; $n = $f.Read($buf, 0, $buf.Length); $f.Close()
+    $b = [Convert]::ToBase64String($buf, 0, $n)
+}}
+"LOG:$b"
+"RC:" + $(if (Test-Path "$d\\rc") {{ Get-Content "$d\\rc" }})
+"TASK:" + (Get-ScheduledTask {STEP_TASK}).State""")
+        if r.returncode == 255:
+            return 255
+        fields = {k: v for k, _, v in (ln.partition(":") for ln in r.stdout.splitlines())}
+        chunk = base64.b64decode(fields.get("LOG", ""))
+        out.write(chunk.replace(b"\r\n", b"\n"))
+        out.flush()
+        offset += len(chunk)
+        if not chunk and fields.get("RC"):
+            try:
+                return int(fields["RC"])
+            except ValueError:
+                return 1
+        idle = idle + 1 if fields.get("TASK") not in ("Running", "Queued") and not chunk else 0
+        if idle >= 8:                                          # (and it may take a moment to start)
+            return STEP_VANISHED
+        if limit and time.time() - begun > limit:
+            return guest.TIMED_OUT
+        if not chunk:
+            time.sleep(1)
+
+
+def leave_desktop(inst: Instance, old: list) -> None:
+    """The logon settings as they were, and winvm's task and files gone. A failed build
+    needs none of this: its VM and disk are thrown away."""
+    back = "\n".join(
+        f"Remove-ItemProperty -LiteralPath {guest.quote(p)} -Name {n} -ErrorAction SilentlyContinue" if v is None else
+        f"New-ItemProperty -LiteralPath {guest.quote(p)} -Name {n} -PropertyType {t} -Force "
+        f"-Value {v if t == 'DWord' else guest.quote(str(v))} | Out-Null"
+        for (p, n, t), v in zip(LOGON_VALUES, old))
+    call(inst, f"""Unregister-ScheduledTask {STEP_TASK} -Confirm:$false -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath {guest.quote(STEP_DIR)} -Recurse -Force -ErrorAction SilentlyContinue
+{back}""")
 
 
 def stop_clean(inst: Instance) -> None:

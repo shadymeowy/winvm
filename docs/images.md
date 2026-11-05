@@ -9,6 +9,7 @@ An image is one YAML file, and its file name is its name. It's built one of two 
 
 - [Examples](#examples)
 - [Steps](#steps)
+- [Steps on a logged-on desktop](#steps-on-a-logged-on-desktop)
 - [Where image files come from](#where-image-files-come-from)
 - [Rebuilds](#rebuilds)
 - [Saved images](#saved-images)
@@ -60,13 +61,33 @@ setup:                               # during the install, as SYSTEM, without ne
 
 | Step | What it does |
 |---|---|
-| `run: CODE` | PowerShell. A thrown error or a non-zero exit fails the build. |
+| `run: CODE` | PowerShell. A thrown error, a failing cmdlet or a non-zero exit of its last command fails the build. Add `timeout: 30m` to the step to fail it if it takes longer (`from` images only). |
 | `download: {url, sha256}` | Fetch on the host, check the sha256 (`curl -sL URL \| sha256sum`), put the file in the work folder |
 | `copy: [HOST]` | Put a host file or folder in the work folder |
 | `copy: [HOST, GUEST]` | Put it anywhere in the guest (`from` images only) |
 | `restart: true` | Reboot (`from` images only) |
 
 Run steps start in the work folder, which is deleted when the build ends.
+
+**Each `run:` is one script in a new PowerShell**, not a command at a time. Variables and the
+current folder don't carry over to the next step, but files and registry changes do, and so
+does what an installer adds to the machine's or user's environment, such as `PATH`.
+
+**A native program failing on any line but the last doesn't fail the step.** Windows PowerShell
+only reports the last exit code, so check the ones that matter:
+
+```yaml
+- run: |
+    .\installer.exe /quiet | Out-Null
+    if ($LASTEXITCODE) { throw "installer failed: $LASTEXITCODE" }
+    "installed"
+```
+
+**`.ps1` files are blocked** by the default execution policy. Run them with
+`powershell -ExecutionPolicy Bypass -File x.ps1`.
+
+**A step that reboots the VM fails the build**, with a message saying so. Stop the installer
+from rebooting (often a `/norestart` option) and add `- restart: true` after it.
 
 There are two lists of steps, and they differ in who runs them:
 
@@ -79,8 +100,47 @@ There are two lists of steps, and they differ in who runs them:
 
 Prefer `steps` unless you have a reason not to: admin rights are enough for most installers,
 and you get network access. There's no interactive desktop in either list, so run installers
-silently, or a GUI installer may hang. Files that `setup` steps use travel on a CD: their
-names must be valid on Windows and at most 64 characters long.
+silently, or a GUI installer may hang; a `timeout:` makes sure the build can't wait forever.
+Files that `setup` steps use travel on a CD: their names must be valid on Windows and at most
+64 characters long.
+
+## Steps on a logged-on desktop
+
+Over SSH, a step has no desktop, and because SSH logs in with a key it can't use DPAPI, the
+Windows store for credentials. `winget` doesn't work there either. If a step needs any of
+that, ask for a real logon:
+
+```yaml
+from: base
+desktop: true
+steps:
+  - run: winget search 7zip.7zip --source winget --accept-source-agreements
+```
+
+The VM reboots once and logs on by itself, which adds about 30 seconds. `run` steps then
+execute in that session, as the same elevated user, and SSH only drives the build: it starts
+each step and reads back its output and exit code, so output arrives in small bursts. Auto-logon
+and winvm's task are removed again before the layer is written, so instances of the image start
+logged out, as usual.
+
+Keep it off unless you need it: it needs the right password, and has more that can go wrong.
+Nothing falls back to SSH by itself, because that could give you a different image without
+telling you. If the logon fails, the build fails.
+
+**It needs the user's password.** winvm knows the one the image was built with. If it was
+changed on the way, as in an image from `winvm save`, the build stops before rebooting and asks
+you to give the current one:
+
+```yaml
+from: my-saved-image
+desktop: true
+password: the-current-password
+```
+
+winvm doesn't change the password itself, because resetting one can make data protected by DPAPI
+unreadable. A logon notice is cleared for the build and put back afterwards. Anything else that
+stops the logon, such as an expired password, ends in an error after 3 minutes, with a picture
+of the screen.
 
 ## Where image files come from
 

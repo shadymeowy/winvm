@@ -7,11 +7,22 @@ import os
 import signal
 import subprocess as sp
 import sys
+import threading
+
+TIMED_OUT = 124     # pipe(): what `timeout` exits with
 
 PROLOGUE = r"""$ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
 function stdin { while ($null -ne ($l = [Console]::In.ReadLine())) { $l } }
+"""
+# A session gets its environment when sshd starts, so what an installer just set (PATH...)
+# is missing until a reboot: take it from the registry, as a new logon would. USERNAME is
+# SYSTEM there, and PowerShell makes its own PSModulePath.
+REFRESH = r"""$m = [Environment]::GetEnvironmentVariables('Machine'); $u = [Environment]::GetEnvironmentVariables('User')
+foreach ($s in $m, $u) { foreach ($k in $s.Keys) { if ($k -notin 'Path', 'PSModulePath', 'USERNAME') {
+    Set-Item -LiteralPath "Env:$k" -Value $s[$k] -ErrorAction SilentlyContinue } } }
+$env:Path = (@($m['Path'], $u['Path'], $env:Path) -join ';' -split ';' | Where-Object { $_ } | Select-Object -Unique) -join ';'
 """
 # $rc: the native program's exit code, or 1 for a failed cmdlet / thrown error
 EPILOGUE = "\n$rc = if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }\n"
@@ -42,7 +53,7 @@ def script(line: str, cwd: str | None = None, strict=False, console=False) -> st
     PowerShell holds objects without a table view (`select`) back for a moment to size the
     table, and `exit` would lose them: the command gets its own output pipeline, which ends
     first. Not with console=True (a terminal), where programs need the real console."""
-    head = PROLOGUE + ("$ErrorActionPreference = 'Stop'\n" if strict else "")
+    head = PROLOGUE + REFRESH + ("$ErrorActionPreference = 'Stop'\n" if strict else "")
     # a command must never run somewhere else than where it was asked to
     cd = (f"try {{ Set-Location -LiteralPath {quote(cwd)} -ErrorAction Stop }} catch {{ "
           f"[Console]::Error.WriteLine(\"error: can't run in {cwd.replace(chr(34), '').replace('$', '`$')}: $($_.Exception.Message)\"); exit 1 }}\n") if cwd else ""
@@ -55,10 +66,20 @@ def script(line: str, cwd: str | None = None, strict=False, console=False) -> st
 
 # `ssh` below is a function: ssh(*options) -> ssh argv up to and including the host name
 
-def pipe(ssh, script_: str, stdin=None) -> int:
-    """Run without a terminal: stdin passes through, stdout streams with CRLF -> LF."""
+def pipe(ssh, script_: str, stdin=None, timeout: int | None = None) -> int:
+    """Run without a terminal: stdin passes through, stdout streams with CRLF -> LF.
+    After `timeout` s stops waiting (the command may go on in the guest): TIMED_OUT."""
     proc = sp.Popen(ssh("-o", "BatchMode=yes") + [encoded(script_)], stdin=stdin, stdout=sp.PIPE)
     out, carry = sys.stdout.buffer, b""
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        proc.kill()
+    timer = threading.Timer(timeout, expire) if timeout else None
+    if timer:
+        timer.daemon = True
+        timer.start()
     try:
         while chunk := proc.stdout.read1(1 << 16):
             chunk = carry + chunk
@@ -71,7 +92,11 @@ def pipe(ssh, script_: str, stdin=None) -> int:
         proc.kill()
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 141
-    return proc.wait()
+    finally:
+        if timer:
+            timer.cancel()
+    rc = proc.wait()
+    return TIMED_OUT if expired.is_set() else rc
 
 
 def terminal(argv: list[str]) -> int:

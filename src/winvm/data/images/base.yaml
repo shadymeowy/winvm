@@ -25,7 +25,8 @@ debloat:
   remove_webview: true           # Edge WebView2 runtime (~1 GB)
 
 # Steps run during the install, as SYSTEM, without network, in a work folder:
-#   - run: <PowerShell>                    fails the build on an error / non-zero exit
+#   - run: <PowerShell>                    fails the build on an error, or if its last command
+#                                          exits non-zero (check $LASTEXITCODE for earlier ones)
 #   - download: {url: U, sha256: H}        fetched on the host, checked, put in the work folder
 #                                          (as `name: F` if given, else the URL's file name)
 #   - copy: [HOST_PATH]                    a file or folder into the work folder

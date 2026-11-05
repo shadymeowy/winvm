@@ -98,6 +98,13 @@ cd ~/Projects/x && winvm sh -i dev dir    # inside a mount: runs in C:\mnt\proje
 Only use `-t` for programs that need a terminal: tables from `select` get lost with it,
 and its output isn't meant for pipes.
 
+Run from inside a mount whose guest folder can't be entered, `winvm sh CMD` runs nothing and exits
+1, so a command never runs in the wrong place. With no command, you still get a shell, in your home
+folder, with a warning.
+
+Commands run over SSH, which has no desktop, so `winget` and programs that store credentials with
+DPAPI won't work in `winvm sh`. Use `winvm rdp` or `winvm gui` for those.
+
 The command travels base64-encoded, so no quoting is lost between your shell, ssh, sshd
 and Windows. All commands to an instance share one SSH connection.
 

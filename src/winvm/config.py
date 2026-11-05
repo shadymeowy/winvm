@@ -19,7 +19,7 @@ from urllib.parse import unquote
 
 import yaml
 
-from .util import Fatal, check_mount_points, content_hash, die, log, run, sha256_file, valid, warn, win_path
+from .util import Fatal, check_mount_points, content_hash, die, log, run, sha256_file, valid, warn, win_path, seconds
 
 DATA = Path(__file__).parent / "data"
 DEFAULT_FILE = DATA / "winvm.yaml"
@@ -28,7 +28,7 @@ GUEST = DATA / "guest"
 # image fields that change what an ISO install produces (`slim` only changes how fast)
 BASE_KEYS = ("edition", "index", "hostname", "user", "password", "timezone", "locale", "keyboard",
              "disk_size", "debloat")
-FROM_KEYS = {"from", "steps", "run"}
+FROM_KEYS = {"from", "steps", "run", "desktop", "password"}
 RUN_KEYS = {"ram", "cpus", "mounts"}
 
 
@@ -173,6 +173,8 @@ class Config:
             if d.get("iso") is not None:
                 die(f"{f}: `iso` or `from`, not both")
             check_keys(d, FROM_KEYS, str(f))
+            if not isinstance(d.get("desktop", False), bool):
+                die(f"{f}: `desktop` is true or false")
             img = {**d, "steps": d.get("steps") or []}
         else:   # an ISO image: the built-in base's values, then the file's
             check_keys(d, set(self.builtin) | {"index"}, str(f))
@@ -300,11 +302,22 @@ class Config:
         out = []
         for i, st in enumerate(img.get("setup" if offline else "steps") or [], 1):
             where = f"image '{name}' step {i}"
+            timeout = None
+            if isinstance(st, dict) and "timeout" in st:
+                st = dict(st)
+                if offline:
+                    die(f"{where}: `timeout` is for `steps` of images built `from` another")
+                if "run" not in st:
+                    die(f"{where}: `timeout` goes with `run`")
+                try:
+                    timeout = seconds(st.pop("timeout"))
+                except ValueError as e:
+                    die(f"{where}: {e}")
             if not isinstance(st, dict) or len(st) != 1:
                 die(f"{where}: expected one of run / download / copy" + ("" if offline else " / restart"))
             (kind, arg), = st.items()
             if kind == "run" and isinstance(arg, str):
-                out.append({"run": arg})
+                out.append({"run": arg, **({"timeout": timeout} if timeout else {})})
             elif kind == "download" and isinstance(arg, dict) and {"url", "sha256"} <= arg.keys():
                 if not re.fullmatch(r"[0-9a-fA-F]{64}", str(arg["sha256"])):
                     die(f"{where}: sha256 must be 64 hex digits")
@@ -361,7 +374,8 @@ class Config:
                      for st in self.steps(name)]
             if "from" in img:
                 self.chain(name)                               # fails on cycles
-                d = {"from": self.hash(img["from"]), "steps": steps}
+                d = {"from": self.hash(img["from"]), "steps": steps,
+                     **{k: img[k] for k in ("desktop", "password") if img.get(k) not in (None, False)}}
             else:
                 try:
                     iso = self.iso_id(name)
@@ -407,7 +421,7 @@ class Config:
         layers = [(self.run_defaults, self.base, str(self.file or DEFAULT_FILE))]
         if image in self.images:
             layers += [(self.images[n].get("run") or {}, self.context(n), str(self.sources[n]))
-                       for n in self.chain(image)]
+                       for n in self.chain(image) if n in self.images]   # (a saved image has no file)
         layers.append((overrides or {}, Path.cwd(), "instance settings"))
         out: dict = {}
         mounts: dict[str, dict] = {}

@@ -27,6 +27,7 @@ from .util import Chan, check_mount_points, die, log, meminfo, mib, mount_point,
 HYPERV = ("hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,"
           "hv-stimer,hv-frequencies,hv-tlbflush,hv-ipi,hv-reset")
 SMB_HOST = "10.0.2.4"           # where the guest reaches the instance's Samba server
+MEM_CALM = 5        # s free memory must stay level before a start is refused for lack of it
 LINKS = r"C:\ProgramData\winvm\mount-links.txt"   # in the guest: the folder links winvm made
 
 
@@ -568,12 +569,19 @@ def running(cfg: Config) -> list[Instance]:
 def need_mem(cfg: Config, want: int, what: str) -> None:
     """Refuse to start something the host can't hold. Running VMs count with the RAM
     they may still grow into, not just what they touched so far."""
-    growth = sum(max(0, vm.state.get("ram", 0) - vm.rss) for vm in running(cfg))
-    have = meminfo("MemAvailable") - growth
     reserve = mib(cfg.s.get("mem_reserve") or 0)
-    if have < want + reserve:
-        die(f"{what} needs ~{want} MiB RAM (+{reserve} reserve) but only {have} MiB is free "
-            f"for it - stop an instance or lower its RAM")
+    best, calm = -1, 0
+    while True:      # a VM that just stopped takes a moment to give its memory back, so
+        growth = sum(max(0, vm.state.get("ram", 0) - vm.rss) for vm in running(cfg))
+        have = meminfo("MemAvailable") - growth
+        if have >= want + reserve:
+            return
+        calm = 0 if have > best + 16 else calm + 1             # only a short level that holds counts
+        best = max(best, have)
+        if calm >= MEM_CALM:
+            die(f"{what} needs ~{want} MiB RAM (+{reserve} reserve) but only {have} MiB is free "
+                f"for it - stop an instance or lower its RAM")
+        time.sleep(1)
 
 
 def ports(cfg: Config, slot: int) -> dict:

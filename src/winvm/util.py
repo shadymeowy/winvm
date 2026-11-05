@@ -101,6 +101,14 @@ def mib(size) -> int:
         die(f"bad size '{size}' (e.g. 4G, 512M)")
 
 
+def seconds(value) -> int:
+    """A duration: 90, 90s, 30m, 2h -> seconds."""
+    m = re.fullmatch(r"(\d+)\s*([smh]?)", str(value).strip().lower())
+    if not m or not int(m[1]):
+        raise ValueError(f"bad duration {value!r} (like 90s, 30m, 2h)")
+    return int(m[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[m[2]]
+
+
 def human(n: float) -> str:
     for unit in "BKMG":
         if n < 1024:

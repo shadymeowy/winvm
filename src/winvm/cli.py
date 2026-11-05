@@ -304,7 +304,10 @@ def cmd_sh(a):
     words = a.rest[tty:]
     cwd = vm.guest_path(Path.cwd())
     if not words:                                              # interactive shell
-        cd = f"Set-Location -LiteralPath {guest.quote(cwd)}\npowershell -NoLogo" if cwd else None
+        # still a shell if the folder can't be entered: to find out why, for one
+        cd = (f"try {{ Set-Location -LiteralPath {guest.quote(cwd)} -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine("
+              f"\"warn: can't enter {cwd.replace(chr(34), '').replace('$', '`$')}, starting in $((Get-Location).Path)\") }}\n"
+              "powershell -NoLogo") if cwd else None
         return guest.terminal(vm.ssh("-t") + ([guest.encoded(cd)] if cd else []))
     script = guest.script(guest.command_line(words), cwd, console=tty)
     return guest.tty(vm.ssh, script) if tty else guest.pipe(vm.ssh, script)
