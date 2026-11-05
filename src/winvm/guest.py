@@ -43,7 +43,9 @@ def script(line: str, cwd: str | None = None, strict=False, console=False) -> st
     table, and `exit` would lose them: the command gets its own output pipeline, which ends
     first. Not with console=True (a terminal), where programs need the real console."""
     head = PROLOGUE + ("$ErrorActionPreference = 'Stop'\n" if strict else "")
-    cd = f"Set-Location -LiteralPath {quote(cwd)}\n" if cwd else ""
+    # a command must never run somewhere else than where it was asked to
+    cd = (f"try {{ Set-Location -LiteralPath {quote(cwd)} -ErrorAction Stop }} catch {{ "
+          f"[Console]::Error.WriteLine(\"error: can't run in {cwd.replace(chr(34), '').replace('$', '`$')}: $($_.Exception.Message)\"); exit 1 }}\n") if cwd else ""
     if strict:   # a thrown error: print just its message and exit 1
         line = ("$global:LASTEXITCODE = 0\ntry {\n" + line +
                 "\n} catch { [Console]::Error.WriteLine(\"error: $($_.Exception.Message)\"); exit 1 }")
