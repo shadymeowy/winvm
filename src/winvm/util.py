@@ -270,8 +270,11 @@ class Chan:
         return json.loads(line) if line else die(f"{cmd}: connection closed")
 
     def __call__(self, cmd: str, args: dict | None = None):
-        self.f.write(json.dumps({"execute": cmd, **({"arguments": args} if args else {})}) + "\n")
-        self.f.flush()
+        try:
+            self.f.write(json.dumps({"execute": cmd, **({"arguments": args} if args else {})}) + "\n")
+            self.f.flush()
+        except OSError as e:
+            die(f"{cmd}: {e}")
         while True:                                            # skip async events
             msg = self._read(cmd)
             if "error" in msg:

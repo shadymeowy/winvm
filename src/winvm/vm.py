@@ -92,9 +92,10 @@ class Instance:
     @property
     def meta(self) -> dict:
         try:
-            return json.loads((self.home / "instance.json").read_text())
+            meta = json.loads((self.home / "instance.json").read_text())
         except (OSError, ValueError):
             return {}
+        return meta if isinstance(meta, dict) else {}
 
     @meta.setter
     def meta(self, value: dict) -> None:
@@ -123,13 +124,13 @@ class Instance:
         `run`: the instance's own settings (kept from before if None); a temporary instance
         stays one (`reset`, `save`)."""
         temporary = temporary or self.meta.get("temporary")
-        Store(self.cfg).overlay(self.disk, on)
-        shutil.copyfile(host.firmware(self.cfg)[1], self.vars)
-        if not self.builder:
+        if not self.builder:                                   # first: a disk never looks real by accident
             src = self.cfg.sources.get(image)
             self.meta = {"image": image, "source": str(src) if src else None,
                          "run": self.meta.get("run", {}) if run is None else run,
                          **({"temporary": temporary} if temporary else {})}
+        Store(self.cfg).overlay(self.disk, on)
+        shutil.copyfile(host.firmware(self.cfg)[1], self.vars)
         log(f"fresh disk for {self.name} on {label(on)}")
 
     def require_stopped(self) -> None:

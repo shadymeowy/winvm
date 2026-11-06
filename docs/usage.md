@@ -39,8 +39,8 @@ winvm build dev --timeout 2h
 
 It goes before the command's name or after it. `sh`, `ssh`, `cp`, `rdp` and `ga` pass on what
 follows, so there it has to come right after the name: `winvm sh hostname --timeout 5m` would hand
-it to `hostname`. `--accel` follows the same rule, and `--rm` always comes right after the name. See
-[Time limits](#time-limits) for what happens without it.
+it to `hostname`. `--accel` and `--rm` follow the same rule. See [Time limits](#time-limits) for what
+happens without it.
 
 **Run instances**
 
@@ -97,8 +97,8 @@ it to `hostname`. `--accel` follows the same rule, and `--rm` always comes right
 | `config path` | Files and folders in use |
 
 `winvm sh` (or `ssh`, `cp`, `rdp`, `gui`) creates `main` when it doesn't exist yet, and starts an
-instance that's stopped, so `winvm sh` alone works from scratch. `winvm -i office sh` does the same
-when there's an image called `office`. Any other name has to be created with `up` first, so a
+instance that's stopped, so `winvm sh` alone works from scratch. `winvm -i golden sh` does the same
+when there's an image called `golden`. Any other name has to be created with `up` first, so a
 mistyped one can't start a build. winvm refuses to run as root.
 
 ## Running commands in the guest
@@ -290,9 +290,9 @@ them, and sets up desktop mode again on the fresh disk.
 when the command ends, also after Ctrl-C or `--timeout`, or when you close the `rdp` or `gui` window:
 
 ```sh
-winvm sh --rm -i office 'C:\tools\test.exe'   # a fresh VM on image office, gone afterwards
-winvm -i office ssh --rm hostname              # for ssh, -i goes first
-winvm rdp --rm -i office                       # gone when the window closes
+winvm sh --rm -i golden 'C:\tools\test.exe'   # a fresh VM on image golden, gone afterwards
+winvm -i golden ssh --rm hostname              # for ssh, -i goes first
+winvm rdp --rm -i golden                       # gone when the window closes
 ```
 
 Once the image is built, it takes about 14 seconds to start, or about 45 with `--desktop`. The
@@ -303,7 +303,7 @@ can run per name. While it runs, other commands with that `-i` use the same VM.
 script, set a `trap`, or a failing step leaves it running:
 
 ```sh
-winvm up work --image office --rm
+winvm up work --image golden --rm
 trap 'winvm stop work' EXIT
 winvm -i work cp test.exe :C:/Users/user/
 winvm sh -i work 'C:\Users\user\test.exe'

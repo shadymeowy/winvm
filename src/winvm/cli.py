@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -304,8 +305,10 @@ def press_and_wait(vms: list[Instance], after: int | None) -> tuple[list[Instanc
             if vm.power_button():
                 pressed.append(vm)
         except Fatal as e:
-            warn(f"couldn't stop {vm.name}: {e}")
-            trouble = True
+            time.sleep(1)                                      # (a --rm command may be ending it just now)
+            if vm.alive:
+                warn(f"couldn't stop {vm.name}: {e}")
+                trouble = True
     return [vm for vm in pressed if not vm.wait_stopped(after or vm.power_off_after, since=t0)], trouble
 
 
@@ -388,7 +391,7 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
          arg("--ram", help="e.g. 8G, or 2G-8G: dynamic memory between the two; kept for this instance "
                            "(`default`: back to the image's)"),
          arg("--cpus", help="kept for this instance (`default`: back to the image's)"),
-         arg("--all", action="store_true", help="every existing instance"),
+         arg("--all", action="store_true", help="every existing instance, except temporary ones"),
          arg("--iso", help="Windows ISO for images without `iso:` (remembered in ${data_dir}/iso)"),
          arg("--gui", action="store_true", help="GTK window with clipboard instead of headless"),
          arg("--desktop", nargs="?", const="on", metavar="off|default", help="log on by itself at every boot, without a window; "
@@ -435,6 +438,8 @@ def cmd_up(a):
             if not any(desktop.status(vm)):
                 allow_reboot(a, vm)
             reboot = True
+        if image and not has_image(cfg, image) and vm.meta.get("temporary"):
+            die(f"no image named {image} (winvm images)")
         stale = clear_stale(cfg, vm, "replacing the stopped temporary instance") or {}
         refuse_busy(vm)
         new = not vm.disk.exists()
@@ -444,7 +449,7 @@ def cmd_up(a):
             die(f"{n} is temporary, so --no-rm can't keep it. `winvm stop {n}` deletes it, and then "
                 f"`winvm up {n} --no-rm` makes one that stays")
         # (the lock lasts until this command ends, so that a VM still starting isn't taken for a finished one)
-        if temporary_lock(cfg, n) is None and new:
+        if temporary_lock(cfg, n) is None and (not vm.alive or vm.meta.get("temporary") == "command"):
             die(f"another command is creating {n} or using it as a temporary VM")
         on = image or stale.get("image")
         temp = new and (a.rm or (stale.get("temporary") == "stop" and not a.no_rm) or
@@ -611,7 +616,7 @@ def cmd_sh(a):
     winvm sh ipconfig | grep IPv4     output has Unix line endings
     winvm sh --desktop CMD            in the logged-on desktop session (COM, winget, DPAPI)
     winvm sh --timeout 5m CMD         give up on it after 5 minutes: exit 124
-    winvm sh --rm -i office CMD       in a fresh VM on image office, deleted afterwards
+    winvm sh --rm -i golden CMD       in a fresh VM on image golden, deleted afterwards
 
     The exit code is the command's. Run from inside a mounted host folder, the guest
     command runs in the matching C:\\mnt\\... folder.
@@ -693,7 +698,7 @@ def cmd_sh(a):
 
 
 def check_not_a_name(a, word: str) -> None:
-    """`winvm sh office`: `office` is the command to run, but it looks meant as a VM. Say so,
+    """`winvm sh golden`: `golden` is the command to run, but it looks meant as a VM. Say so,
     and don't create main just to run it there."""
     if not re.fullmatch(r"[A-Za-z0-9._-]+", word) or word == a.instance:
         return
@@ -1558,8 +1563,35 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
     return p, subs
 
 
+def closed_files_on_devnull() -> None:
+    """`winvm ... <&- >&-`: Python has no sys.stdin or sys.stdout then, which winvm counts on."""
+    for fd, name, mode in ((0, "stdin", "r"), (1, "stdout", "w"), (2, "stderr", "w")):
+        if getattr(sys, name) is None:
+            new = os.open(os.devnull, os.O_RDWR)
+            if new != fd:
+                os.dup2(new, fd)
+                os.close(new)
+            setattr(sys, name, os.fdopen(fd, mode, closefd=False))
+
+
 def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
+    closed_files_on_devnull()
+    try:
+        rc = run_command(sys.argv[1:] if argv is None else argv)
+        sys.stdout.flush()                                     # now, not when Python exits: its errors show here
+        return rc
+    except BrokenPipeError:                                    # `winvm ps | head -0`
+        drop_stdout()
+        return 141
+    except OSError as e:
+        if e.errno not in (errno.EBADF, errno.ENOSPC):
+            raise
+        print(paint("1;31", "error:"), "can't write the output: " + ("stdout is closed" if e.errno == errno.EBADF else "no space left"), file=sys.stderr)
+        drop_stdout()
+        return 1
+
+
+def run_command(argv: list[str]) -> int:
     if argv[:1] == ["__names"]:                                # (hidden) for shell completion
         return complete_names(*(argv[1:3] or [""]))
     p, _ = parser()

@@ -1,2 +1,2 @@
 """winvm - build and run slim, unattended Windows VMs on QEMU/KVM from YAML image files."""
-__version__ = "1.5.5"
+__version__ = "1.5.6"

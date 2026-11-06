@@ -132,7 +132,7 @@ class Config:
         for meta in [*(self.data / "instances").glob("*/instance.json"), *(self.data / "images").glob("*.json")]:
             try:
                 src = json.loads(meta.read_text()).get("source")
-            except (OSError, ValueError):
+            except (OSError, ValueError, AttributeError):      # (a file that holds no JSON object)
                 continue
             if src and Path(src).is_file() and Path(src).stem not in self.sources:
                 self.load_quietly(Path(src))

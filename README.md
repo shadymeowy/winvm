@@ -212,7 +212,7 @@ reinstall Windows, and `prune --iso` tells you whether winvm can download it aga
 - **[Images](https://github.com/shadymeowy/winvm/blob/main/docs/images.md):** image
   files, steps, rebuilds, settings
 - **[Windows in the VM](https://github.com/shadymeowy/winvm/blob/main/docs/windows.md):**
-  what's removed, activation, Office, turning updates back on
+  what's removed, activation, turning updates back on
 - **[How it works](https://github.com/shadymeowy/winvm/blob/main/docs/internals.md):**
   the build process, measurements, design notes
 
