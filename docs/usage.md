@@ -22,10 +22,9 @@ it must come first because ssh and scp have their own `-i`.
 
 Wherever an IMAGE is asked for, a name or the path of an image file works.
 
-Deleting something asks first in a terminal. `-y` doesn't ask, and from a script or a
-pipe winvm goes ahead without asking. `-y` also skips the question before downloads.
-Rebooting a running VM to log on is stricter: from a script, winvm refuses without `-y`. Downloads
-too: from a script, winvm refuses them without `-y`.
+In a terminal, winvm asks before deleting something, downloading, or rebooting a running VM to
+log on, and `-y` answers yes. From a script or a pipe, it goes ahead with a delete, but refuses a
+download or that reboot unless you add `-y`.
 
 **`--timeout TIME`** works on every command and means the same on all of them: give up on the whole
 command after this long, and exit 124. It takes `120`, `90s`, `30m` or `2h`, and covers everything
@@ -38,9 +37,10 @@ winvm cp --timeout 2m big.iso :C:/
 winvm build dev --timeout 2h
 ```
 
-It goes before the command's name or after it. `sh`, `ssh`, `cp`, `rdp` and `ga` pass on what follows,
-so there it has to come right after the name: `winvm sh hostname --timeout 5m` would hand it to
-`hostname`. `--accel` follows the same rule. See [Time limits](#time-limits) for what happens without it.
+It goes before the command's name or after it. `sh`, `ssh`, `cp`, `rdp` and `ga` pass on what
+follows, so there it has to come right after the name: `winvm sh hostname --timeout 5m` would hand
+it to `hostname`. `--accel` follows the same rule. See [Time limits](#time-limits) for what happens
+without it.
 
 **Run instances**
 
@@ -124,15 +124,15 @@ Run from inside a mount whose guest folder can't be entered, `winvm sh CMD` runs
 1, so a command never runs in the wrong place. With no command, you still get a shell, in your home
 folder, with a warning.
 
-For a lot of data on stdin, PowerShell code should read it with `stdin`, which handled 3 MB in
-testing. `[Console]::In` and `[Console]::OpenStandardInput()` can stall the whole connection from
-around 16 KB. A native program gets stdin directly, which also handled 3 MB when it only reads or
-prints a little. One that prints a lot while it reads usually stalls from about 256 KB, and then
-the connection ends with exit 255 after 30-40 seconds (3 minutes when emulating), which winvm points out. For that, go through PowerShell with
-`winvm sh 'stdin | findstr "^"'`, or copy the data in with `winvm cp`.
+**Large stdin.** PowerShell code should read it with `stdin`, which handled 3 MB in testing.
+`[Console]::In` and `[Console]::OpenStandardInput()` can stall the whole connection from around
+16 KB. A native program gets stdin directly, which also handled 3 MB when it prints little. One
+that prints a lot while it reads usually stalls from about 256 KB, and the connection is lost with
+exit 255. For that, go through PowerShell with `winvm sh 'stdin | findstr "^"'`, or copy the data
+in with `winvm cp`.
 
-On `winvm sh`, `--timeout` also ends the command in the guest and what the command started, but not
-what Windows started for it, such as Store apps and COM servers, and it says if it couldn't. It needs
+On `winvm sh`, `--timeout` also ends the command in the guest and what it started, and says if it
+couldn't. It doesn't end what Windows started for it, such as Store apps and COM servers. It needs
 a command, and doesn't go with `-t`.
 
 The command travels base64-encoded, so no quoting is lost between your shell, ssh, sshd
@@ -205,16 +205,15 @@ plain `winvm sh`:
   `Start-Process` to leave them open.
 - `-t` doesn't apply, and neither does a shell without a command: use `winvm gui` or `winvm rdp`.
 
-**For a script,** this runs one export from start to finish. The `trap` comes after `up`, so that
-a refused `up` doesn't stop a VM that was already running; after a successful `up` it does stop the
-VM at the end, also one that was already running. `winvm cp` doesn't create folders, so
-`C:\work` has to exist already, from the image or an earlier step:
+**For a script,** this runs one export from start to finish and always stops the VM afterwards,
+even one that was already running. `winvm cp` doesn't create folders, so `C:\work` has to exist
+already, from the image or an earlier step:
 
 ```sh
 #!/bin/sh
 set -e
 winvm up --desktop                       # returns once logged on
-trap 'winvm stop' EXIT                   # stops the VM even if a step fails
+trap 'winvm stop' EXIT                   # after up: a refused up shouldn't stop a running VM
 
 winvm cp report.docx :C:/work/report.docx
 winvm sh --desktop --timeout 5m 'powershell -ExecutionPolicy Bypass -File C:\work\export.ps1'
@@ -320,9 +319,10 @@ KSM. It's off by default, and `winvm check` shows the command to turn it on.
 
 ## Without KVM
 
-winvm needs KVM to be fast. If you only lack access to it, fix that: `sudo usermod -aG kvm $USER`,
-then log in again. If the machine has no KVM at all, for example inside a VM or a CI runner, QEMU can
-emulate the CPU. You have to ask for it, because of what it costs:
+winvm needs KVM to be fast. If you only lack access to it, fix that: run
+`sudo usermod -aG kvm $USER`, then log in again. If the machine has no KVM at all, for example
+inside a VM or a CI runner, QEMU can emulate the CPU. You have to ask for it, because of what it
+costs:
 
 ```sh
 winvm up --accel tcg              # this command only
@@ -345,27 +345,27 @@ Measured on one 16-thread desktop with 4 vCPUs and 4 GB:
 | Clean `winvm stop` | about 10 s | about 16 s |
 | An image `from` another, one small step | about 1 minute | about 4.5 minutes |
 
-**Installing Windows under emulation hasn't been timed from start to finish.** It takes up to an
-hour on KVM, so expect many hours. It's much better to build the image once on a machine with KVM,
-if you can.
+**A full Windows install under emulation hasn't been run.** It starts, and begins writing Windows
+to the disk after about 4 minutes. It takes up to an hour on KVM, so expect many hours. If you can,
+build the image once on a machine with KVM.
 
-**Desktop mode is poor when emulated.** `winvm up --desktop` took about 10 minutes, which is close to
-the limit on a logon, so give it a longer `--timeout`. The first command in that session then lost its
+**Desktop mode is poor when emulated.** `winvm up --desktop` took about 10 minutes, close to the
+limit on a logon, so give it a longer `--timeout`. The first command in that session then lost its
 connection in both tries, so avoid it there.
 
-A running emulated VM stays emulated, and `winvm restart` keeps it so: only the next start of a
-stopped VM needs the setting again, which `$WINVM_ACCEL` or `settings.accel` takes care of. QEMU uses
-about 700 MB more than the VM's RAM, for its translated code, and the RAM guard counts on that.
+`winvm restart` keeps a running VM emulated. Starting a stopped one needs the setting again, which
+`$WINVM_ACCEL` or `settings.accel` takes care of. QEMU uses about 700 MB more than the VM's RAM, for
+its translated code, and the RAM guard counts on that.
 
 ## Time limits
 
 Without `--timeout`, a command that's working has no limit: installing Windows can take its hours,
-`winvm sh` waits for its command, and `winvm cp` takes as long as the file does. What winvm waits for
-by itself is limited, and every limit says so in its message when it runs out:
+`winvm sh` waits for its command, and `winvm cp` takes as long as the file does. What winvm waits
+for by itself is limited, and it says so when one of these runs out:
 
 | Waiting for | Limit | Then |
 |---|---|---|
-| SSH to answer, a logon, a reboot, a build VM's shutdown, or winvm's own commands in the guest | 10 minutes each | error, exit 1 (a hung command of winvm's own warns instead where it can carry on, like setting up mounts) |
+| SSH to answer, a logon, a reboot, a build VM's shutdown, or winvm's own commands in the guest | 10 minutes each | error, exit 1, or a warning where winvm can carry on, as with setting up mounts |
 | A VM to stop | 2 minutes, 10 when emulating; `--kill-after` | hard power-off, exit 3 |
 | A shared folder to answer | 30 s, 2 minutes when emulating | warning; `winvm mount` undoes the mount, exit 1 |
 | An SSH connection to open | 5 s, 30 s when emulating | that try fails; waits above try again |
@@ -374,12 +374,11 @@ by itself is limited, and every limit says so in its message when it runs out:
 | A download to send anything | 60 s | error; run it again, it resumes |
 | Memory to free up before a start | until it holds level for 5 s | the RAM guard refuses |
 | Cleaning up in the guest after a limit ran out | 30 s | says the command may still be running |
-| Pressing Enter for the Windows ISO's "Press any key" | 30 s, 2 minutes when emulating | if it's missed, Setup never starts, and the build warns after 15 minutes without progress |
 
-`--timeout` overrides the 10 minute waits in both directions: with `--timeout 2h`, `winvm up` waits up
-to 2 hours for a slow VM. The dynamic memory helper has its own timings, in [Dynamic memory](#dynamic-memory),
-and it logs when it stops. Inside the install itself, Windows' setup scripts have a few short retries of
-their own, which aren't visible from here unless the install fails.
+`--timeout` overrides the 10 minute waits in both directions: with `--timeout 2h`, `winvm up` waits
+up to 2 hours for a slow VM. The dynamic memory helper has its own timings, in
+[Dynamic memory](#dynamic-memory), and it logs when it stops. Inside the install, Windows' setup
+scripts have a few short retries of their own, which only show if the install fails.
 
 **When `--timeout` runs out,** what was already underway stays as follows:
 

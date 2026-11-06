@@ -40,6 +40,8 @@ from .vm import Instance, running
 
 # virtio driver folders injected into Windows (w11/amd64 flavour)
 VIRTIO_DRIVERS = "vioscsi viostor NetKVM Balloon vioserial viorng vioinput pvpanic fwcfg viogpudo".split()
+# Read from the Windows CD: 3.5 MB at most up to "Press any key", then boot.wim (about 600 MB)
+BOOTING = 32 << 20
 CAPTURE_GB = 30                 # size of the slim-capture disk; pe.cmd recognizes it by this
 WORK = r"C:\winvm-build"        # work folder of `from` builds: downloads, copies, cwd of run steps
 BOM = guest.BOM
@@ -288,9 +290,7 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     argv = [*inst.qemu_argv(install=True, gui=gui, cdroms=cdroms, disks=disks), "-pidfile", str(inst.pidfile)]
     qemu = sp.Popen(argv + (["-no-reboot"] if no_reboot else []))
     reason: list[str] = []
-    # (emulated, the firmware takes far longer to reach "Press any key")
-    press = 120 if inst.cfg.accel == "tcg" else 30
-    watcher = threading.Thread(target=watch_qmp, args=(inst.dir / "qmp-build.sock", qemu, reason, press), daemon=True)
+    watcher = threading.Thread(target=watch_qmp, args=(inst.dir / "qmp-build.sock", qemu, reason), daemon=True)
     watcher.start()
     buf = b""
     written = [inst.disk, *(d for d, ro in disks if not ro)]  # disks the installer writes to
@@ -335,9 +335,10 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     return serial.read_text(errors="replace"), (reason[-1] if reason else "")
 
 
-def watch_qmp(sock: Path, qemu: sp.Popen, reason: list[str], press: int = 12) -> None:
-    """The installer VM's own QMP socket: press Enter for `press` s (Microsoft's ISO asks to
-    "Press any key to boot from CD"), then record SHUTDOWN reasons until QEMU exits."""
+def watch_qmp(sock: Path, qemu: sp.Popen, reason: list[str]) -> None:
+    """The installer VM's own QMP socket: press Enter until Windows PE is loading (Microsoft's
+    ISO asks to "Press any key to boot from CD", and a VM that misses it sits in the firmware
+    for good), then record SHUTDOWN reasons until QEMU exits."""
     for _ in range(300):                                       # QEMU may take a while to start
         if qemu.poll() is not None:
             return
@@ -353,21 +354,36 @@ def watch_qmp(sock: Path, qemu: sp.Popen, reason: list[str], press: int = 12) ->
         return
     f = s.makefile("rw", encoding="utf-8")
 
-    def send(cmd: str, args: dict | None = None) -> None:
+    def read() -> dict:
+        line = f.readline()
+        if not line:
+            raise OSError("QEMU closed its QMP socket")
+        msg = json.loads(line)
+        if msg.get("event") == "SHUTDOWN":
+            reason.append(msg.get("data", {}).get("reason", ""))
+        return msg
+
+    def call(cmd: str, args: dict | None = None):
         f.write(json.dumps({"execute": cmd, **({"arguments": args} if args else {})}) + "\n")
         f.flush()
+        while True:
+            msg = read()
+            if "return" in msg or "error" in msg:
+                return msg.get("return")
+
+    def booting() -> bool:
+        stats = {b.get("device"): b.get("stats", {}) for b in call("query-blockstats") or []}
+        return (stats.get("cd0", {}).get("rd_bytes", 0) >= BOOTING
+                or stats.get("disk0", {}).get("wr_bytes", 0) > 0)
 
     try:
-        f.readline()
-        send("qmp_capabilities")
-        end = time.time() + press
-        while time.time() < end:
-            send("send-key", {"keys": [{"type": "qcode", "data": "ret"}]})
+        read()
+        call("qmp_capabilities")
+        while not booting():
+            call("send-key", {"keys": [{"type": "qcode", "data": "ret"}]})
             time.sleep(0.5)
-        for line in f:
-            msg = json.loads(line)
-            if msg.get("event") == "SHUTDOWN":
-                reason.append(msg.get("data", {}).get("reason", ""))
+        while True:
+            read()
     except (OSError, ValueError):
         pass
 

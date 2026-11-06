@@ -25,11 +25,15 @@ sits on the image. `winvm save` turns the top disk into a new compressed layer.
 ## How an ISO image is built
 
 ```
-VM without network:  CD 1  Microsoft's Windows ISO, unmodified (boots; Enter for "press any key")
+VM without network:  CD 1  Microsoft's Windows ISO, unmodified (boots)
                      CD 2  winvm payload: autounattend.xml + winslim\ (pe.cmd, lists, unattend.xml,
                            first-boot scripts, your setup steps), written in pure Python
                      CD 3  virtio-win (drivers, guest tools)
 ```
+
+The ISO asks to "press any key" before it boots, and a VM that misses this stays in the firmware
+for good. So winvm keeps pressing Enter until the VM has read 32 MB from the CD or written to its
+disk: the prompt comes within about 3.5 MB, and `boot.wim` is about 600 MB.
 
 1. **WinPE.** Windows Setup finds `autounattend.xml` on CD 2 and runs `winslim\start.cmd`, then
    `pe.cmd` (`data/guest/`), which installs Windows itself. It refuses to run unless the SMBIOS
