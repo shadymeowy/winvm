@@ -57,16 +57,28 @@ own `uuid` and `data_dir`.
 
 ## Office
 
-Office installs fine as an image step or by hand with the
+**Office hasn't been tested on current versions of winvm,** so treat this section as a starting
+point. You can install it by hand or as an image step, using the
 [Office Deployment Tool](https://learn.microsoft.com/microsoft-365-apps/deploy/overview-office-deployment-tool),
 which downloads from Microsoft's CDN, not Windows Update.
 
-Microsoft 365 Apps need the WebView2 runtime and more than 4 GB of RAM without a pagefile. To get
-the runtime, keep it with `debloat.remove_webview: false`, or run
-`winget install Microsoft.EdgeWebView2Runtime --accept-source-agreements --accept-package-agreements` with
+The VM has no pagefile unless it uses dynamic memory, so give Office more than the default 4 GB of
+RAM, for example with `winvm up --ram 6G`.
+
+**WebView2.** `base` removes this runtime.
+[Microsoft says](https://learn.microsoft.com/microsoft-365-apps/deploy/webview2-install) add-ins and
+some Office features need it, and that Microsoft 365 Apps normally install it by themselves within a
+few days. That may not happen here, because `base` also removes the Edge updater. Whether signing in
+to Office needs it isn't clear, so install it if signing in fails. To get it, either keep it with
+`debloat.remove_webview: false`, which means a new Windows install for that image, or run this with
 [`winvm sh --desktop`](usage.md#commands-that-need-a-desktop) or in a
-[`desktop: true`](images.md#steps-on-a-logged-on-desktop) image. `winget` doesn't work from plain
-`winvm sh` or a normal step.
+[`desktop: true`](images.md#steps-on-a-logged-on-desktop) image:
+
+```powershell
+winget install Microsoft.EdgeWebView2Runtime --accept-source-agreements --accept-package-agreements
+```
+
+`winget` doesn't work from plain `winvm sh` or a normal step.
 
 Automating Word or Excel through COM needs the logged-on session too. Run it with
 `winvm sh --desktop`, and see [the example there](usage.md#commands-that-need-a-desktop).

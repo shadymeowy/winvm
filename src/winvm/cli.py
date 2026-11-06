@@ -351,7 +351,8 @@ def cmd_info(a):
     print(f"cpus      {eff.get('cpus')}" + ("  (own setting; `winvm up --cpus default` drops it)" if "cpus" in own else ""))
     if eff.get("desktop") or "desktop" in own:
         print(f"desktop   {'logs on at every boot' if eff.get('desktop') else 'off'}"
-              + ("  (own setting; `winvm up --desktop default` drops it)" if "desktop" in own else ""))
+              + (f"  (turn that off: winvm up {vm.name} --desktop off)" if eff.get("desktop")
+                 else f"  (own setting; back to the image's: winvm up {vm.name} --desktop default)" if "desktop" in own else ""))
     mounts = vm.mounts if st else eff["mounts"]
     for i, (n, m) in enumerate(mounts.items()):
         saved = "  (saved with this instance)" if n in (own.get("mounts") or {}) else ""
@@ -513,7 +514,7 @@ def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, f
             except (Fatal, TimedOut):                          # it couldn't log on: nothing changes
                 vm.meta = before
                 raise
-            log(f"desktop mode is on for {vm.name} from now on (`winvm -i {vm.name} up --desktop default` drops it)")
+            log(f"{vm.name} will now log on by itself at every boot (turn that off: winvm up {vm.name} --desktop off)")
 
     def stopped(*_):                                           # `kill`, `timeout`: as Ctrl-C does
         raise KeyboardInterrupt
@@ -548,7 +549,7 @@ def cmd_ssh(a):
 
 @command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("paths", nargs="*", metavar="PATH", help="':' prefix = guest path"), raw=True)
 def cmd_cp(a):
-    """copy files with scp, e.g. cp a.txt :C:/Users/user/  |  cp :C:/x.log ."""
+    """copy files to or from the VM, e.g. cp a.txt :C:/Users/user/  |  cp :C:/x.log ."""
     vm = ready(a)
     paths = [f"{vm.name}{p}" if p.startswith(":") else p for p in a.rest]
     hand_over(["scp", "-F", str(vm.dir / "ssh_config"), "-r", *paths], "; a partial file may be left where it was going")
