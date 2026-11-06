@@ -36,6 +36,7 @@ run:                                 # how instances of dev run (images on dev i
     projects: ~/Projects             # guest C:\mnt\projects
     docs: {path: ~/Documents, readonly: true}
     src: {path: ~/src, at: 'C:\src'}  # anywhere in the guest instead of C:\mnt
+  # rm: true                         # new instances are temporary, as with --rm
 ```
 
 ```sh

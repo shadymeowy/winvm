@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -16,6 +18,7 @@ import sys
 import termios
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import yaml
 
@@ -24,7 +27,7 @@ from .build import build, fetch_step
 from .config import BUILTIN, DEFAULT_FILE, Config, is_path, sha
 from .media import editions
 from .store import Store, label
-from .util import WAIT, Chan, Fatal, TimedOut, die, du, log, mib, mount_point, paint, seconds, start_timeout, timing, valid, warn, win_path
+from .util import WAIT, Chan, Fatal, TimedOut, cancel_timeout, die, du, log, mib, mount_point, paint, seconds, start_timeout, timing, valid, warn, win_path
 from .vm import Instance, ports, running, smbd as vm_smbd
 
 COMMANDS: dict[str, tuple] = {}
@@ -56,19 +59,165 @@ def inst(a) -> Instance:
 
 
 def existing(a) -> Instance:
-    """The -i instance, which must exist - except the default one, main, which is created
-    on first use as `winvm up` would (a mistyped name shouldn't start a download and build)."""
+    """The -i instance. A new one is created on first use, as `winvm up` would, for main and
+    for the name of an image; any other name must exist already (a mistyped name shouldn't
+    start a download and build). With --rm: a temporary one, see temporary()."""
+    if getattr(a, "rm", False):
+        return temporary(a)
     vm = inst(a)
+    clear_stale(a.cfg, vm)
+    refuse_busy(vm)
     if not vm.builder and not vm.disk.exists():
-        if vm.name != "main":
-            die(f"{vm.name} does not exist yet - winvm up {vm.name}")
+        if vm.name != "main" and not has_image(a.cfg, vm.name):
+            die(f"no instance or image named {vm.name} - winvm up {vm.name} creates it on base")
+        if image_says_rm(a.cfg, vm):
+            if a.fn is cmd_cp:
+                die(f"{vm.name} is set to `run: rm` and isn't running, so it would be deleted again right "
+                    f"away. Start it first: winvm up {vm.name}")
+            return temporary(a)
+        fd = temporary_lock(a.cfg, vm.name)
+        if fd is None:
+            die(f"another command is creating {vm.name} or using it as a temporary VM")
         ensure_disk(a.cfg, vm)
+        os.close(fd)
     return vm
+
+
+def image_says_rm(cfg: Config, vm: Instance) -> bool:
+    """`run: rm`: is an instance with this name, if it were new, a temporary one?"""
+    return bool(cfg.run_settings(vm.name if has_image(cfg, vm.name) else "base").get("rm"))
 
 
 def ready(a) -> Instance:
     """The -i instance, running with SSH answering (see existing)."""
     return existing(a).up()
+
+
+_temporary: list[Instance] = []        # what --rm deletes when this command ends
+
+
+def temporary_lock(cfg: Config, name: str) -> int | None:
+    """Take the lock of a name, which lasts until this process ends or closes it: a --rm command
+    holds it throughout, and `up` while it creates or starts a VM. None: someone else has it."""
+    cfg.runtime.mkdir(parents=True, exist_ok=True)
+    fd = os.open(cfg.runtime / f".{name}.rm-lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def disk_locked(cfg: Config, disk: Path) -> bool:
+    """Does a QEMU have this disk open? That also shows a VM this run folder doesn't know of,
+    as when $XDG_RUNTIME_DIR differs. Can't tell: yes, because this guards deleting it."""
+    try:
+        r = sp.run([host.qemu_img(cfg), "info", str(disk)], capture_output=True, text=True, timeout=20)
+    except (OSError, sp.TimeoutExpired, Fatal):
+        return True
+    return r.returncode != 0 and "lock" in r.stderr
+
+
+def refuse_real(vm: Instance) -> NoReturn:
+    die(f"{vm.name} is a real instance, and --rm would delete it. Use it without --rm"
+        + (", or for a temporary VM on base: --rm -i base" if vm.name == "main" else "")
+        + f". (winvm rm {vm.name} deletes it for good.)")
+
+
+def signals_as_ctrl_c() -> None:
+    """`kill` and a closed terminal end the command the way Ctrl-C does, so cleaning up runs."""
+    def stopped(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stopped)
+    signal.signal(signal.SIGHUP, stopped)
+
+
+def temporary(a) -> Instance:
+    """--rm: a new instance named by -i, deleted when this command ends (end_temporary). A real
+    instance of that name is never touched, and one temporary instance runs per name. `temporary`
+    in its meta: "command" (this), or "stop" (`up --rm`: `stop` and `kill` delete it)."""
+    vm = inst(a)
+    if vm.builder:
+        die("--rm doesn't go with a build VM")
+    if vm.disk.exists() and not vm.meta.get("temporary"):
+        refuse_real(vm)
+    if vm.name != "main" and not has_image(a.cfg, vm.name):
+        die(f"no image named {vm.name} (winvm images)")
+    if temporary_lock(a.cfg, vm.name) is None:                 # (held until this command ends)
+        die(f"another command is creating {vm.name} or using it as a temporary VM, and only one can run per name")
+    if vm.disk.exists():                                       # nobody else can change this now
+        if not vm.meta.get("temporary"):
+            refuse_real(vm)
+        if vm.alive and vm.meta.get("temporary") == "stop":
+            die(f"{vm.name} is running, from `winvm up --rm`. Use it without --rm, or end it first: winvm stop {vm.name}")
+        if not vm.alive and disk_locked(a.cfg, vm.disk):
+            die(f"{vm.name}'s disk is in use by a VM that winvm can't see from here: is $XDG_RUNTIME_DIR different?")
+        warn(f"replacing the temporary {vm.name} that a command left behind")
+        delete_temporary(vm)
+    signals_as_ctrl_c()
+    _temporary.append(vm)
+    vm.ends_with_command = True
+    ensure_disk(a.cfg, vm, temporary="command")
+    return vm
+
+
+def delete_temporary(vm: Instance) -> None:
+    vm.kill()
+    shutil.rmtree(vm.home, ignore_errors=True)
+    shutil.rmtree(vm.dir, ignore_errors=True)
+
+
+def stale_lock(cfg: Config, vm: Instance) -> int | None:
+    """The lock of a temporary VM that is finished: off, and in nobody's use. Only the holder may
+    delete it, and it stays that way for as long as the lock is held. None: it isn't finished."""
+    if vm.builder or not (vm.disk.exists() and vm.meta.get("temporary")) or vm.alive:
+        return None
+    fd = temporary_lock(cfg, vm.name)
+    if fd is None:
+        return None
+    if vm.alive or not (vm.disk.exists() and vm.meta.get("temporary")) or disk_locked(cfg, vm.disk):
+        os.close(fd)
+        return None
+    return fd
+
+
+def clear_stale(cfg: Config, vm: Instance, what: str = "removed the stopped temporary instance") -> dict | None:
+    """Delete a temporary VM that is finished, and return what it was. It got here by `stop`, or
+    by shutting down by itself."""
+    fd = stale_lock(cfg, vm)
+    if fd is None:
+        return None
+    meta = vm.meta
+    delete_temporary(vm)
+    os.close(fd)
+    log(f"{what} {vm.name}")
+    return meta
+
+
+def refuse_busy(vm: Instance) -> None:
+    """A temporary VM that's off and not finished (see stale_lock): it's being started or deleted
+    this moment, or runs where this run folder can't see it. Starting it now would clash."""
+    if vm.disk.exists() and vm.meta.get("temporary") and not vm.alive:
+        die(f"another command is starting or deleting the temporary {vm.name}, or it runs where winvm "
+            f"can't see it from here. Try again in a moment")
+
+
+def end_temporary() -> None:
+    """The end of a --rm command, however it ended: nothing may stop this half way."""
+    if not _temporary:
+        return
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, signal.SIG_IGN)
+    cancel_timeout()
+    for vm in _temporary:
+        if vm.meta.get("temporary"):                           # (not one that was never created)
+            delete_temporary(vm)
+            try:
+                log(f"removed the temporary instance {vm.name}")
+            except (OSError, ValueError):                      # stderr may be a closed pipe by now
+                pass
+    _temporary.clear()
 
 
 def confirm(a, question: str) -> None:
@@ -116,14 +265,15 @@ def drop_stdout() -> None:
 
 def hand_over(argv: list[str], left_behind: str = "") -> None:
     """Become this program; under --timeout stay around, so that the limit still holds, and
-    put the terminal back as it was if the program couldn't."""
-    if not timing():
+    put the terminal back as it was if the program couldn't. --rm stays around too, to clean up."""
+    if not timing() and not _temporary:
         os.execvp(argv[0], argv)
     tty = termios.tcgetattr(0) if sys.stdin.isatty() else None
     proc = sp.Popen(argv)
     try:
-        sys.exit(proc.wait())
-    except TimedOut as e:
+        rc = proc.wait()
+        sys.exit(128 - rc if rc < 0 else rc)                   # (killed by a signal: as a shell says it)
+    except (TimedOut, KeyboardInterrupt) as e:
         proc.terminate()
         try:
             proc.wait(5)
@@ -132,7 +282,9 @@ def hand_over(argv: list[str], left_behind: str = "") -> None:
             proc.wait()
         if tty:
             termios.tcsetattr(0, termios.TCSANOW, tty)
-        raise TimedOut(f"{e}{left_behind}", e.limit) from None
+        if isinstance(e, TimedOut):
+            raise TimedOut(f"{e}{left_behind}", e.limit) from None
+        raise
 
 
 def kill_after(a) -> int | None:
@@ -185,10 +337,31 @@ def link_iso(cfg: Config, iso: str) -> None:
     log(f"using {src} (linked as {dst})")
 
 
-def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict | None = None) -> None:
+def has_image(cfg: Config, name: str) -> bool:
+    """An image of this name: defined in a file, or built (a saved one has no file)."""
+    return name in cfg.images or bool(Store(cfg).versions(name))
+
+
+@contextlib.contextmanager
+def stdout_on_stderr():
+    """A build on the way to a command: `winvm sh CMD | x` must only see what CMD prints."""
+    sys.stdout.flush()
+    saved = os.dup(1)
+    os.dup2(2, 1)
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
+def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict | None = None,
+                temporary: str | None = None) -> None:
     """A new instance gets a disk on its image (built first if needed): `image`, else the
-    image named like the instance, else base. An existing one keeps its disk; new `run`
-    settings are added to its own, and it is told when its image has a newer version."""
+    image named like the instance, else base; `temporary`: see temporary(). An existing one keeps
+    its disk; new `run` settings are added to its own, and it is told when its image has a newer
+    version."""
     store = Store(cfg)
     if vm.disk.exists():
         if run:                                                # (None: back to the image's value)
@@ -201,10 +374,11 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
                  f"winvm -i {vm.name} reset to update it (discards its changes)")
         return
     host.require(cfg)                                          # before creating anything
-    image = image or (vm.name if vm.name in cfg.images or store.versions(vm.name) else "base")
+    image = image or (vm.name if has_image(cfg, vm.name) else "base")
     if image in cfg.images:
-        build(cfg, [image])
-    vm.create(image, store.require(image), {k: v for k, v in (run or {}).items() if v is not None})
+        with stdout_on_stderr():
+            build(cfg, [image])
+    vm.create(image, store.require(image), {k: v for k, v in (run or {}).items() if v is not None}, temporary)
 
 
 @command(arg("names", nargs="*", metavar="NAME", names="instances", help="instance, or an image file (instance named like it); "
@@ -219,6 +393,8 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
          arg("--gui", action="store_true", help="GTK window with clipboard instead of headless"),
          arg("--desktop", nargs="?", const="on", metavar="off|default", help="log on by itself at every boot, without a window; "
                                                      "kept for this instance (`default`: back to the image's)"),
+         arg("--rm", action="store_true", help="temporary: `stop` or `kill` deletes it"),
+         arg("--no-rm", action="store_true", help="one that stays, even if its image says `run: rm`"),
          aliases=("start",))
 def cmd_up(a):
     """create (building images as needed) and start instances; ready when SSH answers, in desktop mode once logged on"""
@@ -240,8 +416,12 @@ def cmd_up(a):
         a.names, desk = [desk, *a.names], "on"
     if desk:
         run["desktop"] = {"on": True, "off": False, "default": None}[desk]
+    if a.rm and a.no_rm:
+        die("--rm or --no-rm, not both")
+    if a.rm and a.all:
+        die("--rm makes new instances, and --all starts existing ones")
     image = cfg.ref(a.image) if a.image else None
-    names = [d.parent.name for d in store.disks()] if a.all else \
+    names = [d.parent.name for d in store.disks() if not Instance(cfg, d.parent.name).meta.get("temporary")] if a.all else \
         [cfg.ref(n) if is_path(n) else valid(n) for n in a.names or [a.instance]]
     if not all(Instance(cfg, n).alive for n in names):
         host.require(cfg, a.gui)                               # before building or creating
@@ -255,8 +435,24 @@ def cmd_up(a):
             if not any(desktop.status(vm)):
                 allow_reboot(a, vm)
             reboot = True
+        stale = clear_stale(cfg, vm, "replacing the stopped temporary instance") or {}
+        refuse_busy(vm)
+        new = not vm.disk.exists()
+        if not new and a.rm and not vm.meta.get("temporary"):
+            refuse_real(vm)
+        if not new and a.no_rm and vm.meta.get("temporary"):
+            die(f"{n} is temporary, so --no-rm can't keep it. `winvm stop {n}` deletes it, and then "
+                f"`winvm up {n} --no-rm` makes one that stays")
+        # (the lock lasts until this command ends, so that a VM still starting isn't taken for a finished one)
+        if temporary_lock(cfg, n) is None and new:
+            die(f"another command is creating {n} or using it as a temporary VM")
+        on = image or stale.get("image")
+        temp = new and (a.rm or (stale.get("temporary") == "stop" and not a.no_rm) or
+                        (not a.no_rm and cfg.run_settings(on or (n if has_image(cfg, n) else "base")).get("rm")))
         before = vm.meta
-        ensure_disk(cfg, vm, image, run)
+        ensure_disk(cfg, vm, on, {**stale.get("run", {}), **run} if stale else run, "stop" if temp else None)
+        if temp:
+            log(f"{n} is temporary: `winvm stop {n}` deletes it")
         try:
             vm.start(gui=a.gui, reboot=reboot)
         except (Fatal, TimedOut):
@@ -274,6 +470,8 @@ def cmd_stop(a):
     """graceful shutdown (ACPI), all at once; hard power-off after --kill-after"""
     vms = [vm for vm in running(a.cfg) if not vm.builder] if a.all else instances_named(a, a.names)
     forced, trouble = press_and_wait(vms, kill_after(a))
+    for vm in vms:
+        clear_stale(a.cfg, vm, "removed the temporary instance")
     return 1 if trouble else EXIT_FORCED if forced else 0
 
 
@@ -284,6 +482,9 @@ def cmd_restart(a):
     vms = instances_named(a, a.names)
     for vm in vms:
         vm.disk.exists() or die(f"no instance '{vm.name}' (winvm ps)")
+    for vm in vms:
+        if vm.meta.get("temporary"):                           # (off for a moment, but not finished)
+            temporary_lock(a.cfg, vm.name)
     accel = {vm.name: vm.state.get("accel") for vm in vms if vm.alive}   # (emulated stays emulated)
     asked = a.cfg.accel_arg
     press_and_wait(vms, kill_after(a))
@@ -299,6 +500,7 @@ def cmd_kill(a):
     """hard power-off (unsaved work in the guest is lost)"""
     for vm in instances_named(a, a.names):
         log(f"killed {vm.name}" if vm.kill() else f"{vm.name} not running")
+        clear_stale(a.cfg, vm, "removed the temporary instance")
 
 
 @command(arg("-q", "--quiet", action="store_true", help="names only"),
@@ -317,6 +519,7 @@ def cmd_ps(a):
                      "disk": vm.disk.stat().st_blocks * 512 if vm.disk.exists() else 0,
                      "ram": ram_text(vm, st), "image": label(on) if on else None,
                      "outdated": bool(on and outdated(cfg, store, vm, on)),
+                     "temporary": bool(vm.meta.get("temporary")) if not vm.builder else False,
                      "mounts": {m: mount_point(m, v) for m, v in vm.mounts.items()} if st else {}})
     if a.json:
         return print(json.dumps(rows, indent=1))
@@ -327,7 +530,7 @@ def cmd_ps(a):
     print(f"{'INSTANCE':<14} {'STATE':<8} {'SSH':>5} {'RDP':>5} {'VNC':>5} {'DISK':>6} {'RAM':>9}  IMAGE")
     for r in rows:
         ssh, rdp, vnc = (str(r[k] or "-") for k in ("ssh", "rdp", "vnc"))
-        image = (r["image"] or "-") + ("  (outdated)" if r["outdated"] else "")
+        image = (r["image"] or "-") + ("  (outdated)" if r["outdated"] else "") + ("  (temporary)" if r["temporary"] else "")
         mounts = ", ".join(r["mounts"])
         print(f"{r['name']:<14} {r['state']:<8} {ssh:>5} {rdp:>5} {vnc:>5} {human_size(r['disk']):>6} "
               f"{r['ram']:>9}  {image}" + (f"   mounts: {mounts}" if mounts else ""))
@@ -347,6 +550,8 @@ def cmd_info(a):
           + (f"  from {tilde(cfg.sources[vm.image])}" if vm.image in cfg.sources else ""))
     print(f"disk      {du(vm.disk)} of changes  ({vm.disk})")
     own = vm.meta.get("run") or {}
+    if kind := vm.meta.get("temporary"):
+        print("temporary " + (f"winvm stop {vm.name} deletes it" if kind == "stop" else "deleted when its --rm command ends"))
     print(f"ram       {ram_text(vm, st)}" + ("  (own setting; `winvm up --ram default` drops it)" if "ram" in own else ""))
     print(f"cpus      {eff.get('cpus')}" + ("  (own setting; `winvm up --cpus default` drops it)" if "cpus" in own else ""))
     if eff.get("desktop") or "desktop" in own:
@@ -390,6 +595,8 @@ def outdated(cfg: Config, store: Store, vm: Instance, on: Path | None) -> bool:
 @command(arg("-t", action="store_true", help="a terminal, for interactive programs"),
          arg("--desktop", action="store_true", help="run CMD in the logged-on desktop session"),
          arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long, starting the VM included (90s, 30m, 2h): exit 124"),
+         arg("--rm", action="store_true", help="a fresh temporary VM on the image named by -i, deleted afterwards"),
+         arg("-i", "--instance", metavar="NAME", default=argparse.SUPPRESS, names="targets", help="instance, or an image to run on"),
          arg("cmd", nargs="*", metavar="CMD", help="PowerShell command line (as typed at the prompt)"),
          raw=True, aliases=("shell",))
 def cmd_sh(a):
@@ -404,6 +611,7 @@ def cmd_sh(a):
     winvm sh ipconfig | grep IPv4     output has Unix line endings
     winvm sh --desktop CMD            in the logged-on desktop session (COM, winget, DPAPI)
     winvm sh --timeout 5m CMD         give up on it after 5 minutes: exit 124
+    winvm sh --rm -i office CMD       in a fresh VM on image office, deleted afterwards
 
     The exit code is the command's. Run from inside a mounted host folder, the guest
     command runs in the matching C:\\mnt\\... folder.
@@ -413,19 +621,21 @@ def cmd_sh(a):
     stdin is not passed on. --timeout ends the command and what it started, but not what
     Windows started for it (Store apps, COM servers).
     """
-    rest, tty, on_desktop, limit = list(a.rest), False, False, a.limit
+    rest, tty, on_desktop, limit, named = list(a.rest), False, False, a.limit, a.instance_given
     while rest:                                                # (only before the command)
         w = rest[0]
         if w == "-t":
             tty = True
         elif w == "--desktop":
             on_desktop = True
+        elif w == "--rm":
+            a.rm = True
         elif w in ("-y", "--yes"):
             a.yes = a.cfg.yes = True
         elif w in ("-i", "--instance", "--timeout", "--accel") and len(rest) == 1:
             die(f"{w} needs a value")
         elif w in ("-i", "--instance"):
-            a.instance = rest.pop(1)
+            a.instance, named = rest.pop(1), True
         elif w == "--accel":
             a.cfg.accel_arg = rest.pop(1)
         elif w == "--timeout" or w.startswith("--timeout="):
@@ -448,6 +658,8 @@ def cmd_sh(a):
         die(f"-t doesn't go with {'--desktop' if on_desktop else '--timeout'}")
     if on_desktop:
         check_no_stdin()
+    if words and not named:
+        check_not_a_name(a, words[0])
     if limit:
         start_timeout(limit)                                   # it covers starting the VM too
     vm = existing(a)
@@ -469,6 +681,8 @@ def cmd_sh(a):
     try:
         rc = guest.pipe(vm.ssh, script)
     except TimedOut as e:
+        if _temporary:                                         # the VM goes, and the command with it
+            raise
         how = "and ended the command" if guest.end(vm.ssh, pid_file) else \
             "but couldn't end the command, so it may still be running in the guest"
         raise TimedOut(f"{e} {how}", e.limit) from None
@@ -476,6 +690,18 @@ def cmd_sh(a):
         warn(f"exit 255: the connection to {vm.name} was lost (no answer from the guest for "
              f"{'3' if vm.emulated else '30-40'}{' min' if vm.emulated else ' s'}, or it rebooted), or the command itself exited with 255")
     return rc
+
+
+def check_not_a_name(a, word: str) -> None:
+    """`winvm sh office`: `office` is the command to run, but it looks meant as a VM. Say so,
+    and don't create main just to run it there."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", word) or word == a.instance:
+        return
+    if not (has_image(a.cfg, word) or (a.cfg.data / "instances" / word / "disk.qcow2").exists()):
+        return
+    if not inst(a).disk.exists():
+        die(f"{word} is an instance or image, and winvm sh takes a command: winvm -i {word} sh [CMD]")
+    warn(f"running `{word}` as a command on {a.instance}; for the instance or image: winvm -i {word} sh [CMD]")
 
 
 def stdin_waiting() -> bool:
@@ -516,9 +742,7 @@ def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, f
                 raise
             log(f"{vm.name} will now log on by itself at every boot (turn that off: winvm up {vm.name} --desktop off)")
 
-    def stopped(*_):                                           # `kill`, `timeout`: as Ctrl-C does
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, stopped)
+    signals_as_ctrl_c()
     rc, note = desktop.run(vm, code, cwd=cwd)                  # (--timeout: raises, saying what it did)
     if stdin_waiting():                                        # data that came only after the look above
         warn("data arrived on stdin and was ignored: winvm sh --desktop can't pass it on")
@@ -532,9 +756,11 @@ def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, f
     return rc
 
 
-@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("args", nargs="*", metavar="ARG", help="ssh options, then an optional remote command"), raw=True)
+@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("--rm", action="store_true", help="a fresh temporary VM on the image named by -i, deleted afterwards"), arg("args", nargs="*", metavar="ARG", help="ssh options, then an optional remote command"), raw=True)
 def cmd_ssh(a):
     """plain ssh to the instance, e.g. ssh -L 8080:localhost:80 -N  |  ssh hostname"""
+    if getattr(a, "rm", False) and a.rest[:1] == ["-i"]:       # it would be ssh's own -i, on main
+        die("for ssh, winvm's -i goes first: winvm -i NAME ssh --rm")
     vm = ready(a)
     opts, rest = [], list(a.rest)
     while rest and rest[0].startswith("-"):                    # options go before the host name
@@ -568,10 +794,21 @@ def cmd_wait(a):
     inst(a).wait_ssh()
 
 
-@command()
+@command(arg("--rm", action="store_true", help="a fresh temporary VM on the image named by -i, deleted when its window closes"))
 def cmd_gui(a):
     """open a VNC viewer on a running instance, or start it with a GTK window"""
     vm = inst(a)
+    if not a.rm:
+        clear_stale(a.cfg, vm)
+        refuse_busy(vm)
+    if a.rm or (not vm.builder and not vm.disk.exists() and image_says_rm(a.cfg, vm)
+                and (vm.name == "main" or has_image(a.cfg, vm.name))):
+        host.require(a.cfg, gui=True)
+        vm = temporary(a)
+        vm.start(gui=True)
+        while vm.alive:                                        # until its window is closed
+            time.sleep(1)
+        return
     if not vm.alive:
         host.require(a.cfg, gui=True)
         return existing(a).start(gui=True)
@@ -582,7 +819,7 @@ def cmd_gui(a):
     die(f"no VNC viewer found - connect one to 127.0.0.1:{vnc}, or {host.install_hint('vnc')}")
 
 
-@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("args", nargs="*", metavar="FREERDP_ARG"), raw=True)
+@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("--rm", action="store_true", help="a fresh temporary VM on the image named by -i, deleted afterwards"), arg("-i", "--instance", metavar="NAME", default=argparse.SUPPRESS, names="targets", help="instance, or an image to run on"), arg("args", nargs="*", metavar="FREERDP_ARG"), raw=True)
 def cmd_rdp(a):
     """RDP session with FreeRDP: dynamic resolution, clipboard"""
     vm = ready(a)                                          # booted = SSH answers
@@ -849,6 +1086,12 @@ def cmd_prune(a):
                 removed = True
     live = {vm.name for vm in running(cfg)}
     extra = [d for d in cfg.build.glob("*") if d.is_dir() and d.name not in live]
+    finished = {}                                              # temporary instances left behind
+    for d in store.disks():
+        vm = Instance(cfg, d.parent.name)
+        if stale_lock(cfg, vm) is not None:                    # (held until they're deleted)
+            extra.append(vm.home)
+            finished[vm.home] = vm
     if a.cache:
         extra += [cfg.cache / d for d in ("downloads", "slim", "firmware") if (cfg.cache / d).exists()]
     else:                                                      # slim images no image would use now
@@ -874,7 +1117,10 @@ def cmd_prune(a):
     for f in gone:
         store.remove(f)
     for p in [*extra, *isos]:
-        shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+        if p in finished:
+            delete_temporary(finished[p])
+        else:
+            shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
     log(f"pruned: {total} freed")
 
 
@@ -1242,7 +1488,7 @@ def fish_opt(cond: str, act, q) -> str:
     shorts = [o[1:] for o in act.option_strings if not o.startswith("--")]
     flags = " ".join([*(f"-l {x}" for x in longs), *(f"-s {x}" for x in shorts)])
     names = f" -a '(winvm __names {act.names})'" if getattr(act, "names", None) else ""
-    takes = "" if act.nargs in (0, "?") else " -x" if getattr(act, "names", None) == "instances" else " -r"  # -x: no files
+    takes = "" if act.nargs in (0, "?") else " -x" if getattr(act, "names", None) in ("instances", "targets") else " -r"  # -x: no files
     return f"complete -c winvm -n {cond} {flags}{takes}{names} -d '{q(act.help)}'"
 
 
@@ -1255,6 +1501,8 @@ def complete_names(kind: str, instance: str | None = None) -> int:
             names = list(Instance(cfg, valid(instance or "main")).mounts)
         elif kind == "instances":
             names = [d.parent.name for d in store.disks()]
+        elif kind == "targets":                                # -i: an image's name makes an instance
+            names = sorted({d.parent.name for d in store.disks()} | set(cfg.images) | {f.stem.split("@")[0] for f in store.all()})
         else:
             names = sorted(set(cfg.images) | {f.stem.split("@")[0] for f in store.all()})
         print("\n".join(names))
@@ -1276,7 +1524,7 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
         epilog="quick start:  winvm up   then   winvm sh      (winvm check: what the host has)")
     p.add_argument("-f", "--file", metavar="YAML",
                    help="machine settings (default: $WINVM_CONFIG, ~/.config/winvm/winvm.yaml)")
-    p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: main)").names = "instances"
+    p.add_argument("-i", "--instance", metavar="NAME", help="instance to act on (default: main)").names = "targets"
     p.add_argument("--data-dir", metavar="DIR",
                    help="images and instances (default: $WINVM_DATA_DIR, settings.data_dir)")
     p.add_argument("--cache-dir", metavar="DIR",
@@ -1288,7 +1536,7 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
     # -i and -y also work after the command (`winvm ps -i x` / `winvm rm -y`)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-i", "--instance", metavar="NAME", default=argparse.SUPPRESS,
-                        help="instance to act on (default: main)").names = "instances"
+                        help="instance to act on (default: main)").names = "targets"
     common.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS, help="don't ask")
     common.add_argument("--accel", choices=("kvm", "tcg"), default=argparse.SUPPRESS, help="tcg: emulate, without KVM; far slower")
     timed = argparse.ArgumentParser(add_help=False)
@@ -1328,7 +1576,9 @@ def main(argv: list[str] | None = None) -> int:
         takes_i = argv[i] in ("sh", "shell", "rdp", "ga")
         while a.rest:
             w = a.rest[0]
-            if takes_i and w in ("-y", "--yes"):
+            if w == "--rm":
+                a.rm, a.rest = True, a.rest[1:]
+            elif takes_i and w in ("-y", "--yes"):
                 a.yes, a.rest = True, a.rest[1:]
             elif takes_i and w in ("-i", "--instance") and len(a.rest) > 1:
                 a.instance, a.rest = a.rest[1], a.rest[2:]
@@ -1359,6 +1609,8 @@ def main(argv: list[str] | None = None) -> int:
         a.instance_given = bool(a.instance)
         a.instance = a.instance or "main"
         a.limit = None
+        if getattr(a, "rm", False) and a.fn not in (cmd_sh, cmd_ssh, cmd_rdp, cmd_gui, cmd_up):
+            die("--rm works on up, sh, ssh, rdp and gui")
         if a.timeout is not None:
             try:
                 a.limit = seconds(a.timeout)
@@ -1375,3 +1627,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+    except BrokenPipeError:                                    # stderr went away: `2>&1 | head -1`
+        drop_stdout()
+        os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+        return 141
+    finally:
+        end_temporary()

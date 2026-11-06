@@ -29,7 +29,7 @@ GUEST = DATA / "guest"
 BASE_KEYS = ("edition", "index", "hostname", "user", "password", "timezone", "locale", "keyboard",
              "disk_size", "debloat")
 FROM_KEYS = {"from", "steps", "run", "desktop", "password"}
-RUN_KEYS = {"ram", "cpus", "mounts", "desktop", "password"}
+RUN_KEYS = {"ram", "cpus", "mounts", "desktop", "password", "rm"}
 
 
 def merge(a, b):
@@ -438,8 +438,8 @@ class Config:
             for k, v in settings.items():
                 if k == "ram" and isinstance(v, dict):         # dynamic memory: {min, max}
                     check_keys(v, {"min", "max"}, f"{where}: run.ram")
-                if k == "desktop" and not isinstance(v, bool):
-                    die(f"{where}: run.desktop is true or false")
+                if k in ("desktop", "rm") and not isinstance(v, bool):
+                    die(f"{where}: run.{k} is true or false")
                 if k != "mounts":
                     out[k] = v
                     continue

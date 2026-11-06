@@ -79,6 +79,12 @@ def start_timeout(seconds: int) -> None:
     _arm()
 
 
+def cancel_timeout() -> None:
+    """No limit may run out any more: the very last cleaning up."""
+    _limits.clear()
+    _arm()
+
+
 @contextlib.contextmanager
 def time_limit(seconds: int | None):
     """An inner limit, such as a build step's `timeout:`; yields it, to tell from the command's."""

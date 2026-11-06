@@ -39,18 +39,18 @@ winvm build dev --timeout 2h
 
 It goes before the command's name or after it. `sh`, `ssh`, `cp`, `rdp` and `ga` pass on what
 follows, so there it has to come right after the name: `winvm sh hostname --timeout 5m` would hand
-it to `hostname`. `--accel` follows the same rule. See [Time limits](#time-limits) for what happens
-without it.
+it to `hostname`. `--accel` follows the same rule, and `--rm` always comes right after the name. See
+[Time limits](#time-limits) for what happens without it.
 
 **Run instances**
 
 | Command | What it does |
 |---|---|
-| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX\|default] [--cpus N\|default] [--desktop [off\|default]] [--iso ISO] [--all] [--gui]` (`start`) | Create (building images as needed) and start. Ready when SSH answers, and in desktop mode once logged on. |
-| `stop [NAME...] [--all] [--kill-after TIME]` (`down`) | ACPI shutdown, all at once; hard power-off after 2 minutes (10 when emulating), then exit 3 |
+| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX\|default] [--cpus N\|default] [--desktop [off\|default]] [--rm\|--no-rm] [--iso ISO] [--all] [--gui]` (`start`) | Create (building images as needed) and start. Ready when SSH answers, and in desktop mode once logged on. |
+| `stop [NAME...] [--all] [--kill-after TIME]` (`down`) | ACPI shutdown, all at once; hard power-off after 2 minutes (10 when emulating), then exit 3. Deletes a temporary instance. |
 | `restart [NAME...] [--kill-after TIME]` | Stop, then start |
-| `kill [NAME...]` | Power off at once; unsaved work in the guest is lost |
-| `ps [-q] [--json]` (`status`) | List instances: state, ports, disk, RAM, image version, mounts |
+| `kill [NAME...]` | Power off at once; unsaved work in the guest is lost. Deletes a temporary instance. |
+| `ps [-q] [--json]` (`status`) | List instances: state, ports, disk, RAM, image version, mounts, whether temporary |
 | `info` | One instance in detail |
 | `wait [TIME]` | Wait until SSH answers: exit 124 after TIME (default 10 minutes) |
 
@@ -58,13 +58,13 @@ without it.
 
 | Command | What it does |
 |---|---|
-| `sh [-t] [--desktop] [--timeout TIME] [CMD]` (`shell`) | PowerShell, or run a command ([below](#running-commands-in-the-guest)) |
-| `ssh` | Plain ssh: `winvm ssh -L 8080:localhost:80`, `winvm ssh hostname` |
+| `sh [-t] [--desktop] [--rm] [--timeout TIME] [CMD]` (`shell`) | PowerShell, or run a command ([below](#running-commands-in-the-guest)) |
+| `ssh [--rm]` | Plain ssh: `winvm ssh -L 8080:localhost:80`, `winvm ssh hostname` |
 | `cp` | Plain scp: `winvm cp a.txt :C:/Users/user/` |
 | `mount [PATH [NAME\|WINPATH]] [--ro] [--save]` | Show a host folder in the guest, or list mounts ([below](#mounts)) |
 | `umount NAME\|WINPATH [--save]` | Remove a mount |
-| `rdp` | FreeRDP session |
-| `gui` | VNC viewer on a running instance, or start it with a GTK window |
+| `rdp [--rm]` | FreeRDP session |
+| `gui [--rm]` | VNC viewer on a running instance, or start it with a GTK window |
 | `ga` | Guest agent, works without network: `winvm ga exec PROG [ARGS]` |
 | `balloon [SIZE]` | Show or set the guest's RAM while it runs |
 | `screenshot [FILE]` | Save a PNG of the screen |
@@ -81,7 +81,7 @@ without it.
 | `reset [IMAGE]` | Discard the (stopped) instance's changes: fresh disk on the current version of its image, or on IMAGE |
 | `rm [NAME...]` | Delete stopped instances: their disks and settings. Images stay. |
 | `rmi IMAGE` | Delete an image; refused while anything uses it |
-| `prune [-n] [--cache] [--iso]` | Delete unused versions, stale slim images and leftovers. `--cache`: downloads and slim images. `--iso`: ISOs. `-n`: only show. |
+| `prune [-n] [--cache] [--iso]` | Delete unused versions, stale slim images, stopped temporary VMs and leftovers. `--cache`: downloads and slim images. `--iso`: ISOs. `-n`: only show. |
 | `df` | Disk space used by images, instances, ISOs, cache; free space |
 
 **Set up and inspect**
@@ -96,9 +96,10 @@ without it.
 | `config show [IMAGE]` | What is in effect |
 | `config path` | Files and folders in use |
 
-`winvm sh` (or `ssh`, `cp`, `rdp`) creates `main` when it doesn't exist yet, so
-`winvm sh` alone works from scratch. Other instance names have to be created with `up`
-first. winvm refuses to run as root.
+`winvm sh` (or `ssh`, `cp`, `rdp`, `gui`) creates `main` when it doesn't exist yet, and starts an
+instance that's stopped, so `winvm sh` alone works from scratch. `winvm -i office sh` does the same
+when there's an image called `office`. Any other name has to be created with `up` first, so a
+mistyped one can't start a build. winvm refuses to run as root.
 
 ## Running commands in the guest
 
@@ -113,8 +114,8 @@ cat x | winvm sh 'stdin | sort'   # ...and PowerShell code reads it with `stdin`
 winvm sh ipconfig | grep IPv4     # output has Unix line endings
 winvm sh cmd /c exit 3; echo $?   # 3: the exit code is the command's (fish: $status)
 cd ~/Projects/x && winvm sh -i dev dir    # inside a mount: runs in C:\mnt\projects\x
-winvm sh --timeout 5m .\slow.exe  # give up after 5 minutes: ends it, exit 124
-winvm sh --desktop .\needs-a-desktop.exe  # see below
+winvm sh --timeout 5m '.\slow.exe'  # give up after 5 minutes: ends it, exit 124
+winvm sh --desktop '.\needs-a-desktop.exe'  # see below
 ```
 
 Only use `-t` for programs that need a terminal: tables from `select` get lost with it,
@@ -285,6 +286,55 @@ Its settings come from, in order:
 `winvm info` shows them, and `--ram default` drops an instance's own value. `reset` keeps
 them, and sets up desktop mode again on the fresh disk.
 
+**Temporary VMs.** `--rm` on `sh`, `ssh`, `rdp` or `gui` starts a fresh VM on an image and deletes it
+when the command ends, also after Ctrl-C or `--timeout`, or when you close the `rdp` or `gui` window:
+
+```sh
+winvm sh --rm -i office 'C:\tools\test.exe'   # a fresh VM on image office, gone afterwards
+winvm -i office ssh --rm hostname              # for ssh, -i goes first
+winvm rdp --rm -i office                       # gone when the window closes
+```
+
+Once the image is built, it takes about 14 seconds to start, or about 45 with `--desktop`. The
+instance has the image's name, so `--rm` refuses if a real instance of that name exists, and only one
+can run per name. While it runs, other commands with that `-i` use the same VM.
+
+**For several commands,** use `up --rm`. `stop` or `kill` then deletes the VM. `restart` doesn't. In a
+script, set a `trap`, or a failing step leaves it running:
+
+```sh
+winvm up work --image office --rm
+trap 'winvm stop work' EXIT
+winvm -i work cp test.exe :C:/Users/user/
+winvm sh -i work 'C:\Users\user\test.exe'
+```
+
+**If nothing was there to delete it,** because Windows shut down by itself, its window was closed or
+winvm was killed, the VM stays behind, and `winvm ps` marks it as temporary. `stop` and `kill` delete
+it. Once it's off:
+
+- `up` replaces it with a fresh VM on the same image, temporary again if it came from `up --rm`;
+- `sh`, `ssh`, `cp`, `rdp` and `gui` delete it, then carry on as if it had never been there;
+- `prune` deletes it;
+- `reset` keeps it temporary, and `save` freezes what's in it as an image, which stays.
+
+One from a killed `--rm` command that's still running is replaced by the next `--rm` of that name. If
+`stop --timeout` runs out, the VM keeps shutting down, and is deleted in the same way.
+
+**To make this the default,** set it under `run:` in an image file, which images on it inherit, or in
+`~/.config/winvm/winvm.yaml` for every image:
+
+```yaml
+run:
+  rm: true
+```
+
+Then new instances are temporary without asking: `sh`, `ssh`, `rdp` and `gui` delete theirs at the end,
+and `stop` deletes one from `up`. `winvm up NAME --no-rm` makes one that stays, and an instance that
+already exists is left alone. `cp` refuses when nothing is running, because the VM would be gone right
+after the copy, so start one with `up` first. A saved image has no file, so for one of those, write a
+small file with `from: NAME` and this setting.
+
 **The host RAM guard.** Before starting a VM, winvm checks `MemAvailable` minus what
 running VMs may still grow into. It refuses when the VM plus `settings.mem_reserve` doesn't
 fit: stop another instance, or give this one less (`winvm up --ram 3G`, or `--ram 2G-6G`
@@ -385,6 +435,7 @@ scripts have a few short retries of their own, which only show if the install fa
 - `up`, `restart`, `wait`: a VM that was starting keeps starting. `winvm up` finishes setting it up.
 - `stop`: the VM keeps shutting down. Add `--kill-after` if it has to be off by then.
 - `sh`: the command is ended, or winvm says it couldn't be.
+- `--rm`: the VM is deleted, along with whatever was running in it.
 - `ssh`, `ga exec`: a command in the guest may go on.
 - `cp`: a partial file may be left.
 - `mount`: the mount is undone.

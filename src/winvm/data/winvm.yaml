@@ -55,6 +55,8 @@ run:                                 # how instances run, unless their image's `
   cpus: 4
   desktop: false                     # log on by itself at every boot (`winvm up --desktop`);
                                      # no window on your screen. `password:` if it was changed
+  rm: false                          # new instances are temporary, as with --rm: deleted when the
+                                     # command ends, or after `up`, by `stop` (`up --no-rm` keeps one)
   mounts:                            # host folders, in the guest at C:\mnt\<name>
     share: ${data_dir}/share         # (an image or this file can drop it: `share: null`)
                                      # long form: NAME: {path: ~/x, readonly: true, at: 'C:\x'}

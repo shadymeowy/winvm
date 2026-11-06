@@ -141,6 +141,10 @@ winvm stop work
 winvm rm work                 # delete it; images stay
 ```
 
+To try something and throw it away, `winvm sh --rm -i golden CMD` runs it in a fresh VM on
+that image and deletes the VM afterwards. `rdp` takes `--rm` too, and after
+`winvm up work --image golden --rm`, `winvm stop work` deletes the VM.
+
 ## Build your own image
 
 To put your tools into a VM you can rebuild at any time, write a small YAML file. Its

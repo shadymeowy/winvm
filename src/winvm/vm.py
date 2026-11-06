@@ -51,6 +51,7 @@ class Instance:
         self.dir = cfg.runtime / name
         self.pidfile = self.dir / "qemu.pid"
         self.qemu_name = f"winvm-{name},process=winvm-{name}"  # QEMU's -name: identifies its process
+        self.ends_with_command = False                         # --rm: it goes when this command does
 
     # --- state: pid from QEMU's pidfile; ports/RAM chosen at start in vm.json
     @property
@@ -117,15 +118,18 @@ class Instance:
         return store.meta(store.parent(self.disk)) if self.disk.exists() else {}
 
     # --- disk
-    def create(self, image: str, on: Path, run: dict | None = None) -> None:
+    def create(self, image: str, on: Path, run: dict | None = None, temporary: str | None = None) -> None:
         """Fresh, empty disk on layer `on` (a version of `image`) + fresh UEFI variables;
-        `run`: the instance's own settings (kept from before if None)."""
+        `run`: the instance's own settings (kept from before if None); a temporary instance
+        stays one (`reset`, `save`)."""
+        temporary = temporary or self.meta.get("temporary")
         Store(self.cfg).overlay(self.disk, on)
         shutil.copyfile(host.firmware(self.cfg)[1], self.vars)
         if not self.builder:
             src = self.cfg.sources.get(image)
             self.meta = {"image": image, "source": str(src) if src else None,
-                         "run": self.meta.get("run", {}) if run is None else run}
+                         "run": self.meta.get("run", {}) if run is None else run,
+                         **({"temporary": temporary} if temporary else {})}
         log(f"fresh disk for {self.name} on {label(on)}")
 
     def require_stopped(self) -> None:
@@ -371,7 +375,8 @@ class Instance:
                         f"`winvm wait --timeout 1h` or any command's --timeout waits longer)")
                 time.sleep(2)
         except TimedOut as e:
-            raise TimedOut(f"{e}: {self.name} wasn't answering SSH yet (it keeps starting; `winvm up` finishes setting it up)", e.limit) from None
+            raise TimedOut(f"{e}: {self.name} wasn't answering SSH yet"
+                           + ("" if self.ends_with_command else " (it keeps starting; `winvm up` finishes setting it up)"), e.limit) from None
 
     def boot_id(self) -> str:
         """When the guest booted, as digits; "" if it can't be told right now."""
