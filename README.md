@@ -185,7 +185,7 @@ reinstall Windows, and `prune --iso` tells you whether winvm can download it aga
 
 - **`no access to /dev/kvm`:** run `sudo usermod -aG kvm $USER`, then log out and back in.
 - **Something might hang:** add `--timeout 5m` right after the command's name. It gives up then and
-  exits 124 (`stop` powers off then instead).
+  exits 124. [All the time limits](https://github.com/shadymeowy/winvm/blob/main/docs/usage.md#time-limits)
 - **A build seems stuck:** Windows Setup is quiet, so winvm prints a line every minute
   and warns if nothing has been written for 15 minutes. To see the screen, run
   `winvm -i _install-base screenshot` or open the VNC address it printed.

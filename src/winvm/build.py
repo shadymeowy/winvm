@@ -162,7 +162,11 @@ def slim_image(cfg: Config, name: str, inst: Instance, t: dict) -> Path:
     disk = cfg.cache / "slim" / f"{cfg.slim_key(name)[:16]}.qcow2"
     disk.parent.mkdir(parents=True, exist_ok=True)
     with open(disk.with_suffix(".lock"), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)                       # data dirs share it: one maker at a time
+        try:                                                   # data dirs share it: one maker at a time
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("waiting for another build that is making this slim image")
+            fcntl.flock(lock, fcntl.LOCK_EX)
         return disk if disk.exists() else make_slim(cfg, name, inst, t, disk)
 
 
@@ -285,7 +289,7 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     qemu = sp.Popen(argv + (["-no-reboot"] if no_reboot else []))
     reason: list[str] = []
     # (emulated, the firmware takes far longer to reach "Press any key")
-    press = 120 if inst.cfg.accel == "tcg" else 12
+    press = 120 if inst.cfg.accel == "tcg" else 30
     watcher = threading.Thread(target=watch_qmp, args=(inst.dir / "qmp-build.sock", qemu, reason, press), daemon=True)
     watcher.start()
     buf = b""
@@ -320,7 +324,11 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     finally:
         if qemu.poll() is None:
             qemu.terminate()
-            qemu.wait()
+            try:
+                qemu.wait(10)
+            except sp.TimeoutExpired:
+                qemu.kill()
+                qemu.wait()
         inst.pidfile.unlink(missing_ok=True)
     watcher.join(timeout=10)                                   # it may not have read SHUTDOWN yet
     log(f"installer VM finished after {(time.time() - t0) / 60:.0f} min")
@@ -424,10 +432,12 @@ def build_overlay(cfg: Config, name: str, gui=False) -> None:
         store.add(name, h, inst.disk, below, user=meta.get("user"), password=password,
                   source=str(cfg.sources[name]))
     finally:
-        if inst.alive:
-            inst.kill()
-        shutil.rmtree(inst.home, ignore_errors=True)
-        shutil.rmtree(inst.dir, ignore_errors=True)
+        try:
+            if inst.alive:
+                inst.kill()
+        finally:
+            shutil.rmtree(inst.home, ignore_errors=True)
+            shutil.rmtree(inst.dir, ignore_errors=True)
 
 
 def step_result(inst: Instance, name: str, i: int, rc: int, limit: int | None, on_desktop: bool, note: str = "") -> None:

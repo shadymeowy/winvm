@@ -120,9 +120,9 @@ def main(name: str) -> int:
         log(f"auto memory for {name}: {rng[0]}-{rng[1]} MiB")
         helper.run()
     except (Fatal, OSError, ValueError, KeyError) as e:   # QEMU gone (socket closed) or no stats
+        log(f"stopped: {e}")
         if vm.alive and helper:
             quit_()
-        log(f"stopped: {e}")
     finally:
         (vm.dir / "balloon.pid").unlink(missing_ok=True)
     return 0

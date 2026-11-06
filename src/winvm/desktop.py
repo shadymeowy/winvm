@@ -23,7 +23,7 @@ import time
 
 from . import guest
 from .guest import BOM
-from .util import WAIT, Chan, Fatal, TimedOut, die, dos, log, warn
+from .util import WAIT, Chan, Fatal, TimedOut, die, dos, log, time_limit, wait_end, warn
 
 HOME = r"C:\ProgramData\winvm"
 MARKER = HOME + r"\desktop.json"
@@ -77,15 +77,15 @@ def on_probe(user: str) -> str:
 
 
 def wait_logon(vm, what: str) -> None:
-    user, end = user_of(vm), time.time() + WAIT
+    user, end = user_of(vm), wait_end()
     try:
-        while time.time() < end:
-            r = guest.capture(vm.ssh, on_probe(user))
+        while time.monotonic() < end:
+            r = guest.capture(vm.ssh, on_probe(user), timeout=120)   # (a busy guest: just ask again)
             if r.returncode == 0 and r.stdout.strip().splitlines()[-1:] not in ([], ["0"]):
                 return
             time.sleep(1)
     except TimedOut as e:
-        raise TimedOut(f"{e}: {user} hadn't logged on yet{picture(vm)}") from None
+        raise TimedOut(f"{e}: {user} hadn't logged on yet{picture(vm)}", e.limit) from None
     die(f"{what}: {user} did not log on within {WAIT} s. A changed password or a policy can stop "
         f"auto-logon. If someone signed out, it logs on at the next boot: winvm -i {vm.name} restart{picture(vm)}")
 
@@ -95,7 +95,7 @@ def picture(vm) -> str:
     out = vm.cfg.build / f"{vm.name}-failed.png"
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
-        Chan(vm.dir / "qmp.sock", qmp=True)("screendump", {"filename": str(out), "format": "png"})
+        Chan(vm.dir / "qmp.sock", qmp=True, timeout=5)("screendump", {"filename": str(out), "format": "png"})
     except (Fatal, OSError):
         return ""
     return f" (its screen: {out})"
@@ -240,47 +240,61 @@ exit $(if ($rc -and -not ($rc -band 255)) {{ 1 }} else {{ $rc -band 255 }})
 
 def run(vm, code: str, limit: int | None = None, cwd: str | None = None, strict: bool = False) -> tuple[int, str]:
     """Run PowerShell in the logged-on session, its output (stderr too) on our stdout as it
-    comes. Returns its exit code, or guest.TIMED_OUT (the command is ended) / VANISHED / LOST
-    / 141 (our stdout went away); and text for an error message: a picture of the screen, taken
-    before the command is ended. Each call has its own folder and task: they can overlap."""
+    comes. Returns its exit code, or guest.TIMED_OUT (`limit` ran out) / VANISHED / LOST / 141 (our
+    stdout went away); and text for an error message: a picture of the screen, taken before the
+    command is ended, and whether it was. The command's own --timeout raises TimedOut with that
+    text instead. Each call has its own folder and task: they can overlap."""
     tag = secrets.token_hex(4)
     d, task = f"{STEPS}\\{tag}", f"{TASKS}-{tag}"
     script = BOM + dos(guest.script(code, cwd=cwd, strict=strict))
     step = base64.b64encode(script).decode()
+    own = None
     try:
-        if len(step) > LONG:                                   # (a command line has a limit)
-            vm.call(f"New-Item -ItemType Directory -Force {guest.quote(d)} | Out-Null")
-            with tempfile.NamedTemporaryFile(dir=vm.dir, suffix=".ps1") as f:
-                f.write(script)
-                f.flush()
-                vm.scp(f.name, f"{d}\\step.ps1")
-            step = None
-        rc = guest.pipe(vm.ssh, launch(d, task, user_of(vm), step), stdin=sp.DEVNULL, timeout=limit)
+        with time_limit(limit) as own:
+            if len(step) > LONG:                               # (a command line has a limit)
+                vm.call(f"New-Item -ItemType Directory -Force {guest.quote(d)} | Out-Null")
+                with tempfile.NamedTemporaryFile(dir=vm.dir, suffix=".ps1") as f:
+                    f.write(script)
+                    f.flush()
+                    vm.scp(f.name, f"{d}\\step.ps1", timeout=WAIT)
+                step = None
+            rc = guest.pipe(vm.ssh, launch(d, task, user_of(vm), step), stdin=sp.DEVNULL)
+    except TimedOut as e:
+        note = picture(vm) + ended(finish(vm, d, task))        # (the picture first: it shows why)
+        if own and e.limit is own:
+            return guest.TIMED_OUT, note
+        raise TimedOut(f"{e}{note}", e.limit) from None
     except BaseException:                                      # Ctrl-C: nothing stays running
         finish(vm, d, task)
         raise
-    if rc not in (guest.TIMED_OUT, 141, GONE, 255):
+    if rc not in (141, GONE, 255):
         return rc, ""
-    note = picture(vm) if rc in (guest.TIMED_OUT, GONE) else ""
+    note = picture(vm) if rc == GONE else ""
     state = finish(vm, d, task)
-    if rc == guest.TIMED_OUT:
-        return rc, note
     if state == "done":                                        # 141, 254, 255: the command's own
         return rc, ""
     if state == "lost" or rc == 255:
-        return LOST, ""
+        return LOST, ""                                        # ("stuck" with GONE: nothing to end)
     return (141, "") if rc == 141 else (VANISHED, note)
+
+
+def ended(state: str) -> str:
+    """finish()'s result, for an error message."""
+    return "; the command had just finished" if state == "done" else "; ended the command" if state == "left" else \
+        "; couldn't end the command, so it may still be running"
 
 
 def finish(vm, d: str, task: str) -> str:
     """End a command that is still there and remove what is left of it, with its folder. What
-    was there: "done" (nothing, it had finished by itself), "left", or "lost" (no connection)."""
-    r = guest.capture(vm.ssh, f"""$d = {guest.quote(d)}
+    was there: "done" (nothing, it had finished by itself), "left", "stuck" (it wouldn't end), or
+    "lost" (no connection, or no answer in time: a limit may just have run out, so this must not
+    hang either)."""
+    r = guest.capture(guest.fresh(vm.ssh), f"""$d = {guest.quote(d)}
 if (-not (Test-Path -LiteralPath $d)) {{ 'STATE:done'; exit 0 }}
 $r = (Get-Content "$d\\pid" -ErrorAction SilentlyContinue) -as [int]
-if ($r) {{ taskkill.exe /F /T /PID $r 2>&1 | Out-Null }}
+if ($r) {{ {guest.KILL_TREE} }}
 $s = New-Object -ComObject Schedule.Service; $s.Connect()
 try {{ $s.GetFolder('\\').DeleteTask('{task}', 0) }} catch {{}}
 Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-'STATE:left'""")
-    return "lost" if r.returncode else "done" if "STATE:done" in r.stdout else "left"
+if ($r -and (Get-Process -Id $r -ErrorAction SilentlyContinue)) {{ 'STATE:stuck' }} else {{ 'STATE:left' }}""", timeout=guest.CLEANUP)
+    return "lost" if r.returncode else "done" if "STATE:done" in r.stdout else "stuck" if "STATE:stuck" in r.stdout else "left"

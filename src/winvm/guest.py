@@ -5,13 +5,15 @@ from __future__ import annotations
 import base64
 import os
 import re
-import select
 import signal
 import subprocess as sp
 import sys
-import time
 
-TIMED_OUT = -124    # pipe(): it took too long (no exit code can look like this)
+from .util import WAIT, TimedOut, time_limit, timing
+
+TIMED_OUT = -124    # pipe(): its own limit ran out (no exit code can look like this)
+NO_ANSWER = 124     # capture(): no answer in time; its output says so
+CLEANUP = 30        # s for cleaning up in the guest: it must not hang past a limit that just ran out
 EXIT_TIMED_OUT = 124   # what `winvm sh` exits with then, as `timeout` does
 BOM = b"\xef\xbb\xbf"  # Windows PowerShell reads .ps1 files without it as ANSI, not UTF-8
 
@@ -85,45 +87,61 @@ def script(line: str, cwd: str | None = None, strict=False, console=False, pid_f
     return head + cd + run + "exit $rc\n"
 
 
-def end(ssh, pid_file: str) -> None:
-    """End the command that keeps its pid in pid_file, with everything it started."""
-    capture(ssh, f"""$r = (Get-Content -LiteralPath {quote(pid_file)} -ErrorAction SilentlyContinue) -as [int]
-if ($r) {{ taskkill.exe /F /T /PID $r 2>&1 | Out-Null }}
-Remove-Item -LiteralPath {quote(pid_file)} -ErrorAction SilentlyContinue""")
+# (what taskkill exits with says little: it fails for a tree whose child went first. So look)
+KILL_TREE = ("taskkill.exe /F /T /PID $r 2>&1 | Out-Null; $n = 0; "
+             "while ((Get-Process -Id $r -ErrorAction SilentlyContinue) -and $n++ -lt 30) { Start-Sleep -Milliseconds 100 }")
+
+
+def fresh(ssh):
+    """`ssh` on a connection of its own: a command blocked on stdin holds up the shared one."""
+    return lambda *opts: ssh("-S", "none", *opts)
+
+
+def end(ssh, pid_file: str) -> bool:
+    """End the command that keeps its pid in pid_file, with everything it started. Did that work?"""
+    # (no file: it has finished, as dropping the connection can end it. Or it hadn't started yet: wait a moment)
+    r = capture(fresh(ssh), f"""$f = {quote(pid_file)}; $n = 0
+while (-not (Test-Path -LiteralPath $f) -and $n++ -lt 30) {{ Start-Sleep -Milliseconds 100 }}
+$r = (Get-Content -LiteralPath $f -ErrorAction SilentlyContinue) -as [int]
+if ($r) {{ {KILL_TREE} }}
+if (-not $r -or -not (Get-Process -Id $r -ErrorAction SilentlyContinue)) {{ 'ENDED' }}
+Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue""", timeout=CLEANUP)
+    return "ENDED" in r.stdout
 
 
 # `ssh` below is a function: ssh(*options) -> ssh argv up to and including the host name
 
 def pipe(ssh, script_: str, stdin=None, timeout: int | None = None) -> int:
-    """Run without a terminal: stdin passes through, stdout streams with CRLF -> LF.
-    After `timeout` s stops waiting (the command goes on in the guest): TIMED_OUT."""
+    """Run without a terminal: stdin passes through, stdout streams with CRLF -> LF. After
+    `timeout` s returns TIMED_OUT; the command's own --timeout raises TimedOut here too. Either
+    way the command goes on in the guest until someone ends it, as ssh is only the messenger."""
     proc = sp.Popen(ssh("-o", "BatchMode=yes") + [encoded(script_)], stdin=stdin, stdout=sp.PIPE)
-    out, carry = sys.stdout.buffer, b""
-    end = time.monotonic() + timeout if timeout else None
+    out, carry, limit = sys.stdout.buffer, b"", None
     try:
-        while True:
-            # (killing ssh wouldn't end the read: the shared connection holds on to its stdout)
-            if end and not select.select([proc.stdout], [], [], max(0, end - time.monotonic()))[0]:
-                proc.kill()
-                proc.wait()
-                return TIMED_OUT
-            chunk = proc.stdout.read1(1 << 16)
-            if not chunk:
-                break
-            chunk = carry + chunk
-            carry = b"\r" if chunk.endswith(b"\r") else b""   # a CRLF may straddle two chunks
-            out.write(chunk[: len(chunk) - len(carry)].replace(b"\r\n", b"\n"))
+        with time_limit(timeout) as limit:                         # (also through a full pipe to a slow reader)
+            while chunk := proc.stdout.read1(1 << 16):
+                chunk = carry + chunk
+                carry = b"\r" if chunk.endswith(b"\r") else b""   # a CRLF may straddle two chunks
+                out.write(chunk[: len(chunk) - len(carry)].replace(b"\r\n", b"\n"))
+                out.flush()
+            out.write(carry)
             out.flush()
-        out.write(carry)
-        out.flush()
+            return proc.wait(WAIT)                             # (stdout closed: it has ended)
+    except sp.TimeoutExpired:
+        proc.kill()
+        return 255
     except BrokenPipeError:                                    # e.g. | head
         proc.kill()
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 141
-    except BaseException:                                      # --timeout, Ctrl-C
+    except TimedOut as e:
+        proc.kill()
+        if limit and e.limit is limit:
+            return TIMED_OUT
+        raise
+    except BaseException:                                      # Ctrl-C
         proc.kill()
         raise
-    return proc.wait()
 
 
 def terminal(argv: list[str]) -> int:
@@ -154,12 +172,17 @@ def tty(ssh, script_: str) -> int:
     child = base64.b64encode(script_.encode("utf-16-le")).decode()   # -EncodedCommand wants UTF-16
     terminal(ssh("-t") + [encoded(f"powershell -NoLogo -NoProfile -EncodedCommand {child}\n"
                                   f"Set-Content {rc} $LASTEXITCODE\nexit $LASTEXITCODE\n")])
-    r = sp.run(ssh("-o", "BatchMode=yes") + [encoded(f"Get-Content {rc}; Remove-Item {rc}")],
-               stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.DEVNULL, text=True)
+    r = capture(ssh, f"Get-Content {rc}; Remove-Item {rc}", timeout=CLEANUP)
     return int(r.stdout.strip()) if r.stdout.strip().isdigit() else 1
 
 
-def capture(ssh, script_: str) -> sp.CompletedProcess:
-    """Run quietly, collecting output (for winvm's own housekeeping in the guest)."""
-    return sp.run(ssh("-o", "BatchMode=yes") + [encoded(PROLOGUE + script_)],
-                  stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+def capture(ssh, script_: str, timeout: int | None = None) -> sp.CompletedProcess:
+    """Run quietly, collecting output (for winvm's own housekeeping in the guest). A guest can hang
+    while SSH stays fine, so this always ends: after `timeout` s, or WAIT if no limit is running.
+    Then the result is NO_ANSWER, with output saying so. If a limit is running it decides."""
+    argv = ssh("-o", "BatchMode=yes") + [encoded(PROLOGUE + script_)]
+    limit = timeout or (None if timing() else WAIT)
+    try:
+        return sp.run(argv, stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.STDOUT, text=True, timeout=limit)
+    except sp.TimeoutExpired:
+        return sp.CompletedProcess(argv, NO_ANSWER, f"no answer from the guest within {limit} s", "")

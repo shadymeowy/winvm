@@ -22,7 +22,7 @@ from . import desktop, guest, host
 from .balloon import ram_range
 from .config import Config
 from .store import Store, label
-from .util import WAIT, Chan, TimedOut, check_mount_points, die, log, meminfo, mib, mount_point, run, warn
+from .util import WAIT, Chan, TimedOut, check_mount_points, die, log, meminfo, mib, mount_point, run, wait_end, warn, write_atomic
 
 HYPERV = ("hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,"
           "hv-stimer,hv-frequencies,hv-tlbflush,hv-ipi,hv-reset")
@@ -77,7 +77,7 @@ class Instance:
     @state.setter
     def state(self, value: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / "vm.json").write_text(json.dumps(value, indent=1) + "\n")
+        write_atomic(self.dir / "vm.json", json.dumps(value, indent=1) + "\n")
 
     @property
     def rss(self) -> int:
@@ -98,7 +98,7 @@ class Instance:
     @meta.setter
     def meta(self, value: dict) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
-        (self.home / "instance.json").write_text(json.dumps(value, indent=1) + "\n")
+        write_atomic(self.home / "instance.json", json.dumps(value, indent=1) + "\n")
 
     @property
     def image(self) -> str:
@@ -207,15 +207,19 @@ class Instance:
         argv = [*argv, "-pidfile", str(self.pidfile)]
         if gui:
             with open(self.dir / "qemu.log", "w") as logf:
-                sp.Popen(argv, stdout=logf, stderr=sp.STDOUT, start_new_session=True)
+                proc = sp.Popen(argv, stdout=logf, stderr=sp.STDOUT, start_new_session=True)
+            end = wait_end()
+            while not self.alive:
+                if proc.poll() is not None:
+                    die(f"QEMU failed to start (see {self.dir}/qemu.log)")
+                if time.monotonic() > end:
+                    proc.kill()
+                    die(f"QEMU did not start within {WAIT} s (see {self.dir}/qemu.log)")
+                time.sleep(0.1)
         else:
             run(*argv, "-daemonize")                            # its errors go to the terminal
-        for _ in range(50):
-            if self.alive:
-                break
-            time.sleep(0.1)
-        else:
-            die("QEMU failed to start" + (f" (see {self.dir}/qemu.log)" if gui else ""))
+            if not self.alive:                                  # (it has written its pidfile by now)
+                die("QEMU exited right after starting")
 
     def start(self, gui=False, wait=True, reboot=False) -> None:
         """Boot the instance (its disk must exist); wait for SSH and set up the mounts.
@@ -251,7 +255,11 @@ class Instance:
     def power_off_after(self) -> int:
         """s `winvm stop` gives a VM before a hard power-off: an emulated one is slow to shut down,
         however it was asked for at its start (the stop needn't say again)."""
-        return WAIT if self.state.get("accel") == "tcg" else 120
+        return WAIT if self.emulated else 120
+
+    @property
+    def emulated(self) -> bool:
+        return self.state.get("accel") == "tcg"
 
     def power_button(self) -> bool:
         """Press the ACPI power button; False if it was not running."""
@@ -265,13 +273,18 @@ class Instance:
     def wait_stopped(self, timeout=120, since: float | None = None) -> bool:
         """After power_button: wait until it is off, kill it after `timeout` s (counted
         from `since`). False if it had to be killed."""
-        end = (since or time.time()) + timeout
-        while time.time() < end:
-            if not self.alive:
-                log(f"stopped {self.name}")
-                return True
-            time.sleep(0.5)
-        warn(f"{self.name} did not power off in {timeout} s - killing it")
+        end = (since or time.monotonic()) + timeout
+        try:
+            while True:
+                if not self.alive:                             # (also a last look, after a host suspend)
+                    log(f"stopped {self.name}")
+                    return True
+                if time.monotonic() >= end:
+                    break
+                time.sleep(0.5)
+        except TimedOut as e:
+            raise TimedOut(f"{e}: {self.name} is still shutting down (winvm -i {self.name} kill powers it off)", e.limit) from None
+        warn(f"{self.name} did not power off in {timeout} s - powering it off hard")
         self.kill()
         return False
 
@@ -286,10 +299,14 @@ class Instance:
                 if not self.alive:
                     break
                 time.sleep(0.1)
-            else:
-                os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:                             # gone in the meantime
             pass
+        finally:                                               # (a limit may run out in that loop)
+            if self.alive:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         self.pidfile.unlink(missing_ok=True)
         return True
 
@@ -307,7 +324,7 @@ class Instance:
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
   LogLevel ERROR
-  ConnectTimeout 5
+  ConnectTimeout {30 if st.get("accel") == "tcg" else 5}
   ServerAliveInterval {60 if st.get("accel") == "tcg" else 10}
   ControlMaster auto
   ControlPath "{self.dir}/mux"
@@ -323,37 +340,57 @@ class Instance:
     def close_ssh(self) -> None:
         """End the shared SSH connection (it would outlive a stopped guest for a while)."""
         if (self.dir / "mux").exists():
-            sp.run(self.ssh("-O", "exit"), stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            try:
+                sp.run(self.ssh("-O", "exit"), stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=5)
+            except sp.TimeoutExpired:                          # (a stuck connection must not keep us)
+                pass
 
-    def wait_ssh(self, timeout=WAIT) -> None:
-        if (self.dir / "mux").exists() and not sp.run(   # shared connection up: nothing to wait for
-                self.ssh("-O", "check"), stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
-            return
-        end = time.time() + timeout
+    def answers(self, *opts: str) -> bool:
+        """Does SSH answer right now? A hung answer counts as no."""
         try:
-            while sp.run(self.ssh("-o", "BatchMode=yes", "-o", "ConnectTimeout=3") + ["exit 0"],
-                         stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
+            return not sp.run(self.ssh("-o", "BatchMode=yes", *opts) + ["exit 0"], stdin=sp.DEVNULL, stdout=sp.DEVNULL,
+                              stderr=sp.DEVNULL, timeout=60).returncode
+        except sp.TimeoutExpired:
+            return False
+
+    def wait_ssh(self) -> None:
+        """Until SSH answers: up to WAIT, or as long as --timeout allows."""
+        try:
+            if (self.dir / "mux").exists() and not sp.run(   # shared connection up: nothing to wait for
+                    self.ssh("-O", "check"), stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=10).returncode:
+                return
+        except sp.TimeoutExpired:
+            self.close_ssh()
+        end = wait_end()
+        try:
+            while not self.answers("-o", "ConnectTimeout=3"):
                 if not self.alive:
                     die(f"{self.name} is not running")
-                if time.time() > end:
-                    die(f"{self.name} did not answer SSH within {timeout} s (winvm -i {self.name} screenshot; "
-                        f"it can wait longer with `winvm wait SECONDS`)")
+                if time.monotonic() > end:
+                    die(f"{self.name} did not answer SSH within {WAIT} s (winvm -i {self.name} screenshot shows its screen; "
+                        f"`winvm wait --timeout 1h` or any command's --timeout waits longer)")
                 time.sleep(2)
         except TimedOut as e:
-            raise TimedOut(f"{e}: {self.name} wasn't answering SSH yet (it keeps starting)") from None
+            raise TimedOut(f"{e}: {self.name} wasn't answering SSH yet (it keeps starting; `winvm up` finishes setting it up)", e.limit) from None
+
+    def boot_id(self) -> str:
+        """When the guest booted, as digits; "" if it can't be told right now."""
+        r = guest.capture(self.ssh, "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.Ticks", timeout=60)
+        out = r.stdout.strip().splitlines()[-1:] if not r.returncode else []
+        return out[0] if out and out[0].isdigit() else ""
 
     def reboot(self) -> None:
-        """Reboot the guest (QEMU stays, with its window if it has one), until SSH answers."""
-        guest.capture(self.ssh, "shutdown.exe /r /f /t 0")
+        """Reboot the guest (QEMU stays, with its window if it has one), until it has really booted
+        again: a slow guest that doesn't answer for a moment hasn't rebooted yet."""
+        before = self.boot_id()
+        guest.capture(self.ssh, "shutdown.exe /r /f /t 0", timeout=60)
         self.close_ssh()
-        end = time.time() + WAIT
-        while not sp.run(self.ssh("-o", "ConnectTimeout=2") + ["exit 0"], stdin=sp.DEVNULL,   # until it is really gone
-                         stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
-            if time.time() > end:
+        end = wait_end()
+        while (now := self.boot_id()) == before or not now:
+            if time.monotonic() > end:
                 die(f"{self.name} did not reboot within {WAIT} s")
-            time.sleep(1)
-        self.close_ssh()
-        self.wait_ssh()
+            self.close_ssh()
+            time.sleep(2)
         if not self.builder:
             self.sync_mounts()
 
@@ -362,11 +399,17 @@ class Instance:
         r = guest.capture(self.ssh, "$ErrorActionPreference = 'Stop'\n" + ps)
         if r.returncode == 255:
             die(f"lost the connection to {self.name}: it may be rebooting (winvm -i {self.name} wait, then try again)")
+        if r.returncode == guest.NO_ANSWER:
+            die(f"{self.name}: {r.stdout}, for: {ps[:100]}")
         if r.returncode:
             die(f"guest command failed: {ps[:100]}\n{r.stdout.strip()[:500]}")
 
-    def scp(self, src, dst: str) -> None:
-        run("scp", "-F", self.dir / "ssh_config", "-q", "-r", src, f"{self.name}:{dst.replace(chr(92), '/')}")
+    def scp(self, src, dst: str, timeout: int | None = None) -> None:
+        """Copy into the guest. Without `timeout` it takes as long as the file needs."""
+        try:
+            run("scp", "-F", self.dir / "ssh_config", "-q", "-r", src, f"{self.name}:{dst.replace(chr(92), '/')}", timeout=timeout)
+        except sp.TimeoutExpired:
+            die(f"copying into {self.name} took more than {timeout} s")
 
     def up(self) -> Instance:
         """Make sure the instance runs and SSH answers (for sh/cp/ssh)."""
@@ -409,6 +452,8 @@ class Instance:
         mm = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
         r = guest.capture(self.ssh, f"""if (Get-CimInstance Win32_PageFileUsage) {{ 'ok' }} else {{
     reg add "{mm}" /v PagingFiles /t REG_MULTI_SZ /d "C:\\pagefile.sys 1024 4096" /f | Out-Null; 'set' }}""")
+        if r.returncode:
+            return warn(f"could not check the pagefile in {self.name}, so no dynamic memory for now: {r.stdout.strip()[:200]}")
         if r.stdout.strip().endswith("set"):
             if not may_reboot:                                 # (its first start was cut short)
                 return warn(f"dynamic memory on {self.name} needs one reboot: winvm -i {self.name} restart")
@@ -475,6 +520,11 @@ class Instance:
             except OSError:
                 pass
 
+    @property
+    def share_wait(self) -> int:
+        """s a share may take to answer before it counts as not reaching its host folder."""
+        return 120 if self.emulated else 30
+
     def sync_mounts(self) -> list[str]:
         """Make the guest's folder links match the mounts. Returns the mount points left
         without a link: taken by something else (a folder, a file, another link) or failed."""
@@ -501,7 +551,7 @@ foreach ($p in $want.Keys) {{
     }} catch {{ "FAILED $p - $($_.Exception.Message)" }}
 }}
 Set-Content -LiteralPath $list -Value @($want.Keys)
-$end = (Get-Date).AddSeconds(30)                 # until the shares answer (a guest just booted is slow)
+$end = (Get-Date).AddSeconds({self.share_wait})                 # until the shares answer (a guest just booted is slow)
 while (@($want.Values | Where-Object {{ -not (Test-Path -LiteralPath $_) }}).Count -and (Get-Date) -lt $end) {{
     Start-Sleep -Milliseconds 500
 }}
@@ -517,12 +567,13 @@ if ($h.LinkType -and "$($h.Target)" -like '*10.0.2.4\\qemu*') {{ $h.Delete() }}
                 warn(f"{ln[6:]} already exists in {self.name} and is not a winvm mount - left alone, not mounted there")
             elif ln.startswith("SILENT "):
                 missing.append(ln[7:])
-                warn(f"{ln[7:]} in {self.name} doesn't reach its host folder (`winvm -i {self.name} logs smb`)")
+                warn(f"{ln[7:]} in {self.name} didn't reach its host folder within {self.share_wait} s (`winvm -i {self.name} logs smb`)")
             elif ln.startswith("FAILED "):
                 missing.append(ln[7:].split(" - ", 1)[0])
                 warn(f"could not link {ln[7:]}")
         if r.returncode:
             warn(f"could not set up the mounts in {self.name}: {r.stdout.strip()[:300]}")
+            missing += [mount_point(n, m) for n, m in self.mounts.items()]
         return missing
 
     def sync_keys(self) -> None:
@@ -556,13 +607,21 @@ if ((Test-Path $ak) -and [IO.File]::ReadAllText($ak) -ne $want) {{ [IO.File]::Wr
         r = guest.capture(self.ssh, f"""if (-not (Test-Path -LiteralPath {guest.quote(spot[:3])})) {{ exit 4 }}
 $i = Get-Item -LiteralPath {guest.quote(spot)} -Force -ErrorAction SilentlyContinue
 if ($i -and -not ($i.LinkType -and "$($i.Target)" -like '*{SMB_HOST}\\*')) {{ exit 3 }}""")
+        if r.returncode == guest.NO_ANSWER:
+            die(f"{self.name}: {r.stdout}")
         if r.returncode == 4:
             die(f"{self.name} has no drive {spot[:2]}")
         if r.returncode == 3:
             die(f"{spot} already exists in {self.name} and is not a winvm mount - pick another place")
         self.write_smb(new)
         self.restart_smb()
-        if spot in self.sync_mounts():                         # undo: no half-made mount
+        try:
+            failed = spot in self.sync_mounts()
+        except TimedOut:                                       # no half-made mount, whatever stopped it
+            self.write_smb(mounts)
+            self.restart_smb()
+            raise
+        if failed:
             self.write_smb(mounts)
             self.restart_smb()
             self.sync_mounts()
@@ -610,7 +669,7 @@ def need_mem(cfg: Config, want: int, what: str) -> None:
     """Refuse to start something the host can't hold. Running VMs count with the RAM
     they may still grow into, not just what they touched so far."""
     reserve = mib(cfg.s.get("mem_reserve") or 0)
-    best, calm = -1, 0
+    best, calm, end = -1, 0, wait_end()
     while True:      # a VM that just stopped takes a moment to give its memory back, so
         growth = sum(max(0, vm.state.get("ram", 0) - vm.rss) for vm in running(cfg))
         have = meminfo("MemAvailable") - growth
@@ -618,7 +677,7 @@ def need_mem(cfg: Config, want: int, what: str) -> None:
             return
         calm = 0 if have > best + 16 else calm + 1             # only a short level that holds counts
         best = max(best, have)
-        if calm >= MEM_CALM:
+        if calm >= MEM_CALM or time.monotonic() > end:
             die(f"{what} needs ~{want} MiB RAM (+{reserve} reserve) but only {have} MiB is free "
                 f"for it - stop an instance or lower its RAM")
         time.sleep(1)

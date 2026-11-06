@@ -1,8 +1,10 @@
 """Shared helpers: output, external tools, sizes, hashing, QMP/QGA sockets."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
 import signal
 import socket
@@ -37,39 +39,79 @@ def die(msg: str) -> NoReturn:
     raise Fatal(msg)
 
 
-WAIT = 600      # s any one wait for the guest gives up after, if --timeout doesn't say otherwise
+WAIT = 600      # s any one wait for the guest gives up after, unless --timeout decides instead
 
 
 class TimedOut(Exception):
-    """The command's --timeout ran out; the CLI prints it and exits 124."""
+    """A limit ran out; for the command's own --timeout the CLI prints it and exits 124."""
+
+    def __init__(self, msg: str, limit=None):
+        super().__init__(msg)
+        self.limit = limit      # which limit: within() can tell its own from the command's
 
 
-_deadline = None
+class _Limit:
+    def __init__(self, seconds: int):
+        self.seconds, self.end = seconds, time.monotonic() + min(seconds, 10 ** 8)
 
 
-def start_timeout(limit: int) -> None:
-    """--timeout: one alarm for the whole command, wherever it is by then. It raises like
-    Ctrl-C does, so cleaning up is the same."""
-    global _deadline
+_limits: list[_Limit] = []      # the command's limit first, if it has one, then any inner ones
 
-    def expired(*_):
-        raise TimedOut(f"gave up after {limit} s")
-    signal.signal(signal.SIGALRM, expired)
-    signal.alarm(limit)
-    _deadline = time.monotonic() + limit
+
+def _arm() -> None:
+    next_end = min((x.end for x in _limits), default=None)
+    signal.setitimer(signal.ITIMER_REAL, 0 if next_end is None else max(0.001, next_end - time.monotonic()))
+
+
+def _expired(*_) -> None:
+    first = min(_limits, key=lambda x: x.end)
+    _limits.remove(first)
+    _arm()
+    raise TimedOut(f"gave up after {first.seconds} s", first)
+
+
+def start_timeout(seconds: int) -> None:
+    """--timeout: one limit for the whole command, wherever it is by then. It raises like Ctrl-C
+    does, so cleaning up is the same. Cleaning up then runs with this limit spent, so anything
+    it does in the guest needs a bound of its own (guest.capture's `timeout`)."""
+    signal.signal(signal.SIGALRM, _expired)
+    _limits[:] = [_Limit(seconds)]
+    _arm()
+
+
+@contextlib.contextmanager
+def time_limit(seconds: int | None):
+    """An inner limit, such as a build step's `timeout:`; yields it, to tell from the command's."""
+    if not seconds:
+        yield None
+        return
+    signal.signal(signal.SIGALRM, _expired)
+    limit = _Limit(seconds)
+    _limits.append(limit)
+    _arm()
+    try:
+        yield limit
+    finally:
+        if limit in _limits:
+            _limits.remove(limit)
+        _arm()
 
 
 def timing() -> bool:
-    return _deadline is not None
+    """Is a limit running? Then it decides how long waits may last."""
+    return bool(_limits)
 
 
-def stop_timeout() -> int:
-    """Turn the alarm off, for code that ends things by itself. Returns the seconds left."""
-    global _deadline
-    signal.alarm(0)
-    left = max(1, round(_deadline - time.monotonic()))
-    _deadline = None
-    return left
+def wait_end(default: int = WAIT) -> float:
+    """When a wait for the guest gives up (monotonic): after `default`, or as long as --timeout allows."""
+    return time.monotonic() + (10 ** 9 if timing() else default)
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """A limit may run out at any moment: never leave half a state file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 def run(*cmd, check=True, quiet=False, **kw) -> sp.CompletedProcess:
@@ -197,11 +239,12 @@ def dos(text: str) -> bytes:
 class Chan:
     """Line-delimited JSON over a unix socket: QMP (QEMU monitor) or QGA (guest agent)."""
 
-    def __init__(self, path: Path, qmp: bool):
+    def __init__(self, path: Path, qmp: bool, timeout: int = 30):
+        self.timeout = timeout
         if not path.is_socket():
             die(f"{path.name} missing - is the instance running?")
         self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.settimeout(30)
+        self.sock.settimeout(timeout)
         try:
             self.sock.connect(str(path))
         except OSError as e:                                   # a socket left by a QEMU that died
@@ -214,7 +257,9 @@ class Chan:
     def _read(self, cmd: str) -> dict:
         try:
             line = self.f.readline()
-        except OSError as e:                                   # e.g. no guest agent: timeout
+        except TimeoutError:                                   # e.g. no guest agent
+            die(f"{cmd}: no answer within {self.timeout} s")
+        except OSError as e:
             die(f"{cmd}: {e}")
         return json.loads(line) if line else die(f"{cmd}: connection closed")
 

@@ -13,6 +13,7 @@ import signal
 import stat
 import subprocess as sp
 import sys
+import termios
 import time
 from pathlib import Path
 
@@ -23,12 +24,12 @@ from .build import build, fetch_step
 from .config import BUILTIN, DEFAULT_FILE, Config, is_path, sha
 from .media import editions
 from .store import Store, label
-from .util import WAIT, Chan, Fatal, TimedOut, die, du, log, mib, mount_point, paint, seconds, start_timeout, stop_timeout, timing, valid, warn, win_path
+from .util import WAIT, Chan, Fatal, TimedOut, die, du, log, mib, mount_point, paint, seconds, start_timeout, timing, valid, warn, win_path
 from .vm import Instance, ports, running, smbd as vm_smbd
 
 COMMANDS: dict[str, tuple] = {}
 RAW = set()   # commands whose arguments are passed through verbatim (PowerShell, ssh, scp, ...)
-OWN_TIMEOUT = ("stop", "restart", "wait")   # their --timeout or SECONDS: when to power off, how long to wait
+EXIT_FORCED = 3     # stop: it had to be powered off hard
 
 
 def arg(*flags, **kw):
@@ -98,19 +99,62 @@ def allow_reboot(a, vm: Instance) -> None:
         die("nothing changed")
 
 
-def hand_over(argv: list[str]) -> None:
-    """Become this program; under --timeout stay around, so that the limit still holds."""
-    if timing():
-        sys.exit(sp.call(argv))
-    os.execvp(argv[0], argv)
-
-
-def own_limit(a) -> int | None:
-    """stop, restart: what --timeout says, if it says anything."""
+def drop_stdout() -> None:
+    """A limit ran out, maybe because of a reader that doesn't read: leaving must not wait for it.
+    What fits still goes out, the rest is dropped, or Python would block on it at exit."""
     try:
-        return seconds(a.timeout) if a.timeout else None
+        os.set_blocking(1, False)
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+    try:
+        os.set_blocking(1, True)                               # (it is shared with whoever started us)
+        os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+    except OSError:
+        pass
+
+
+def hand_over(argv: list[str], left_behind: str = "") -> None:
+    """Become this program; under --timeout stay around, so that the limit still holds, and
+    put the terminal back as it was if the program couldn't."""
+    if not timing():
+        os.execvp(argv[0], argv)
+    tty = termios.tcgetattr(0) if sys.stdin.isatty() else None
+    proc = sp.Popen(argv)
+    try:
+        sys.exit(proc.wait())
+    except TimedOut as e:
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except sp.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if tty:
+            termios.tcsetattr(0, termios.TCSANOW, tty)
+        raise TimedOut(f"{e}{left_behind}", e.limit) from None
+
+
+def kill_after(a) -> int | None:
+    """stop, restart: what --kill-after says, if it says anything."""
+    try:
+        return seconds(a.kill_after) if a.kill_after is not None else None
     except ValueError as e:
-        die(f"--timeout: {e}")
+        die(f"--kill-after: {e}")
+
+
+def press_and_wait(vms: list[Instance], after: int | None) -> tuple[list[Instance], bool]:
+    """ACPI shutdown of them all at once. Returns those powered off hard, and whether any
+    couldn't be told. One that can't be told doesn't stop the others from being stopped."""
+    t0, pressed, trouble = time.monotonic(), [], False
+    for vm in vms:
+        try:
+            if vm.power_button():
+                pressed.append(vm)
+        except Fatal as e:
+            warn(f"couldn't stop {vm.name}: {e}")
+            trouble = True
+    return [vm for vm in pressed if not vm.wait_stopped(after or vm.power_off_after, since=t0)], trouble
 
 
 def instances_named(a, names: list[str]) -> list[Instance]:
@@ -224,28 +268,25 @@ def cmd_up(a):
 
 @command(arg("names", nargs="*", metavar="INSTANCE", names="instances"),
          arg("--all", action="store_true", help="every running instance"),
-         arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="time before a hard power-off (default 2 min, emulated 10)"),
+         arg("--kill-after", metavar="TIME", help="power it off hard if it hasn't stopped after this long: exit 3 (default 2 min, emulated 10)"),
          aliases=("down",))
 def cmd_stop(a):
-    """graceful shutdown (ACPI), all at once; hard power-off after --timeout"""
+    """graceful shutdown (ACPI), all at once; hard power-off after --kill-after"""
     vms = [vm for vm in running(a.cfg) if not vm.builder] if a.all else instances_named(a, a.names)
-    t0, limit = time.time(), own_limit(a)
-    for vm in [vm for vm in vms if vm.power_button()]:
-        vm.wait_stopped(limit or vm.power_off_after, since=t0)
+    forced, trouble = press_and_wait(vms, kill_after(a))
+    return 1 if trouble else EXIT_FORCED if forced else 0
 
 
 @command(arg("names", nargs="*", metavar="INSTANCE", names="instances"),
-         arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="time before a hard power-off (default 2 min, emulated 10)"))
+         arg("--kill-after", metavar="TIME", help="power it off hard if it hasn't stopped after this long: exit 3 (default 2 min, emulated 10)"))
 def cmd_restart(a):
     """stop (ACPI) and start again, e.g. for new --ram/--cpus or mounts"""
     vms = instances_named(a, a.names)
     for vm in vms:
         vm.disk.exists() or die(f"no instance '{vm.name}' (winvm ps)")
-    t0, limit = time.time(), own_limit(a)
     accel = {vm.name: vm.state.get("accel") for vm in vms if vm.alive}   # (emulated stays emulated)
     asked = a.cfg.accel_arg
-    for vm in [vm for vm in vms if vm.power_button()]:
-        vm.wait_stopped(limit or vm.power_off_after, since=t0)
+    press_and_wait(vms, kill_after(a))
     for vm in vms:
         ensure_disk(a.cfg, vm)                                 # (tells if its image is outdated)
         a.cfg.accel_arg = asked or accel.get(vm.name)
@@ -414,7 +455,6 @@ def cmd_sh(a):
     cwd = vm.guest_path(Path.cwd())
     if on_desktop:
         return sh_desktop(a, vm, guest.command_line(words), cwd, limit, fresh)
-    left = stop_timeout() if limit else None                   # from here on it ends the command itself
     if not words:                                              # interactive shell
         # still a shell if the folder can't be entered: to find out why, for one
         cd = (f"try {{ Set-Location -LiteralPath {guest.quote(cwd)} -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine("
@@ -425,27 +465,34 @@ def cmd_sh(a):
     script = guest.script(guest.command_line(words), cwd, console=tty, pid_file=pid_file)
     if tty:
         return guest.tty(vm.ssh, script)
-    rc = guest.pipe(vm.ssh, script, timeout=left)
-    if rc == guest.TIMED_OUT:
-        guest.end(vm.ssh, pid_file)
-        print(paint("1;31", "error:"), f"gave up on the command after {limit} s and ended it", file=sys.stderr)
-        return guest.EXIT_TIMED_OUT
+    try:
+        rc = guest.pipe(vm.ssh, script)
+    except TimedOut as e:
+        how = "and ended the command" if guest.end(vm.ssh, pid_file) else \
+            "but couldn't end the command, so it may still be running in the guest"
+        raise TimedOut(f"{e} {how}", e.limit) from None
+    if rc == 255:      # (ssh's own message for this is hidden, as is its chatter)
+        warn(f"exit 255: the connection to {vm.name} was lost (no answer from the guest for "
+             f"{'3' if vm.emulated else '30-40'}{' min' if vm.emulated else ' s'}, or it rebooted), or the command itself exited with 255")
     return rc
+
+
+def stdin_waiting() -> bool:
+    """Is there data on stdin? A pipe nobody writes to, or a terminal, doesn't count."""
+    try:
+        st = os.fstat(0)
+        if stat.S_ISREG(st.st_mode):
+            return st.st_size > os.lseek(0, 0, os.SEEK_CUR)
+        if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode):
+            return bool(select.select([0], [], [], 0.1)[0] and os.read(0, 1))
+    except OSError:
+        pass
+    return False
 
 
 def check_no_stdin() -> None:
     """--desktop has no way to pass stdin on: better an error than a command that sees nothing."""
-    try:
-        st = os.fstat(0)
-        if stat.S_ISREG(st.st_mode):
-            waiting = st.st_size > os.lseek(0, 0, os.SEEK_CUR)
-        elif stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode):   # a pipe nobody writes to is fine
-            waiting = bool(select.select([0], [], [], 0.1)[0] and os.read(0, 1))
-        else:
-            waiting = False
-    except OSError:
-        return
-    if waiting:
+    if stdin_waiting():
         die("winvm sh --desktop can't pass stdin on to the command: copy the data in with winvm cp, "
             "or add </dev/null if the command doesn't need it")
 
@@ -471,16 +518,15 @@ def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, f
     def stopped(*_):                                           # `kill`, `timeout`: as Ctrl-C does
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stopped)
-    rc, note = desktop.run(vm, code, stop_timeout() if limit else None, cwd=cwd)
-    if rc == guest.TIMED_OUT:
-        print(paint("1;31", "error:"), f"gave up on the command after {limit} s and ended it{note}", file=sys.stderr)
-        return guest.EXIT_TIMED_OUT
+    rc, note = desktop.run(vm, code, cwd=cwd)                  # (--timeout: raises, saying what it did)
+    if stdin_waiting():                                        # data that came only after the look above
+        warn("data arrived on stdin and was ignored: winvm sh --desktop can't pass it on")
     if rc == desktop.VANISHED:
         print(paint("1;31", "error:"), f"the command ended without an exit code: it probably rebooted the VM or "
               f"logged the user off{note}", file=sys.stderr)
         return 1
     if rc == desktop.LOST:
-        print(paint("1;31", "error:"), "lost the connection to the VM: the command probably rebooted it", file=sys.stderr)
+        print(paint("1;31", "error:"), "lost the connection to the VM: the command may have rebooted it, or the guest stopped answering", file=sys.stderr)
         return 255
     return rc
 
@@ -497,7 +543,7 @@ def cmd_ssh(a):
         opts.append(o)
         if len(o) == 2 and o[1] in "BbcDEeFIiJLlmOoPpRSWw" and rest:   # ssh options taking a value
             opts.append(rest.pop(0))
-    hand_over(["ssh", "-F", str(vm.dir / "ssh_config"), *opts, vm.name, *rest])
+    hand_over(["ssh", "-F", str(vm.dir / "ssh_config"), *opts, vm.name, *rest], "; a command in the guest may go on")
 
 
 @command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("paths", nargs="*", metavar="PATH", help="':' prefix = guest path"), raw=True)
@@ -505,18 +551,20 @@ def cmd_cp(a):
     """copy files with scp, e.g. cp a.txt :C:/Users/user/  |  cp :C:/x.log ."""
     vm = ready(a)
     paths = [f"{vm.name}{p}" if p.startswith(":") else p for p in a.rest]
-    hand_over(["scp", "-F", str(vm.dir / "ssh_config"), "-r", *paths])
+    hand_over(["scp", "-F", str(vm.dir / "ssh_config"), "-r", *paths], "; a partial file may be left where it was going")
 
 
-@command(arg("seconds", nargs="?", metavar="SECONDS", help="how long to wait (default 600)"),
-         arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="the same"))
+@command(arg("seconds", nargs="?", metavar="TIME", help="how long to wait: exit 124 after that (default 10 min)"))
 def cmd_wait(a):
     """wait until SSH in the guest answers"""
-    try:
-        limit = seconds(a.seconds or a.timeout or WAIT)
-    except ValueError as e:
-        die(f"wait: {e}")
-    inst(a).wait_ssh(limit)
+    if a.seconds is not None and a.limit:
+        die("wait: give the time once, as TIME or as --timeout")
+    if not a.limit:
+        try:
+            start_timeout(seconds(a.seconds) if a.seconds is not None else WAIT)
+        except ValueError as e:
+            die(f"wait: {e}")
+    inst(a).wait_ssh()
 
 
 @command()
@@ -1233,7 +1281,7 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
     p.add_argument("--cache-dir", metavar="DIR",
                    help="downloads and build scratch (default: $WINVM_CACHE_DIR, settings.cache_dir)")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask: download what's needed, delete what was asked for")
-    p.add_argument("--timeout", metavar="TIME", help="give up on the whole command after this long (90s, 30m, 2h): exit 124")
+    p.add_argument("--timeout", metavar="TIME", help="give up on the whole command after this long (90, 90s, 30m, 2h): exit 124")
     p.add_argument("--accel", choices=("kvm", "tcg"), help="tcg: emulate, without KVM; far slower (default: $WINVM_ACCEL, settings.accel)")
     p.add_argument("-V", "--version", action="version", version=f"winvm {__version__}")
     # -i and -y also work after the command (`winvm ps -i x` / `winvm rm -y`)
@@ -1251,7 +1299,7 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
         sp_ = sub.add_parser(name, aliases=aliases, help=doc.splitlines()[0], description=doc,
                              formatter_class=argparse.RawDescriptionHelpFormatter,
                              parents=[] if name in RAW or getattr(fn, "no_config", False) else
-                             [common] if name in OWN_TIMEOUT else [common, timed])
+                             [common, timed])
         for flags, kw in args:
             kw = dict(kw)
             names = kw.pop("names", None)
@@ -1310,7 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
         a.instance_given = bool(a.instance)
         a.instance = a.instance or "main"
         a.limit = None
-        if a.timeout and a.fn.__name__.removeprefix("cmd_") not in OWN_TIMEOUT:
+        if a.timeout is not None:
             try:
                 a.limit = seconds(a.timeout)
             except ValueError as e:
@@ -1319,6 +1367,7 @@ def main(argv: list[str] | None = None) -> int:
         return a.fn(a) or 0
     except TimedOut as e:
         print(paint("1;31", "error:"), e, file=sys.stderr)
+        drop_stdout()
         return guest.EXIT_TIMED_OUT
     except Fatal as e:
         print(paint("1;31", "error:"), e, file=sys.stderr)
