@@ -140,7 +140,7 @@ password: the-current-password
 
 winvm doesn't change the password itself, because resetting one can make data protected by DPAPI
 unreadable. A logon notice is cleared for the build and put back afterwards. Anything else that
-stops the logon, such as an expired password, ends in an error after 3 minutes, with a picture
+stops the logon, such as an expired password, ends in an error after 10 minutes, with a picture
 of the screen.
 
 ## Where image files come from
@@ -188,7 +188,7 @@ made from. To get something that rebuilds on a newer `base`, write an image file
 
 ## Machine settings
 
-Folders, ports, UUID, RAM reserve and the default `run` are in
+Folders, ports, UUID, RAM reserve, the accelerator and the default `run` are in
 `~/.config/winvm/winvm.yaml`, merged over the built-in ones, which `winvm config dump` prints.
 They never change what an image contains, so an image file means the same on every machine.
 

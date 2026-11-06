@@ -11,6 +11,7 @@ import select
 import shutil
 import signal
 import stat
+import subprocess as sp
 import sys
 import time
 from pathlib import Path
@@ -22,11 +23,12 @@ from .build import build, fetch_step
 from .config import BUILTIN, DEFAULT_FILE, Config, is_path, sha
 from .media import editions
 from .store import Store, label
-from .util import Chan, Fatal, die, du, log, mib, mount_point, paint, seconds, valid, warn, win_path
+from .util import WAIT, Chan, Fatal, TimedOut, die, du, log, mib, mount_point, paint, seconds, start_timeout, stop_timeout, timing, valid, warn, win_path
 from .vm import Instance, ports, running, smbd as vm_smbd
 
 COMMANDS: dict[str, tuple] = {}
 RAW = set()   # commands whose arguments are passed through verbatim (PowerShell, ssh, scp, ...)
+OWN_TIMEOUT = ("stop", "restart", "wait")   # their --timeout or SECONDS: when to power off, how long to wait
 
 
 def arg(*flags, **kw):
@@ -96,6 +98,21 @@ def allow_reboot(a, vm: Instance) -> None:
         die("nothing changed")
 
 
+def hand_over(argv: list[str]) -> None:
+    """Become this program; under --timeout stay around, so that the limit still holds."""
+    if timing():
+        sys.exit(sp.call(argv))
+    os.execvp(argv[0], argv)
+
+
+def own_limit(a) -> int | None:
+    """stop, restart: what --timeout says, if it says anything."""
+    try:
+        return seconds(a.timeout) if a.timeout else None
+    except ValueError as e:
+        die(f"--timeout: {e}")
+
+
 def instances_named(a, names: list[str]) -> list[Instance]:
     """Instances named on the command line, else the -i one."""
     return [Instance(a.cfg, valid(n)) for n in names] if names else [inst(a)]
@@ -160,7 +177,7 @@ def ensure_disk(cfg: Config, vm: Instance, image: str | None = None, run: dict |
                                                      "kept for this instance (`default`: back to the image's)"),
          aliases=("start",))
 def cmd_up(a):
-    """create (building images as needed) and start instances; ready when SSH answers"""
+    """create (building images as needed) and start instances; ready when SSH answers, in desktop mode once logged on"""
     cfg, store = a.cfg, Store(a.cfg)
     if a.iso:
         link_iso(cfg, a.iso)
@@ -182,7 +199,8 @@ def cmd_up(a):
     image = cfg.ref(a.image) if a.image else None
     names = [d.parent.name for d in store.disks()] if a.all else \
         [cfg.ref(n) if is_path(n) else valid(n) for n in a.names or [a.instance]]
-    host.require(cfg, a.gui)                                   # before building or creating
+    if not all(Instance(cfg, n).alive for n in names):
+        host.require(cfg, a.gui)                               # before building or creating
     for n in names:
         vm = Instance(cfg, n)
         if run.keys() - {"desktop"} and vm.alive:
@@ -197,37 +215,40 @@ def cmd_up(a):
         ensure_disk(cfg, vm, image, run)
         try:
             vm.start(gui=a.gui, reboot=reboot)
-        except Fatal:
-            if desk == "on" and before:                        # it couldn't log on: nothing changes
-                vm.meta = before
+        except (Fatal, TimedOut):
+            if desk == "on":                                   # it couldn't log on: nothing changes
+                vm.meta = before or {**vm.meta, "run": {k: v for k, v in vm.meta.get("run", {}).items() if k != "desktop"}}
             raise
         log(f"{n} is up - winvm{'' if n == 'main' else f' -i {n}'} sh")
 
 
 @command(arg("names", nargs="*", metavar="INSTANCE", names="instances"),
          arg("--all", action="store_true", help="every running instance"),
-         arg("--timeout", type=int, default=120, help="seconds before a hard power-off (default 120)"),
+         arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="time before a hard power-off (default 2 min, emulated 10)"),
          aliases=("down",))
 def cmd_stop(a):
     """graceful shutdown (ACPI), all at once; hard power-off after --timeout"""
     vms = [vm for vm in running(a.cfg) if not vm.builder] if a.all else instances_named(a, a.names)
-    t0 = time.time()
+    t0, limit = time.time(), own_limit(a)
     for vm in [vm for vm in vms if vm.power_button()]:
-        vm.wait_stopped(a.timeout, since=t0)
+        vm.wait_stopped(limit or vm.power_off_after, since=t0)
 
 
 @command(arg("names", nargs="*", metavar="INSTANCE", names="instances"),
-         arg("--timeout", type=int, default=120, help="seconds before a hard power-off (default 120)"))
+         arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="time before a hard power-off (default 2 min, emulated 10)"))
 def cmd_restart(a):
     """stop (ACPI) and start again, e.g. for new --ram/--cpus or mounts"""
     vms = instances_named(a, a.names)
     for vm in vms:
         vm.disk.exists() or die(f"no instance '{vm.name}' (winvm ps)")
-    t0 = time.time()
+    t0, limit = time.time(), own_limit(a)
+    accel = {vm.name: vm.state.get("accel") for vm in vms if vm.alive}   # (emulated stays emulated)
+    asked = a.cfg.accel_arg
     for vm in [vm for vm in vms if vm.power_button()]:
-        vm.wait_stopped(a.timeout, since=t0)
+        vm.wait_stopped(limit or vm.power_off_after, since=t0)
     for vm in vms:
         ensure_disk(a.cfg, vm)                                 # (tells if its image is outdated)
+        a.cfg.accel_arg = asked or accel.get(vm.name)
         vm.start()
         log(f"{vm.name} is up")
 
@@ -326,7 +347,7 @@ def outdated(cfg: Config, store: Store, vm: Instance, on: Path | None) -> bool:
 
 @command(arg("-t", action="store_true", help="a terminal, for interactive programs"),
          arg("--desktop", action="store_true", help="run CMD in the logged-on desktop session"),
-         arg("--timeout", metavar="TIME", help="give up on CMD after this long (90s, 30m, 2h): exit 124"),
+         arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long, starting the VM included (90s, 30m, 2h): exit 124"),
          arg("cmd", nargs="*", metavar="CMD", help="PowerShell command line (as typed at the prompt)"),
          raw=True, aliases=("shell",))
 def cmd_sh(a):
@@ -350,7 +371,7 @@ def cmd_sh(a):
     stdin is not passed on. --timeout ends the command and what it started, but not what
     Windows started for it (Store apps, COM servers).
     """
-    rest, tty, on_desktop, limit = list(a.rest), False, False, None
+    rest, tty, on_desktop, limit = list(a.rest), False, False, a.limit
     while rest:                                                # (only before the command)
         w = rest[0]
         if w == "-t":
@@ -359,10 +380,12 @@ def cmd_sh(a):
             on_desktop = True
         elif w in ("-y", "--yes"):
             a.yes = a.cfg.yes = True
-        elif w in ("-i", "--instance", "--timeout") and len(rest) == 1:
+        elif w in ("-i", "--instance", "--timeout", "--accel") and len(rest) == 1:
             die(f"{w} needs a value")
         elif w in ("-i", "--instance"):
             a.instance = rest.pop(1)
+        elif w == "--accel":
+            a.cfg.accel_arg = rest.pop(1)
         elif w == "--timeout" or w.startswith("--timeout="):
             value = rest.pop(1) if w == "--timeout" else w.partition("=")[2]
             try:
@@ -383,12 +406,15 @@ def cmd_sh(a):
         die(f"-t doesn't go with {'--desktop' if on_desktop else '--timeout'}")
     if on_desktop:
         check_no_stdin()
+    if limit:
+        start_timeout(limit)                                   # it covers starting the VM too
     vm = existing(a)
     fresh = not vm.alive
     vm.up()
     cwd = vm.guest_path(Path.cwd())
     if on_desktop:
         return sh_desktop(a, vm, guest.command_line(words), cwd, limit, fresh)
+    left = stop_timeout() if limit else None                   # from here on it ends the command itself
     if not words:                                              # interactive shell
         # still a shell if the folder can't be entered: to find out why, for one
         cd = (f"try {{ Set-Location -LiteralPath {guest.quote(cwd)} -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine("
@@ -399,7 +425,7 @@ def cmd_sh(a):
     script = guest.script(guest.command_line(words), cwd, console=tty, pid_file=pid_file)
     if tty:
         return guest.tty(vm.ssh, script)
-    rc = guest.pipe(vm.ssh, script, timeout=limit)
+    rc = guest.pipe(vm.ssh, script, timeout=left)
     if rc == guest.TIMED_OUT:
         guest.end(vm.ssh, pid_file)
         print(paint("1;31", "error:"), f"gave up on the command after {limit} s and ended it", file=sys.stderr)
@@ -437,7 +463,7 @@ def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, f
             ensure_disk(a.cfg, vm, run={"desktop": True})
             try:
                 desktop.sync(vm, may_reboot=True)
-            except Fatal:                                      # it couldn't log on: nothing changes
+            except (Fatal, TimedOut):                          # it couldn't log on: nothing changes
                 vm.meta = before
                 raise
             log(f"desktop mode is on for {vm.name} from now on (`winvm -i {vm.name} up --desktop default` drops it)")
@@ -445,7 +471,7 @@ def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, f
     def stopped(*_):                                           # `kill`, `timeout`: as Ctrl-C does
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stopped)
-    rc, note = desktop.run(vm, code, limit, cwd=cwd)
+    rc, note = desktop.run(vm, code, stop_timeout() if limit else None, cwd=cwd)
     if rc == guest.TIMED_OUT:
         print(paint("1;31", "error:"), f"gave up on the command after {limit} s and ended it{note}", file=sys.stderr)
         return guest.EXIT_TIMED_OUT
@@ -459,7 +485,7 @@ def sh_desktop(a, vm: Instance, code: str, cwd: str | None, limit: int | None, f
     return rc
 
 
-@command(arg("args", nargs="*", metavar="ARG", help="ssh options, then an optional remote command"), raw=True)
+@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("args", nargs="*", metavar="ARG", help="ssh options, then an optional remote command"), raw=True)
 def cmd_ssh(a):
     """plain ssh to the instance, e.g. ssh -L 8080:localhost:80 -N  |  ssh hostname"""
     vm = ready(a)
@@ -471,21 +497,26 @@ def cmd_ssh(a):
         opts.append(o)
         if len(o) == 2 and o[1] in "BbcDEeFIiJLlmOoPpRSWw" and rest:   # ssh options taking a value
             opts.append(rest.pop(0))
-    os.execvp("ssh", ["ssh", "-F", str(vm.dir / "ssh_config"), *opts, vm.name, *rest])
+    hand_over(["ssh", "-F", str(vm.dir / "ssh_config"), *opts, vm.name, *rest])
 
 
-@command(arg("paths", nargs="*", metavar="PATH", help="':' prefix = guest path"), raw=True)
+@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("paths", nargs="*", metavar="PATH", help="':' prefix = guest path"), raw=True)
 def cmd_cp(a):
     """copy files with scp, e.g. cp a.txt :C:/Users/user/  |  cp :C:/x.log ."""
     vm = ready(a)
     paths = [f"{vm.name}{p}" if p.startswith(":") else p for p in a.rest]
-    os.execvp("scp", ["scp", "-F", str(vm.dir / "ssh_config"), "-r", *paths])
+    hand_over(["scp", "-F", str(vm.dir / "ssh_config"), "-r", *paths])
 
 
-@command(arg("timeout", nargs="?", type=int, default=600))
+@command(arg("seconds", nargs="?", metavar="SECONDS", help="how long to wait (default 600)"),
+         arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="the same"))
 def cmd_wait(a):
     """wait until SSH in the guest answers"""
-    inst(a).wait_ssh(a.timeout)
+    try:
+        limit = seconds(a.seconds or a.timeout or WAIT)
+    except ValueError as e:
+        die(f"wait: {e}")
+    inst(a).wait_ssh(limit)
 
 
 @command()
@@ -498,24 +529,24 @@ def cmd_gui(a):
     vnc = vm.state.get("vnc") or die(f"{vm.name} runs headless without VNC - winvm rdp")
     for viewer in VNC_VIEWERS:
         if shutil.which(viewer):
-            os.execvp(viewer, [viewer, f"vnc://127.0.0.1:{vnc}" if viewer == "remote-viewer" else f"127.0.0.1:{vnc}"])
+            hand_over([viewer, f"vnc://127.0.0.1:{vnc}" if viewer == "remote-viewer" else f"127.0.0.1:{vnc}"])
     die(f"no VNC viewer found - connect one to 127.0.0.1:{vnc}, or {host.install_hint('vnc')}")
 
 
-@command(arg("args", nargs="*", metavar="FREERDP_ARG"), raw=True)
+@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("args", nargs="*", metavar="FREERDP_ARG"), raw=True)
 def cmd_rdp(a):
     """RDP session with FreeRDP: dynamic resolution, clipboard"""
     vm = ready(a)                                          # booted = SSH answers
     port = vm.state.get("rdp") or die("RDP is off (settings.ports.rdp)")
     for x in RDP_CLIENTS:
         if shutil.which(x):
-            os.execvp(x, [x, f"/v:127.0.0.1:{port}", f"/u:{desktop.user_of(vm)}",
+            hand_over([x, f"/v:127.0.0.1:{port}", f"/u:{desktop.user_of(vm)}",
                           f"/p:{desktop.password_of(vm)}", "/cert:ignore", "/dynamic-resolution", "+clipboard",
                           *a.rest])
     die(f"no FreeRDP client found - {host.install_hint('rdp')}")
 
 
-@command(arg("args", nargs="*", metavar="ARG", help="agent command [json] | exec PROGRAM [ARGS]"), raw=True)
+@command(arg("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124"), arg("args", nargs="*", metavar="ARG", help="agent command [json] | exec PROGRAM [ARGS]"), raw=True)
 def cmd_ga(a):
     """qemu-guest-agent (works without network), e.g. ga guest-info | ga exec ipconfig /all"""
     agent = Chan(inst(a).dir / "qga.sock", qmp=False)
@@ -584,7 +615,7 @@ def cmd_logs(a):
     f = vm.dir / LOGS[a.which]
     f.exists() or die(f"no {a.which} log for {vm.name} ({f})")
     if a.follow:
-        os.execvp("tail", ["tail", "-n", "50", "-F", str(f)])
+        hand_over(["tail", "-n", "50", "-F", str(f)])
     sys.stdout.write(f.read_text(errors="replace"))
 
 
@@ -952,7 +983,10 @@ def cmd_check(a):
 
     print("required")
     kvm = host.kvm_problem()
-    row("KVM", not kvm, kvm or "/dev/kvm")
+    if cfg.accel == "tcg":
+        row("KVM", None if kvm else True, f"{kvm or '/dev/kvm'} - not used: accel tcg, emulated and far slower")
+    else:
+        row("KVM", not kvm, kvm or "/dev/kvm")
     qemu = host.program(cfg, "qemu")
     row("QEMU", bool(qemu), qemu or host.install_hint("qemu"))
     try:
@@ -1024,7 +1058,7 @@ def cmd_config(a):
         print(f"# {cfg.sources[name]}")
         print(yaml.safe_dump({**img, "run": cfg.run_settings(name)}, sort_keys=False, width=120), end="")
     elif a.what == "show":
-        print(yaml.safe_dump({k: cfg.raw[k] for k in ("settings", "run")}, sort_keys=False, width=120), end="")
+        print(yaml.safe_dump({"settings": {**cfg.raw["settings"], "accel": cfg.accel}, "run": cfg.raw["run"]}, sort_keys=False, width=120), end="")
     else:
         print(f"settings: {cfg.file or '(built-in only: winvm config dump)'}")
         print(f"images:   {cfg.images_dir}  (NAME.yaml, then the built-ins)")
@@ -1199,19 +1233,25 @@ def parser() -> tuple[argparse.ArgumentParser, list[tuple[list[str], argparse.Ar
     p.add_argument("--cache-dir", metavar="DIR",
                    help="downloads and build scratch (default: $WINVM_CACHE_DIR, settings.cache_dir)")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask: download what's needed, delete what was asked for")
+    p.add_argument("--timeout", metavar="TIME", help="give up on the whole command after this long (90s, 30m, 2h): exit 124")
+    p.add_argument("--accel", choices=("kvm", "tcg"), help="tcg: emulate, without KVM; far slower (default: $WINVM_ACCEL, settings.accel)")
     p.add_argument("-V", "--version", action="version", version=f"winvm {__version__}")
     # -i and -y also work after the command (`winvm ps -i x` / `winvm rm -y`)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-i", "--instance", metavar="NAME", default=argparse.SUPPRESS,
                         help="instance to act on (default: main)").names = "instances"
     common.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS, help="don't ask")
+    common.add_argument("--accel", choices=("kvm", "tcg"), default=argparse.SUPPRESS, help="tcg: emulate, without KVM; far slower")
+    timed = argparse.ArgumentParser(add_help=False)
+    timed.add_argument("--timeout", metavar="TIME", default=argparse.SUPPRESS, help="give up after this long (90s, 30m, 2h): exit 124")
     sub = p.add_subparsers(title="commands", metavar="<command>")
     subs = []
     for name, (fn, args, aliases) in COMMANDS.items():
         doc = fn.__doc__ or ""
         sp_ = sub.add_parser(name, aliases=aliases, help=doc.splitlines()[0], description=doc,
                              formatter_class=argparse.RawDescriptionHelpFormatter,
-                             parents=[] if name in RAW or getattr(fn, "no_config", False) else [common])
+                             parents=[] if name in RAW or getattr(fn, "no_config", False) else
+                             [common] if name in OWN_TIMEOUT else [common, timed])
         for flags, kw in args:
             kw = dict(kw)
             names = kw.pop("names", None)
@@ -1230,17 +1270,26 @@ def main(argv: list[str] | None = None) -> int:
     # raw commands get everything after their name untouched (PowerShell, ssh, scp arguments)
     i = 0
     while i < len(argv) and argv[i].startswith("-"):
-        i += 2 if argv[i] in ("-i", "--instance", "-f", "--file", "--data-dir", "--cache-dir") else 1
+        i += 2 if argv[i] in ("-i", "--instance", "-f", "--file", "--data-dir", "--cache-dir", "--timeout", "--accel") else 1
     if i < len(argv) and argv[i] in RAW and argv[i + 1:] not in (["-h"], ["--help"]):
         a = p.parse_args(argv[: i + 1])
         a.rest = argv[i + 1:]
-        # sh / rdp / ga: winvm's own -i NAME and -y right after the command (ssh and scp have
-        # their own -i, so theirs go before the command)
-        while argv[i] in ("sh", "shell", "rdp", "ga") and a.rest[:1] and a.rest[0] in ("-i", "--instance", "-y", "--yes"):
-            if a.rest[0] in ("-y", "--yes"):
+        # winvm's own options right after the command; what follows them is the program's. ssh and
+        # scp have an -i of their own, so winvm's goes before the command there
+        takes_i = argv[i] in ("sh", "shell", "rdp", "ga")
+        while a.rest:
+            w = a.rest[0]
+            if takes_i and w in ("-y", "--yes"):
                 a.yes, a.rest = True, a.rest[1:]
-            elif len(a.rest) > 1:
+            elif takes_i and w in ("-i", "--instance") and len(a.rest) > 1:
                 a.instance, a.rest = a.rest[1], a.rest[2:]
+            elif w in ("--timeout", "--accel") and len(a.rest) > 1:
+                setattr(a, w[2:], a.rest[1])
+                a.rest = a.rest[2:]
+            elif w.startswith(("--timeout=", "--accel=")):
+                k, _, v = w[2:].partition("=")
+                setattr(a, k, v)
+                a.rest = a.rest[1:]
             else:
                 break
     else:
@@ -1257,9 +1306,20 @@ def main(argv: list[str] | None = None) -> int:
             return a.fn(a) or 0
         a.cfg = Config(a.file, a.data_dir, a.cache_dir)
         a.cfg.yes = a.yes
+        a.cfg.accel_arg = getattr(a, "accel", None)
         a.instance_given = bool(a.instance)
         a.instance = a.instance or "main"
+        a.limit = None
+        if a.timeout and a.fn.__name__.removeprefix("cmd_") not in OWN_TIMEOUT:
+            try:
+                a.limit = seconds(a.timeout)
+            except ValueError as e:
+                die(f"--timeout: {e}")
+            start_timeout(a.limit)
         return a.fn(a) or 0
+    except TimedOut as e:
+        print(paint("1;31", "error:"), e, file=sys.stderr)
+        return guest.EXIT_TIMED_OUT
     except Fatal as e:
         print(paint("1;31", "error:"), e, file=sys.stderr)
         return 1

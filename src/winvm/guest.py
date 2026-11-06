@@ -69,8 +69,6 @@ def script(line: str, cwd: str | None = None, strict=False, console=False, pid_f
     table, and `exit` would lose them: the command gets its own output pipeline, which ends
     first. Not with console=True (a terminal), where programs need the real console."""
     head = PROLOGUE + REFRESH + ("$ErrorActionPreference = 'Stop'\n" if strict else "")
-    if pid_file:
-        head += f"[IO.File]::WriteAllText({quote(pid_file)}, \"$PID\")\n"
     # a command must never run somewhere else than where it was asked to
     cd = (f"try {{ Set-Location -LiteralPath {quote(cwd)} -ErrorAction Stop }} catch {{ "
           f"[Console]::Error.WriteLine(\"error: can't run in {cwd.replace(chr(34), '').replace('$', '`$')}: $($_.Exception.Message)\"); exit 1 }}\n") if cwd else ""
@@ -78,8 +76,13 @@ def script(line: str, cwd: str | None = None, strict=False, console=False, pid_f
         line = ("$global:LASTEXITCODE = 0\ntry {\n" + line +
                 "\n} catch { [Console]::Error.WriteLine(\"error: $($_.Exception.Message)\"); exit 1 }")
     body = line + EPILOGUE
-    done = f"Remove-Item -LiteralPath {quote(pid_file)} -ErrorAction SilentlyContinue\n" if pid_file else ""
-    return head + cd + (body if console else ". {\n" + body + "} | Out-Default\n") + done + "exit $rc\n"
+    run = body if console else ". {\n" + body + "} | Out-Default\n"
+    if pid_file:     # (the folder may not exist yet, on a VM whose first start was cut short;
+        # `finally` also sees the command's own `exit`)
+        run = (f"[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName({quote(pid_file)}))\n"
+               f"[IO.File]::WriteAllText({quote(pid_file)}, \"$PID\")\n"
+               f"try {{\n{run}}} finally {{ Remove-Item -LiteralPath {quote(pid_file)} -ErrorAction SilentlyContinue }}\n")
+    return head + cd + run + "exit $rc\n"
 
 
 def end(ssh, pid_file: str) -> None:
@@ -117,6 +120,9 @@ def pipe(ssh, script_: str, stdin=None, timeout: int | None = None) -> int:
         proc.kill()
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 141
+    except BaseException:                                      # --timeout, Ctrl-C
+        proc.kill()
+        raise
     return proc.wait()
 
 

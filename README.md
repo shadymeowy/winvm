@@ -39,7 +39,8 @@ $ winvm stop
 ## Install
 
 You need Linux x86-64 with KVM, Python 3.10 or newer, at least 8 GB of RAM and about
-25 GB of free disk.
+25 GB of free disk. [Without KVM](https://github.com/shadymeowy/winvm/blob/main/docs/usage.md#without-kvm)
+winvm can emulate instead, which is far slower.
 
 ```sh
 # 1. QEMU
@@ -64,7 +65,7 @@ errors say what to install on your distro.
 winvm up
 ```
 
-winvm lists what it needs to download and asks once: about 8.6 GB, nearly all of it the
+winvm lists what it needs to download and asks once: about 8 GB, nearly all of it the
 Windows 11 ISO, straight from Microsoft and checked by its sha256. Then it installs
 Windows by itself.
 
@@ -136,6 +137,7 @@ Each VM (an *instance*) has a name, and the default one is `main`. To start anot
 ```sh
 winvm up work --image golden  # a second VM, starting from "golden"
 winvm sh -i work              # -i picks which one to use
+winvm stop work
 winvm rm work                 # delete it; images stay
 ```
 
@@ -182,6 +184,8 @@ reinstall Windows, and `prune --iso` tells you whether winvm can download it aga
 ## Troubleshooting
 
 - **`no access to /dev/kvm`:** run `sudo usermod -aG kvm $USER`, then log out and back in.
+- **Something might hang:** add `--timeout 5m` right after the command's name. It gives up then and
+  exits 124 (`stop` powers off then instead).
 - **A build seems stuck:** Windows Setup is quiet, so winvm prints a line every minute
   and warns if nothing has been written for 15 minutes. To see the screen, run
   `winvm -i _install-base screenshot` or open the VNC address it printed.

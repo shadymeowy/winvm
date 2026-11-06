@@ -4,9 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import signal
 import socket
 import subprocess as sp
 import sys
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -33,6 +35,41 @@ class Fatal(Exception):
 
 def die(msg: str) -> NoReturn:
     raise Fatal(msg)
+
+
+WAIT = 600      # s any one wait for the guest gives up after, if --timeout doesn't say otherwise
+
+
+class TimedOut(Exception):
+    """The command's --timeout ran out; the CLI prints it and exits 124."""
+
+
+_deadline = None
+
+
+def start_timeout(limit: int) -> None:
+    """--timeout: one alarm for the whole command, wherever it is by then. It raises like
+    Ctrl-C does, so cleaning up is the same."""
+    global _deadline
+
+    def expired(*_):
+        raise TimedOut(f"gave up after {limit} s")
+    signal.signal(signal.SIGALRM, expired)
+    signal.alarm(limit)
+    _deadline = time.monotonic() + limit
+
+
+def timing() -> bool:
+    return _deadline is not None
+
+
+def stop_timeout() -> int:
+    """Turn the alarm off, for code that ends things by itself. Returns the seconds left."""
+    global _deadline
+    signal.alarm(0)
+    left = max(1, round(_deadline - time.monotonic()))
+    _deadline = None
+    return left
 
 
 def run(*cmd, check=True, quiet=False, **kw) -> sp.CompletedProcess:

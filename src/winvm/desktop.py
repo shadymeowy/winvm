@@ -23,9 +23,8 @@ import time
 
 from . import guest
 from .guest import BOM
-from .util import Chan, Fatal, die, dos, log, warn
+from .util import WAIT, Chan, Fatal, TimedOut, die, dos, log, warn
 
-WAIT_LOGON = 180                # s for a VM to log on after it answers SSH
 HOME = r"C:\ProgramData\winvm"
 MARKER = HOME + r"\desktop.json"
 STEPS = HOME + r"\steps"        # one folder per running command: script, runner, log, exit code
@@ -78,14 +77,17 @@ def on_probe(user: str) -> str:
 
 
 def wait_logon(vm, what: str) -> None:
-    user, end = user_of(vm), time.time() + WAIT_LOGON
-    while time.time() < end:
-        r = guest.capture(vm.ssh, on_probe(user))
-        if r.returncode == 0 and r.stdout.strip().splitlines()[-1:] not in ([], ["0"]):
-            return
-        time.sleep(1)
-    die(f"{what}: {user} did not log on within {WAIT_LOGON} s. A changed password or a policy can stop "
-        f"auto-logon{picture(vm)}")
+    user, end = user_of(vm), time.time() + WAIT
+    try:
+        while time.time() < end:
+            r = guest.capture(vm.ssh, on_probe(user))
+            if r.returncode == 0 and r.stdout.strip().splitlines()[-1:] not in ([], ["0"]):
+                return
+            time.sleep(1)
+    except TimedOut as e:
+        raise TimedOut(f"{e}: {user} hadn't logged on yet{picture(vm)}") from None
+    die(f"{what}: {user} did not log on within {WAIT} s. A changed password or a policy can stop "
+        f"auto-logon. If someone signed out, it logs on at the next boot: winvm -i {vm.name} restart{picture(vm)}")
 
 
 def picture(vm) -> str:
@@ -212,7 +214,7 @@ $a = $t.Actions.Create(0); $a.Path = 'powershell.exe'; $a.Arguments = {guest.quo
 [void]$root.RegisterTaskDefinition('{task}', $t, 6, $null, $null, 3).Run($null)
 $ErrorActionPreference = 'Continue'
 $out = [Console]::OpenStandardOutput(); $buf = New-Object byte[] 65536
-$pos = 0; $begun = Get-Date; $gone = 0; $pid_ = $null
+$pos = 0; $gone = 0; $pid_ = $null
 while (Test-Path -LiteralPath $d) {{
     $done = Test-Path "$d\\rc"; $n = 0
     if (Test-Path "$d\\log") {{
@@ -223,9 +225,9 @@ while (Test-Path -LiteralPath $d) {{
     if ($done) {{ break }}
     if (-not $pid_ -and (Test-Path "$d\\pid")) {{ $pid_ = (Get-Content "$d\\pid") -as [int] }}
     $alive = if ($pid_) {{ [bool](Get-Process -Id $pid_ -ErrorAction SilentlyContinue) }}
-             else {{ ((Get-Date) - $begun).TotalSeconds -lt 60 }}
+             else {{ $root.GetTask('{task}').State -in 2, 4 }}     # queued or running: it just takes a while
     $gone = if ($alive) {{ 0 }} else {{ $gone + 1 }}
-    if ($gone -ge 5) {{ exit {GONE} }}
+    if ($gone -ge $(if ($pid_) {{ 5 }} else {{ 100 }})) {{ exit {GONE} }}
     Start-Sleep -Milliseconds 50
 }}
 $rc = (Get-Content "$d\\rc") -as [int]

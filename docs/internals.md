@@ -61,7 +61,7 @@ host, so only the relations are worth remembering.
 
 | | |
 |---|---|
-| **First build of `base`** | Up to about an hour, plus downloading about 8.6 GB |
+| **First build of `base`** | Up to about an hour, plus downloading about 8 GB |
 | **First `slim` build** | A bit longer, because it also captures the debloated image; later rebuilds skip the debloat and take a fraction of the time |
 | **An image `from` another** | About a minute, plus whatever its steps do |
 | **Starting an instance** | Seconds until SSH answers |

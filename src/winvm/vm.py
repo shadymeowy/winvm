@@ -22,11 +22,12 @@ from . import desktop, guest, host
 from .balloon import ram_range
 from .config import Config
 from .store import Store, label
-from .util import Chan, check_mount_points, die, log, meminfo, mib, mount_point, run, warn
+from .util import WAIT, Chan, TimedOut, check_mount_points, die, log, meminfo, mib, mount_point, run, warn
 
 HYPERV = ("hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,"
           "hv-stimer,hv-frequencies,hv-tlbflush,hv-ipi,hv-reset")
 SMB_HOST = "10.0.2.4"           # where the guest reaches the instance's Samba server
+TCG_EXTRA = 800     # MiB QEMU uses on top of the VM's RAM when emulating, for translated code
 MEM_CALM = 5        # s free memory must stay level before a start is refused for lack of it
 LINKS = r"C:\ProgramData\winvm\mount-links.txt"   # in the guest: the folder links winvm made
 
@@ -137,12 +138,14 @@ class Instance:
         (the disk is still empty); disks: extra (path, readonly) disks after the main one."""
         st, cfg = st or self.state, self.cfg
         code = host.firmware(cfg)[0]
-        a = [host.qemu(cfg), "-name", self.qemu_name, "-enable-kvm",
+        tcg = st.get("accel", cfg.accel) == "tcg"
+        a = [host.qemu(cfg), "-name", self.qemu_name, *(["-accel", "tcg,thread=multi,tb-size=512"] if tcg else ["-enable-kvm"]),
              "-uuid", cfg.s["uuid"],
-             # q35 + host CPU with Hyper-V enlightenments: what Windows runs fastest on
-             "-machine", "q35,hpet=off,vmport=off", "-cpu", f"host,{HYPERV}",
+             # q35 + host CPU with Hyper-V enlightenments: what Windows runs fastest on. Emulated
+             # there is no Hyper-V timer, and Windows' boot loader hangs without an HPET
+             "-machine", "q35,vmport=off" if tcg else "q35,hpet=off,vmport=off", "-cpu", "max" if tcg else f"host,{HYPERV}",
              "-smp", self.settings["cpus"], "-m", f"{st['ram']}M",
-             "-rtc", "base=utc,driftfix=slew", "-global", "kvm-pit.lost_tick_policy=delay",
+             "-rtc", "base=utc,driftfix=slew", *([] if tcg else ["-global", "kvm-pit.lost_tick_policy=delay"]),
              "-global", "ICH9-LPC.disable_s3=1", "-global", "ICH9-LPC.disable_s4=1",
              # UEFI: shared read-only firmware + this instance's variable store
              "-drive", f"if=pflash,format=raw,readonly=on,file={qfile(code)}",
@@ -194,9 +197,10 @@ class Instance:
     # --- lifecycle
     def claim(self, ram: int) -> None:
         """Pick a port slot and record RAM/ports for this run."""
-        need_mem(self.cfg, ram, f"{'build VM' if self.builder else 'instance'} {self.name}")
+        need_mem(self.cfg, ram + (TCG_EXTRA if self.cfg.accel == "tcg" else 0),
+                 f"{'build VM' if self.builder else 'instance'} {self.name}")
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.state = {"ram": ram, **ports(self.cfg, free_slot(self.cfg, self.state.get("slot")))}
+        self.state = {"ram": ram, "accel": self.cfg.accel, **ports(self.cfg, free_slot(self.cfg, self.state.get("slot")))}
 
     def launch(self, argv: list[str], gui=False) -> None:
         """Start QEMU in the background and wait for its pidfile."""
@@ -222,6 +226,8 @@ class Instance:
         else:
             host.require(self.cfg, gui)
             self.claim(self.ram)
+            if self.cfg.accel == "tcg":
+                warn("no KVM (accel: tcg): emulated, so 10-15 times slower to boot and far slower under load")
             self.write_smb({} if self.builder else self.settings["mounts"])
             self.launch(self.qemu_argv(gui=gui), gui)
             self.ssh_config()                                  # for `Include .../ssh_config`
@@ -235,11 +241,17 @@ class Instance:
                 self.sync_keys()
                 self.sync_mounts()
                 desktop.sync(self, may_reboot=booted or reboot, fresh=booted)
-                self.auto_memory()
+                self.auto_memory(may_reboot=booted or reboot)
 
-    def stop(self, timeout=120) -> bool:
+    def stop(self, timeout=WAIT) -> bool:
         """ACPI shutdown, a hard kill after `timeout` s. False if it had to be killed."""
         return self.wait_stopped(timeout) if self.power_button() else True
+
+    @property
+    def power_off_after(self) -> int:
+        """s `winvm stop` gives a VM before a hard power-off: an emulated one is slow to shut down,
+        however it was asked for at its start (the stop needn't say again)."""
+        return WAIT if self.state.get("accel") == "tcg" else 120
 
     def power_button(self) -> bool:
         """Press the ACPI power button; False if it was not running."""
@@ -296,7 +308,7 @@ class Instance:
   UserKnownHostsFile /dev/null
   LogLevel ERROR
   ConnectTimeout 5
-  ServerAliveInterval 10
+  ServerAliveInterval {60 if st.get("accel") == "tcg" else 10}
   ControlMaster auto
   ControlPath "{self.dir}/mux"
   ControlPersist 120
@@ -313,27 +325,32 @@ class Instance:
         if (self.dir / "mux").exists():
             sp.run(self.ssh("-O", "exit"), stdout=sp.DEVNULL, stderr=sp.DEVNULL)
 
-    def wait_ssh(self, timeout=600) -> None:
+    def wait_ssh(self, timeout=WAIT) -> None:
         if (self.dir / "mux").exists() and not sp.run(   # shared connection up: nothing to wait for
                 self.ssh("-O", "check"), stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
             return
         end = time.time() + timeout
-        while sp.run(self.ssh("-o", "BatchMode=yes", "-o", "ConnectTimeout=3") + ["exit 0"],
-                     stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
-            if not self.alive:
-                die(f"{self.name} is not running")
-            if time.time() > end:
-                die(f"timeout waiting for SSH on {self.name}")
-            time.sleep(2)
+        try:
+            while sp.run(self.ssh("-o", "BatchMode=yes", "-o", "ConnectTimeout=3") + ["exit 0"],
+                         stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
+                if not self.alive:
+                    die(f"{self.name} is not running")
+                if time.time() > end:
+                    die(f"{self.name} did not answer SSH within {timeout} s (winvm -i {self.name} screenshot; "
+                        f"it can wait longer with `winvm wait SECONDS`)")
+                time.sleep(2)
+        except TimedOut as e:
+            raise TimedOut(f"{e}: {self.name} wasn't answering SSH yet (it keeps starting)") from None
 
     def reboot(self) -> None:
         """Reboot the guest (QEMU stays, with its window if it has one), until SSH answers."""
         guest.capture(self.ssh, "shutdown.exe /r /f /t 0")
         self.close_ssh()
-        for _ in range(60):                                    # until it is really gone
-            if sp.run(self.ssh("-o", "ConnectTimeout=2") + ["exit 0"], stdin=sp.DEVNULL,
-                      stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
-                break
+        end = time.time() + WAIT
+        while not sp.run(self.ssh("-o", "ConnectTimeout=2") + ["exit 0"], stdin=sp.DEVNULL,   # until it is really gone
+                         stdout=sp.DEVNULL, stderr=sp.DEVNULL).returncode:
+            if time.time() > end:
+                die(f"{self.name} did not reboot within {WAIT} s")
             time.sleep(1)
         self.close_ssh()
         self.wait_ssh()
@@ -343,6 +360,8 @@ class Instance:
     def call(self, ps: str) -> None:
         """winvm's own guest commands; fail loudly."""
         r = guest.capture(self.ssh, "$ErrorActionPreference = 'Stop'\n" + ps)
+        if r.returncode == 255:
+            die(f"lost the connection to {self.name}: it may be rebooting (winvm -i {self.name} wait, then try again)")
         if r.returncode:
             die(f"guest command failed: {ps[:100]}\n{r.stdout.strip()[:500]}")
 
@@ -358,7 +377,7 @@ class Instance:
         else:
             self.wait_ssh()
             if self.auto_ram and not self.balloon_pid:          # its helper died: restart it
-                self.auto_memory()
+                self.auto_memory(may_reboot=False)
         return self
 
     # --- dynamic memory (ram: {min, max}, see balloon.py)
@@ -380,7 +399,7 @@ class Instance:
         except (OSError, ValueError):
             return None
 
-    def auto_memory(self) -> None:
+    def auto_memory(self, may_reboot: bool = True) -> None:
         """Dynamic memory: a pagefile in the guest (absorbs spikes; set once, one reboot) and
         the balloon helper process."""
         if not self.auto_ram or not (self.dir / "qmp-balloon.sock").is_socket():
@@ -391,6 +410,8 @@ class Instance:
         r = guest.capture(self.ssh, f"""if (Get-CimInstance Win32_PageFileUsage) {{ 'ok' }} else {{
     reg add "{mm}" /v PagingFiles /t REG_MULTI_SZ /d "C:\\pagefile.sys 1024 4096" /f | Out-Null; 'set' }}""")
         if r.stdout.strip().endswith("set"):
+            if not may_reboot:                                 # (its first start was cut short)
+                return warn(f"dynamic memory on {self.name} needs one reboot: winvm -i {self.name} restart")
             log(f"dynamic memory: adding a pagefile to {self.name} (once, one reboot)")
             self.reboot()
             if self.settings.get("desktop"):

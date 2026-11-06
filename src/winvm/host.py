@@ -109,8 +109,9 @@ def require(cfg: Config, gui=False) -> None:
     the way winvm does: QEMU with KVM, and the OpenSSH client to talk to Windows."""
     qemu(cfg)
     qemu_img(cfg)
-    if problem := kvm_problem():
-        die(problem)
+    if cfg.accel == "kvm" and (problem := kvm_problem()):
+        die(f"{problem}. Without KVM winvm can still emulate with --accel tcg (or `settings: accel: tcg` in winvm.yaml), but "
+            f"that is 10-25 times slower: expect installing Windows to take many hours")
     if missing := ssh_missing():
         die(f"{', '.join(missing)} not found: winvm talks to Windows over SSH - {install_hint('ssh')}")
     if gui and not has_gtk(cfg):

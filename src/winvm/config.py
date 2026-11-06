@@ -94,7 +94,7 @@ class Config:
                 die(f"{self.file}: `{'`, `'.join(old)}` no longer go in winvm.yaml. Each image is "
                     f"its own file now, ~/.config/winvm/images/NAME.yaml (`winvm config dump base` "
                     f"shows one); instance settings go in an image's `run:` or on the command line "
-                    f"(`winvm up --ram 8G`). See the README, section Images.")
+                    f"(`winvm up --ram 8G`). See docs/images.md.")
             check_keys(user, set(raw), str(self.file))
             # an empty section (`settings:` with everything below commented out) changes nothing
             raw = merge(raw, {k: v for k, v in user.items() if v is not None})
@@ -414,6 +414,14 @@ class Config:
         return [m["hash"] for m in sorted(metas, key=lambda m: m.get("built", ""), reverse=True) if "hash" in m]
 
     # --- how instances run
+    @property
+    def accel(self) -> str:
+        """kvm or tcg: --accel, else $WINVM_ACCEL, else settings.accel."""
+        value = getattr(self, "accel_arg", None) or os.environ.get("WINVM_ACCEL") or self.s.get("accel") or "kvm"
+        if value not in ("kvm", "tcg"):
+            die(f"accel is kvm or tcg, not {value!r}")
+        return value
+
     def run_settings(self, image: str | None, overrides: dict | None = None) -> dict:
         """ram/cpus/mounts/desktop/password of an instance: the machine's `run`, then the `run:` of its image and
         the images below it (bottom first), then the instance's own overrides. Mount paths are

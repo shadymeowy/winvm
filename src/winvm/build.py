@@ -284,7 +284,9 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     argv = [*inst.qemu_argv(install=True, gui=gui, cdroms=cdroms, disks=disks), "-pidfile", str(inst.pidfile)]
     qemu = sp.Popen(argv + (["-no-reboot"] if no_reboot else []))
     reason: list[str] = []
-    watcher = threading.Thread(target=watch_qmp, args=(inst.dir / "qmp-build.sock", qemu, reason), daemon=True)
+    # (emulated, the firmware takes far longer to reach "Press any key")
+    press = 120 if inst.cfg.accel == "tcg" else 12
+    watcher = threading.Thread(target=watch_qmp, args=(inst.dir / "qmp-build.sock", qemu, reason, press), daemon=True)
     watcher.start()
     buf = b""
     written = [inst.disk, *(d for d, ro in disks if not ro)]  # disks the installer writes to
@@ -325,8 +327,8 @@ def run_installer(inst: Instance, cdroms: list[Path], disks=(), gui=False, no_re
     return serial.read_text(errors="replace"), (reason[-1] if reason else "")
 
 
-def watch_qmp(sock: Path, qemu: sp.Popen, reason: list[str]) -> None:
-    """The installer VM's own QMP socket: press Enter for ~12 s (Microsoft's ISO asks to
+def watch_qmp(sock: Path, qemu: sp.Popen, reason: list[str], press: int = 12) -> None:
+    """The installer VM's own QMP socket: press Enter for `press` s (Microsoft's ISO asks to
     "Press any key to boot from CD"), then record SHUTDOWN reasons until QEMU exits."""
     for _ in range(300):                                       # QEMU may take a while to start
         if qemu.poll() is not None:
@@ -350,7 +352,7 @@ def watch_qmp(sock: Path, qemu: sp.Popen, reason: list[str]) -> None:
     try:
         f.readline()
         send("qmp_capabilities")
-        end = time.time() + 12
+        end = time.time() + press
         while time.time() < end:
             send("send-key", {"keys": [{"type": "qcode", "data": "ret"}]})
             time.sleep(0.5)

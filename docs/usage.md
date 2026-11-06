@@ -8,6 +8,7 @@
 - [Mounts](#mounts)
 - [Instances and their settings](#instances-and-their-settings)
 - [Dynamic memory](#dynamic-memory)
+- [Without KVM](#without-kvm)
 - [Connecting: SSH, RDP, VNC](#connecting-ssh-rdp-vnc)
 - [Shell completion](#shell-completion)
 - [Where files live](#where-files-live)
@@ -22,15 +23,35 @@ Wherever an IMAGE is asked for, a name or the path of an image file works.
 
 Deleting something asks first in a terminal. `-y` doesn't ask, and from a script or a
 pipe winvm goes ahead without asking. `-y` also skips the question before downloads.
-Rebooting a running VM to log on is stricter: from a script, winvm refuses without `-y`.
+Rebooting a running VM to log on is stricter: from a script, winvm refuses without `-y`. Downloads
+too: from a script, winvm refuses them without `-y`.
+
+**`--timeout TIME`** takes `120`, `90s`, `30m` or `2h`, and covers the whole command, downloads and
+starting the VM included. When it runs out, winvm says so and exits 124. A VM that was starting keeps
+starting (`winvm up` again finishes setting it up), and a build's scratch VM is stopped:
+
+```sh
+winvm up --desktop --timeout 5m
+winvm cp --timeout 2m big.iso :C:/
+winvm build dev --timeout 2h
+```
+
+It goes before the command's name or after it. `sh`, `ssh`, `cp`, `rdp` and `ga` pass on what follows,
+so there it has to come right after the name: `winvm sh hostname --timeout 5m` would hand it to
+`hostname`. `--accel` follows the same rule.
+
+Without it, a command that's working has no limit, so installing Windows can take its time, and
+each wait for the guest (SSH, the logon, a reboot, a shutdown during a build) gives up after 10
+minutes, with exit 1. `stop` and `restart` are the exception: their `--timeout` is the time before a
+hard power-off, by default 2 minutes (10 when emulating). `winvm wait`'s is how long to wait.
 
 **Run instances**
 
 | Command | What it does |
 |---|---|
-| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX\|default] [--cpus N\|default] [--desktop [off\|default]] [--iso ISO] [--all] [--gui]` (`start`) | Create (building images as needed) and start. Ready when SSH answers, and with `--desktop` once logged on. |
-| `stop [NAME...] [--all] [--timeout S]` (`down`) | ACPI shutdown, all at once; hard power-off after 120 s |
-| `restart [NAME...]` | Stop, then start |
+| `up [NAME\|FILE...] [--image IMAGE] [--ram R\|MIN-MAX\|default] [--cpus N\|default] [--desktop [off\|default]] [--iso ISO] [--all] [--gui]` (`start`) | Create (building images as needed) and start. Ready when SSH answers, and in desktop mode once logged on. |
+| `stop [NAME...] [--all] [--timeout TIME]` (`down`) | ACPI shutdown, all at once; hard power-off after 2 minutes (10 when emulating) |
+| `restart [NAME...] [--timeout TIME]` | Stop, then start |
 | `kill [NAME...]` | Power off at once; unsaved work in the guest is lost |
 | `ps [-q] [--json]` (`status`) | List instances: state, ports, disk, RAM, image version, mounts |
 | `info` | One instance in detail |
@@ -49,9 +70,9 @@ Rebooting a running VM to log on is stricter: from a script, winvm refuses witho
 | `gui` | VNC viewer on a running instance, or start it with a GTK window |
 | `ga` | Guest agent, works without network: `winvm ga exec PROG [ARGS]` |
 | `balloon [SIZE]` | Show or set the guest's RAM while it runs |
-| `screenshot` | Save a PNG of the screen |
+| `screenshot [FILE]` | Save a PNG of the screen |
 | `logs [serial\|balloon\|smb\|qemu] [-f]` | An instance's logs; without a name, where they are |
-| `cmdline` | Print the QEMU command line |
+| `cmdline [--gui]` | Print the QEMU command line |
 
 **Images and disk**
 
@@ -59,9 +80,9 @@ Rebooting a running VM to log on is stricter: from a script, winvm refuses witho
 |---|---|
 | `build [IMAGE...] [--force] [--gui]` | Build missing or changed images (default: all known). Asks before reinstalling Windows. |
 | `images [--json]` | Built versions, status, size, base, users, defining file |
-| `save NAME` | Freeze the instance's disk as image NAME; the instance continues on it |
-| `reset [IMAGE]` | Discard the instance's changes: fresh disk on the current version of its image, or on IMAGE |
-| `rm [NAME...]` | Delete instances: their disks and settings. Images stay. |
+| `save NAME` | Freeze the (stopped) instance's disk as image NAME; the instance continues on it |
+| `reset [IMAGE]` | Discard the (stopped) instance's changes: fresh disk on the current version of its image, or on IMAGE |
+| `rm [NAME...]` | Delete stopped instances: their disks and settings. Images stay. |
 | `rmi IMAGE` | Delete an image; refused while anything uses it |
 | `prune [-n] [--cache] [--iso]` | Delete unused versions, stale slim images and leftovers. `--cache`: downloads and slim images. `--iso`: ISOs. `-n`: only show. |
 | `df` | Disk space used by images, instances, ISOs, cache; free space |
@@ -110,11 +131,12 @@ For a lot of data on stdin, PowerShell code should read it with `stdin`, which h
 testing. `[Console]::In` and `[Console]::OpenStandardInput()` can stall the whole connection from
 around 16 KB. A native program gets stdin directly, which also handled 3 MB when it only reads or
 prints a little. One that prints a lot while it reads usually stalls from about 256 KB, and then
-the connection ends with exit 255 after 40 seconds. For that, go through PowerShell with
+the connection ends with exit 255 after 40 seconds (longer when emulating). For that, go through PowerShell with
 `winvm sh 'stdin | findstr "^"'`, or copy the data in with `winvm cp`.
 
-`--timeout` takes `90s`, `30m` or `2h`. It ends the command and what the command started, but not
-what Windows started for it, such as Store apps and COM servers.
+On `winvm sh`, `--timeout` also ends the command in the guest and what the command started, but not
+what Windows started for it, such as Store apps and COM servers. It needs a command, and doesn't go
+with `-t`.
 
 The command travels base64-encoded, so no quoting is lost between your shell, ssh, sshd
 and Windows. All commands to an instance share one SSH connection.
@@ -128,7 +150,7 @@ session:
 
 ```sh
 winvm up work --desktop                  # returns once it is logged on
-winvm sh -i work --desktop 'winget install 7zip.7zip --accept-source-agreements'
+winvm sh -i work --desktop 'winget install 7zip.7zip --accept-source-agreements --accept-package-agreements'
 ```
 
 **Nothing appears on your screen.** The desktop exists inside the VM, and you only see it if you
@@ -141,8 +163,10 @@ ask to:
 | `winvm up --gui` | yes | no |
 | `winvm up --desktop --gui` | yes | yes |
 
+The window opens only when this starts the VM. On a running one, use `winvm gui`.
+
 **Desktop mode** makes the VM log on by itself at every boot. The first start in that mode reboots
-once, which adds about 25 seconds. Being logged on costs about 560 MB of the guest's RAM. Set it
+once, which adds about 30 seconds. Being logged on costs about 560 MB of the guest's RAM. Set it
 for one instance, or in an image file for every instance of that image and the images on it:
 
 ```sh
@@ -184,7 +208,8 @@ plain `winvm sh`:
 - `-t` doesn't apply, and neither does a shell without a command: use `winvm gui` or `winvm rdp`.
 
 **For a script,** this runs one export from start to finish. The `trap` comes after `up`, so that
-a refused `up` doesn't stop a VM that was already running. `winvm cp` doesn't create folders, so
+a refused `up` doesn't stop a VM that was already running; after a successful `up` it does stop the
+VM at the end, also one that was already running. `winvm cp` doesn't create folders, so
 `C:\work` has to exist already, from the image or an earlier step:
 
 ```sh
@@ -194,7 +219,7 @@ winvm up --desktop                       # returns once logged on
 trap 'winvm stop' EXIT                   # stops the VM even if a step fails
 
 winvm cp report.docx :C:/work/report.docx
-winvm sh --desktop --timeout 5m 'powershell -File C:\work\export.ps1'
+winvm sh --desktop --timeout 5m 'powershell -ExecutionPolicy Bypass -File C:\work\export.ps1'
 winvm cp :C:/work/report.pdf ./report.pdf
 ```
 
@@ -294,6 +319,45 @@ memory leaves room for the host, but it doesn't fit more VMs than `max` allows.
 
 Several instances on the same image can also share identical memory pages with the kernel's
 KSM. It's off by default, and `winvm check` shows the command to turn it on.
+
+## Without KVM
+
+winvm needs KVM to be fast. If you only lack access to it, fix that: `sudo usermod -aG kvm $USER`,
+then log in again. If the machine has no KVM at all, for example inside a VM or a CI runner, QEMU can
+emulate the CPU. You have to ask for it, because of what it costs:
+
+```sh
+winvm up --accel tcg              # this command only
+export WINVM_ACCEL=tcg            # this shell
+```
+
+```yaml
+# ~/.config/winvm/winvm.yaml: this machine, always
+settings:
+  accel: tcg
+```
+
+Measured on one 16-thread desktop with 4 vCPUs and 4 GB:
+
+| | KVM | Emulated |
+|---|---|---|
+| `winvm up` | about 13 s | about 3.5 minutes |
+| `winvm sh hostname` | 0.6 s | about 7.5 s |
+| CPU-heavy PowerShell | | about 25 times slower |
+| Clean `winvm stop` | about 10 s | about 16 s |
+| An image `from` another, one small step | about 1 minute | about 4.5 minutes |
+
+**Installing Windows under emulation hasn't been timed from start to finish.** It takes up to an
+hour on KVM, so expect many hours. It's much better to build the image once on a machine with KVM,
+if you can.
+
+**Desktop mode is poor when emulated.** `winvm up --desktop` took 9 minutes, the first command in
+that session lost its connection, and the VM then didn't shut down within 10 minutes, so it was
+powered off hard. Avoid it there.
+
+A running emulated VM stays emulated, and `winvm restart` keeps it so: only the next start of a
+stopped VM needs the setting again, which `$WINVM_ACCEL` or `settings.accel` takes care of. QEMU uses
+about 700 MB more than the VM's RAM, for its translated code, and the RAM guard counts on that.
 
 ## Connecting: SSH, RDP, VNC
 
